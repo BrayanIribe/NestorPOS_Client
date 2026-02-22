@@ -160,9 +160,16 @@ function startLocalFrontendServer(currentDir, getServerOriginFn) {
         const cacheKey = `${upstreamBase.toString()}|${req.method}|${req.baseUrl}${req.url}`;
         const cacheFile = path.join(cacheDir, sha256Hex(cacheKey) + '.json');
 
-        const canCacheRequest = (req.method === 'GET');
+        const disallowCache = [
+            '/pos/status'
+        ];
+
+        const canCacheRequest = (req.method === 'GET') && !disallowCache.includes(req.url)
+        console.log(cacheKey)
 
         const serveCached = async () => {
+            if (disallowCache.includes(req.url))
+                return false;
             console.log('[SERVE FROM CACHE]', cacheKey)
             const cached = await readJsonIfExists(cacheFile);
             if (!cached || !cached.response) return false;
@@ -185,8 +192,10 @@ function startLocalFrontendServer(currentDir, getServerOriginFn) {
             const ct = proxyRes.headers['content-type'] || '';
             const canCacheResponse =
                 canCacheRequest &&
-                (proxyRes.statusCode > 200 && proxyRes.statusCode < 202) &&
+                (proxyRes.statusCode >= 200 && proxyRes.statusCode < 202) &&
                 isJsonContentType(ct);
+
+            // console.log({ canCacheRequest, canCacheResponse, status: proxyRes.statusCode })
 
 
 
