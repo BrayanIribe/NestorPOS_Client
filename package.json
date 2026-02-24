@@ -2,17 +2,53 @@
   "name": "nestorpos_client",
   "version": "1.0.0",
   "description": "",
-  "main": "main.js",
+  "main": "src/main.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "electron src/main.js"
+    "start": "electron src/main.js",
+    "dist": "electron-builder"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "adm-zip": "^0.5.16",
-    "electron": "^40.6.0",
     "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "electron": "^40.6.0",
+    "electron-builder": "^26.8.1"
+  },
+  "build": {
+    "productName": "Nestor POS",
+    "appId": "com.nestor.pos",
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": "dmg"
+    },
+    "dmg": {
+      "contents": [
+        {
+          "x": 110,
+          "y": 150
+        },
+        {
+          "x": 240,
+          "y": 150,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "directories": {
+      "output": "output",
+      "buildResources": "output/resources"
+    },
+    "files": [
+      "src/**/*"
+    ]
   }
 }
