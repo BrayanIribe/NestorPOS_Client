@@ -53,8 +53,12 @@ function configHtml() {
     .row { margin-top: 12px; display:flex; gap: 10px; }
     button { padding: 10px 12px; border-radius: 8px; border: 1px solid #222; background: #222; color:#fff; cursor:pointer; }
     button.secondary { background: #fff; color:#222; }
+    button.danger { border-color: #c0392b; background: #c0392b; }
+    button.danger:hover { background: #a93226; border-color: #a93226; }
     .hint { color:#555; font-size: 13px; margin-top: 10px; line-height: 1.4; }
     .status { margin-top: 12px; font-size: 13px; white-space: pre-wrap; }
+    hr { border: none; border-top: 1px solid #eee; margin: 18px 0 14px; }
+    .danger-label { font-size: 11px; font-weight: 700; color: #c0392b; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
   </style>
 </head>
 <body>
@@ -77,6 +81,10 @@ function configHtml() {
     </div>
 
     <div id="status" class="status"></div>
+
+    <hr />
+    <div class="danger-label">Zona de peligro</div>
+    <button id="clear-data" class="danger">Eliminar datos y caché</button>
   </div>
 
 <script>
@@ -105,6 +113,17 @@ function configHtml() {
       await window.NestorClient.setServerOrigin(elServer.value.trim());
       setStatus('Guardado. Reiniciando...');
       await window.NestorClient.relaunch();
+    } catch (e) {
+      setStatus('ERROR\\n' + (e && e.message ? e.message : String(e)));
+    }
+  });
+
+  document.getElementById('clear-data').addEventListener('click', async () => {
+    const ok = confirm('¿Eliminar todos los datos y caché del cliente POS?\\n\\nSe borrarán los archivos del frontend, el caché de respuestas y el almacenamiento local. La aplicación se reiniciará.');
+    if (!ok) return;
+    setStatus('Eliminando datos...');
+    try {
+      await window.NestorClient.clearData();
     } catch (e) {
       setStatus('ERROR\\n' + (e && e.message ? e.message : String(e)));
     }

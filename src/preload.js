@@ -32,6 +32,9 @@ contextBridge.exposeInMainWorld('NestorClient', {
     testServerOrigin: (origin) => invoke('nestor:test-server-origin', origin),
     relaunch: () => invoke('nestor:relaunch'),
 
+    refresh: () => invoke('nestor:refresh'),
+    clearData: () => invoke('nestor:clear-data'),
+
     getWindowMode: () => invoke('win:get-mode'),
     toggleFullscreen: () => invoke('win:toggle-fullscreen'),
     toggleKiosk: () => invoke('win:toggle-kiosk'),

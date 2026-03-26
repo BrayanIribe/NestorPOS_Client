@@ -1,4 +1,4 @@
-const { app, session, BrowserWindow, ipcMain, Menu, globalShortcut } = require('electron');
+const { app, session, BrowserWindow, ipcMain, Menu, globalShortcut, dialog } = require('electron');
 const path = require('path');
 const fsp = require('fs/promises');
 const fs = require('fs');
@@ -174,6 +174,31 @@ async function ensureFrontendCached(origin) {
     return { version: remoteVer.version };
 }
 
+async function refreshWithUpdate(win) {
+    if (!win || win.isDestroyed()) return;
+
+    // Borrar caché de respuestas del proxy (no datos de sesión)
+    const { wwwRoot } = getPaths();
+    const apiCacheDir = path.join(wwwRoot, 'api_cache');
+    try {
+        await fsp.rm(apiCacheDir, { recursive: true, force: true });
+    } catch { }
+
+    // Intentar descargar la versión más reciente del frontend
+    try {
+        await ensureFrontendCached(serverOrigin);
+    } catch (e) {
+        console.warn('[refresh] No se pudo actualizar el frontend:', e && e.message ? e.message : e);
+    }
+
+    // Limpiar caché HTTP de Electron (NO localStorage/cookies/session)
+    try {
+        await session.defaultSession.clearCache();
+    } catch { }
+
+    if (!win.isDestroyed()) win.webContents.reload();
+}
+
 function createMainWindow() {
     const isMac = process.platform === 'darwin';
     const wantKiosk = START_KIOSK;
@@ -228,6 +253,37 @@ function createMainWindow() {
         win.on('enter-html-full-screen', () => { enforceMacNoTrafficLightsSoon(win); notifyWinMode(win); });
         win.on('leave-html-full-screen', () => { enforceMacNoTrafficLightsSoon(win); notifyWinMode(win); });
     } catch { }
+
+    // Interceptar window.location.reload() desde el renderer
+    win.webContents.on('will-navigate', (event, url) => {
+        try {
+            const curr = new URL(win.webContents.getURL());
+            const next = new URL(url);
+            if (curr.origin === next.origin && curr.pathname === next.pathname) {
+                event.preventDefault();
+                refreshWithUpdate(win);
+            }
+        } catch { }
+    });
+
+    // Interceptar Ctrl+R / Cmd+R para hacer refresh con actualización de frontend
+    win.webContents.on('before-input-event', (event, input) => {
+        if (input.type !== 'keyDown') return;
+        const isReload = input.key === 'r' && (input.control || input.meta);
+        if (!isReload) return;
+        event.preventDefault();
+        dialog.showMessageBox(win, {
+            type: 'question',
+            buttons: ['Cancelar', 'Refrescar'],
+            defaultId: 1,
+            cancelId: 0,
+            title: 'Nestor POS',
+            message: '¿Refrescar la aplicación?',
+            detail: 'Se descargará el código más reciente y se limpiará el caché. Los datos de sesión se conservarán.',
+        }).then(({ response }) => {
+            if (response === 1) refreshWithUpdate(win);
+        });
+    });
 
     return win;
 }
@@ -372,6 +428,42 @@ function wireIpc() {
     });
 
     removeAndHandle('nestor:relaunch', async () => {
+        app.relaunch();
+        app.exit(0);
+        return { ok: true };
+    });
+
+    removeAndHandle('nestor:refresh', async (event) => {
+        const win = winFromEvent(event);
+        if (!win) return { ok: false };
+        const { response } = await dialog.showMessageBox(win, {
+            type: 'question',
+            buttons: ['Cancelar', 'Refrescar'],
+            defaultId: 1,
+            cancelId: 0,
+            title: 'Nestor POS',
+            message: '¿Refrescar la aplicación?',
+            detail: 'Se descargará el código más reciente y se limpiará el caché. Los datos de sesión se conservarán.',
+        });
+        if (response === 1) refreshWithUpdate(win);
+        return { ok: response === 1 };
+    });
+
+    removeAndHandle('nestor:clear-data', async () => {
+        const { wwwRoot, currentDir, metaPath } = getPaths();
+        const apiCacheDir = path.join(wwwRoot, 'api_cache');
+
+        await fsp.rm(currentDir, { recursive: true, force: true });
+        await fsp.rm(apiCacheDir, { recursive: true, force: true });
+        await fsp.rm(metaPath, { force: true });
+
+        try {
+            await session.defaultSession.clearCache();
+            await session.defaultSession.clearStorageData({
+                storages: ['serviceworkers', 'cachestorage', 'localstorage', 'indexdb', 'cookies']
+            });
+        } catch { }
+
         app.relaunch();
         app.exit(0);
         return { ok: true };
