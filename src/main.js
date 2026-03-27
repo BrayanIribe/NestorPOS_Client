@@ -266,23 +266,52 @@ function createMainWindow() {
         } catch { }
     });
 
-    // Interceptar Ctrl+R / Cmd+R para hacer refresh con actualización de frontend
+    // Interceptar Ctrl+R / Cmd+R y atajos de zoom como navegador
     win.webContents.on('before-input-event', (event, input) => {
         if (input.type !== 'keyDown') return;
-        const isReload = input.key === 'r' && (input.control || input.meta);
-        if (!isReload) return;
-        event.preventDefault();
-        dialog.showMessageBox(win, {
-            type: 'question',
-            buttons: ['Cancelar', 'Refrescar'],
-            defaultId: 1,
-            cancelId: 0,
-            title: 'Nestor POS',
-            message: '¿Refrescar la aplicación?',
-            detail: 'Se descargará el código más reciente y se limpiará el caché. Los datos de sesión se conservarán.',
-        }).then(({ response }) => {
-            if (response === 1) refreshWithUpdate(win);
-        });
+        const mod = input.control || input.meta;
+        if (!mod) return;
+
+        const key = input.key;
+
+        // Zoom in: Ctrl/Cmd + (= o +)
+        if (key === '=' || key === '+') {
+            event.preventDefault();
+            const current = win.webContents.getZoomFactor();
+            win.webContents.setZoomFactor(Math.min(current + 0.1, 3.0));
+            return;
+        }
+
+        // Zoom out: Ctrl/Cmd + -
+        if (key === '-') {
+            event.preventDefault();
+            const current = win.webContents.getZoomFactor();
+            win.webContents.setZoomFactor(Math.max(current - 0.1, 0.3));
+            return;
+        }
+
+        // Reset zoom: Ctrl/Cmd + 0
+        if (key === '0') {
+            event.preventDefault();
+            win.webContents.setZoomFactor(1.0);
+            return;
+        }
+
+        // Reload: Ctrl/Cmd + R
+        if (key === 'r') {
+            event.preventDefault();
+            dialog.showMessageBox(win, {
+                type: 'question',
+                buttons: ['Cancelar', 'Refrescar'],
+                defaultId: 1,
+                cancelId: 0,
+                title: 'Nestor POS',
+                message: '¿Refrescar la aplicación?',
+                detail: 'Se descargará el código más reciente y se limpiará el caché. Los datos de sesión se conservarán.',
+            }).then(({ response }) => {
+                if (response === 1) refreshWithUpdate(win);
+            });
+        }
     });
 
     return win;
