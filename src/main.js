@@ -293,6 +293,23 @@ function createMainWindow() {
             return;
         }
 
+        // F10: toggle fullscreen/kiosk, pero solo si NO estamos en /pos
+        if (input.key === 'F10' && !input.control && !input.meta && !input.alt && !input.shift) {
+            try {
+                const pathname = new URL(win.webContents.getURL()).pathname;
+                if (!pathname.startsWith('/pos')) {
+                    event.preventDefault();
+                    if (win.isKiosk()) win.setKiosk(false);
+                    if (isMac) win.setSimpleFullScreen(!win.isSimpleFullScreen());
+                    else win.setFullScreen(!win.isFullScreen());
+                    enforceMacNoTrafficLightsSoon(win);
+                    notifyWinMode(win);
+                }
+                // Si estamos en /pos, no interceptar → el renderer lo recibe
+            } catch { }
+            return;
+        }
+
         const mod = input.control || input.meta;
         if (!mod) return;
 
@@ -572,20 +589,6 @@ function registerPosShortcuts(win) {
         notifyWinMode(win);
     });
 
-    // F10: salir a modo ventana (kiosk + fullscreen OFF)
-    reg('F10', () => {
-        if (!win || win.isDestroyed()) return;
-        if (win.isKiosk()) win.setKiosk(false);
-
-        if (process.platform === 'darwin') {
-            win.setSimpleFullScreen(!win.isSimpleFullScreen());
-        } else {
-            win.setFullScreen(!win.isFullScreen());
-        }
-
-        enforceMacNoTrafficLightsSoon(win);
-        notifyWinMode(win);
-    });
 }
 
 app.whenReady().then(async () => {

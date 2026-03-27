@@ -284,6 +284,14 @@ function ensureTitlebarInjected() {
     bar.appendChild(right);
 
     document.body.appendChild(bar);
+    updateConfigBtnVisibility();
+}
+
+function updateConfigBtnVisibility() {
+    const btn = document.getElementById('nestor-config-btn');
+    if (!btn) return;
+    const isPos = window.location.pathname.startsWith('/pos');
+    btn.style.display = isPos ? 'none' : '';
 }
 
 function setTitlebarVisible(visible) {
@@ -320,6 +328,7 @@ function startAppWatcher() {
             renderDebounce = setTimeout(() => {
                 ensureTitlebarPlacement();
                 applyAppLayout();
+                updateConfigBtnVisibility();
             }, 30);
         });
 
@@ -331,6 +340,7 @@ function startAppWatcher() {
         });
 
         window.addEventListener('resize', () => applyAppLayout());
+        window.addEventListener('popstate', () => updateConfigBtnVisibility());
     };
 
     appReadyTimer = setInterval(tryAttach, 100);
