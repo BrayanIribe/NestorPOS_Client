@@ -428,7 +428,18 @@ function wireIpc() {
 
     removeAndHandle('win:close', (event) => {
         const win = winFromEvent(event);
-        if (win) win.close();
+        if (!win) return { ok: false };
+
+        // En macOS, salir de fullscreen/kiosk antes de cerrar evita que
+        // la ventana quede bloqueada en la transición y no se cierre.
+        if (win.isKiosk()) win.setKiosk(false);
+        if (process.platform === 'darwin') {
+            try { win.setSimpleFullScreen(false); } catch { }
+        }
+        win.setFullScreen(false);
+
+        // Destruir directamente garantiza el cierre sin depender del evento close
+        win.destroy();
         return { ok: true };
     });
 
