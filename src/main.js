@@ -23,6 +23,7 @@ let mainWindow = null;
 let configWindow = null;
 let localServer = null;
 let serverOrigin = DEFAULT_SERVER_ORIGIN;
+let savedZoomFactor = 1.0;
 
 function getWinMode(win) {
     if (!win) return { fullscreen: false, kiosk: false, simple: false };
@@ -107,19 +108,30 @@ async function loadClientConfig() {
 
     const cfg = await readJSON(clientConfigPath, null);
     if (cfg && cfg.server_origin) {
-        return { server_origin: normalizeServerOrigin(cfg.server_origin) };
+        const zoom = (typeof cfg.zoom_factor === 'number' && cfg.zoom_factor >= 0.3 && cfg.zoom_factor <= 3.0)
+            ? cfg.zoom_factor : 1.0;
+        return { server_origin: normalizeServerOrigin(cfg.server_origin), zoom_factor: zoom };
     }
-    return { server_origin: DEFAULT_SERVER_ORIGIN };
+    return { server_origin: DEFAULT_SERVER_ORIGIN, zoom_factor: 1.0 };
 }
 
 async function saveClientConfig(origin) {
     const { clientConfigPath } = getPaths();
+    const existing = await readJSON(clientConfigPath, {});
     const cfg = {
+        ...existing,
         server_origin: normalizeServerOrigin(origin),
         updated_at: new Date().toISOString()
     };
     await writeJSON(clientConfigPath, cfg);
     return cfg;
+}
+
+async function saveZoomFactor(factor) {
+    const { clientConfigPath } = getPaths();
+    const cfg = await readJSON(clientConfigPath, {});
+    cfg.zoom_factor = Math.round(factor * 100) / 100;
+    await writeJSON(clientConfigPath, cfg);
 }
 
 async function fetchJson(url) {
@@ -242,6 +254,10 @@ function createMainWindow() {
             else win.setFullScreen(true);
         }
 
+        if (savedZoomFactor !== 1.0) {
+            win.webContents.setZoomFactor(savedZoomFactor);
+        }
+
         enforceMacNoTrafficLightsSoon(win);
         notifyWinMode(win);
         win.show();
@@ -277,16 +293,20 @@ function createMainWindow() {
         // Zoom in: Ctrl/Cmd + (= o +)
         if (key === '=' || key === '+') {
             event.preventDefault();
-            const current = win.webContents.getZoomFactor();
-            win.webContents.setZoomFactor(Math.min(current + 0.1, 3.0));
+            const next = Math.min(win.webContents.getZoomFactor() + 0.1, 3.0);
+            win.webContents.setZoomFactor(next);
+            savedZoomFactor = next;
+            saveZoomFactor(next).catch(() => {});
             return;
         }
 
         // Zoom out: Ctrl/Cmd + -
         if (key === '-') {
             event.preventDefault();
-            const current = win.webContents.getZoomFactor();
-            win.webContents.setZoomFactor(Math.max(current - 0.1, 0.3));
+            const next = Math.max(win.webContents.getZoomFactor() - 0.1, 0.3);
+            win.webContents.setZoomFactor(next);
+            savedZoomFactor = next;
+            saveZoomFactor(next).catch(() => {});
             return;
         }
 
@@ -294,6 +314,8 @@ function createMainWindow() {
         if (key === '0') {
             event.preventDefault();
             win.webContents.setZoomFactor(1.0);
+            savedZoomFactor = 1.0;
+            saveZoomFactor(1.0).catch(() => {});
             return;
         }
 
@@ -566,6 +588,7 @@ app.whenReady().then(async () => {
         const { currentDir } = getPaths();
         const cfg = await loadClientConfig();
         serverOrigin = cfg.server_origin;
+        savedZoomFactor = cfg.zoom_factor ?? 1.0;
 
         localServer = await startLocalFrontendServer(currentDir, () => serverOrigin);
 
