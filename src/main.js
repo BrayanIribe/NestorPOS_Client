@@ -285,6 +285,14 @@ function createMainWindow() {
     // Interceptar Ctrl+R / Cmd+R y atajos de zoom como navegador
     win.webContents.on('before-input-event', (event, input) => {
         if (input.type !== 'keyDown') return;
+
+        // Alt+F4 (Windows/Linux) → cerrar ventana
+        if (input.alt && input.key === 'F4') {
+            event.preventDefault();
+            win.close();
+            return;
+        }
+
         const mod = input.control || input.meta;
         if (!mod) return;
 
@@ -542,6 +550,12 @@ function registerPosShortcuts(win) {
 
     reg('CommandOrControl+Alt+Shift+Q', () => {
         exitFullscreenAndKiosk(win);
+    });
+
+    // Cmd+Q (mac) / Ctrl+Q cierra la app
+    reg('CommandOrControl+Q', () => {
+        if (win && !win.isDestroyed()) win.close();
+        else app.quit();
     });
 
     reg('CommandOrControl+Enter', () => {
