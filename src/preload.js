@@ -272,7 +272,7 @@ function ensureTitlebarInjected() {
     cfgBtn.addEventListener('click', () => invoke('win:open-config'));
     btnClose.addEventListener('click', () => invoke('win:close'));
     btnMin.addEventListener('click', () => invoke('win:minimize'));
-    btnMax.addEventListener('click', () => invoke('win:toggle-maximize'));
+    btnMax.addEventListener('click', () => invoke('win:toggle-fullscreen'));
 
     left.appendChild(cfgBtn);
     right.appendChild(btnClose);
@@ -299,10 +299,7 @@ function setTitlebarVisible(visible) {
 }
 
 function applyWindowMode(mode) {
-    const fullscreen = !!(mode && mode.fullscreen);
-    const kiosk = !!(mode && mode.kiosk);
-    const visible = shouldInjectTitlebar() && !(fullscreen || kiosk);
-    setTitlebarVisible(visible);
+    setTitlebarVisible(shouldInjectTitlebar());
 }
 
 function startAppWatcher() {
@@ -355,7 +352,7 @@ async function recheckWindowMode(times) {
         try {
             const mode = await invoke('win:get-mode');
             applyWindowMode(mode || {});
-            if ((mode && (mode.fullscreen || mode.kiosk)) || left <= 0) return;
+            if (left <= 0) return;
         } catch {
             if (left <= 0) return;
         }
