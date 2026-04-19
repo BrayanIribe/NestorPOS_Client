@@ -20,7 +20,16 @@ function invoke(channel, ...args) {
 
 log('[preload] loaded');
 
+let initialConfig = null;
+try {
+    initialConfig = ipcRenderer.sendSync('nestor:get-config-sync');
+} catch (err) {
+    log('[preload] get-config-sync failed:', err && err.message ? err.message : err);
+}
+
 contextBridge.exposeInMainWorld('NestorClient', {
+    serverOrigin: initialConfig ? initialConfig.serverOrigin : null,
+
     minimize: () => invoke('win:minimize'),
     toggleMaximize: () => invoke('win:toggle-maximize'),
     close: () => invoke('win:close'),

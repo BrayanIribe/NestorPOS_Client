@@ -409,6 +409,14 @@ ipcMain.on('client:log', (event, ...args) => {
     console.log('[renderer]', ...args);
 });
 
+ipcMain.on('nestor:get-config-sync', (event) => {
+    event.returnValue = {
+        serverOrigin,
+        localFront: `http://127.0.0.1:${LOCAL_FRONT_PORT}`,
+        apiBaseUrl: `http://127.0.0.1:${LOCAL_FRONT_PORT}/api/v1`
+    };
+});
+
 function wireIpc() {
     const winFromEvent = (event) => BrowserWindow.fromWebContents(event.sender);
 
