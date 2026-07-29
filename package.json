@@ -6,6 +6,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "electron src/main.js",
+    "dev": "NESTOR_DEV_URL=http://127.0.0.1:8081 NESTOR_SERVER=http://127.0.0.1:8180 NESTOR_FULLSCREEN=0 electron src/main.js",
+    "dev:win": "set NESTOR_DEV_URL=http://127.0.0.1:8081&& set NESTOR_SERVER=http://127.0.0.1:8180&& set NESTOR_FULLSCREEN=0&& electron src/main.js",
     "dist": "electron-builder"
   },
   "keywords": [],

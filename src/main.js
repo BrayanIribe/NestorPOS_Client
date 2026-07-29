@@ -10,6 +10,16 @@ app.commandLine.appendSwitch('disable-http-cache');
 const DEFAULT_SERVER_ORIGIN = 'http://127.0.0.1:8180';
 const LOCAL_FRONT_PORT = parseInt(process.env.NESTOR_FRONT_PORT || '18180', 10);
 
+// Modo desarrollo: carga el frontend desde el dev server de Vue en vez del
+// bundle que publica el backend en /__front. El dev server no tiene ese
+// endpoint (lo sirve el Go embebiendo el build), así que en dev se salta toda
+// la descarga, el borrado por cambio de build y el sondeo de versión.
+//   NESTOR_DEV_URL=http://127.0.0.1:8081 npm start
+// El origen del servidor (NESTOR_SERVER) sigue apuntando al backend: el dev
+// server ya proxya /api hacia él (vue.config.js).
+const DEV_URL = String(process.env.NESTOR_DEV_URL || '').trim().replace(/\/+$/, '');
+const IS_DEV = !!DEV_URL;
+
 // Fullscreen por defecto (puedes apagarlo con NESTOR_FULLSCREEN=0)
 const START_FULLSCREEN = (process.env.NESTOR_FULLSCREEN || '1') === '1';
 
@@ -19,11 +29,35 @@ const START_KIOSK = process.env.NESTOR_KIOSK === '1';
 // Atajos ocultos (solo soporte/QA) (NESTOR_ALLOW_EXIT=1)
 const ALLOW_EXIT_SHORTCUTS = true; // process.env.NESTOR_ALLOW_EXIT === '1';
 
+// Cada cuánto se sondea /__front/version.json para detectar que el servidor
+// cambió de build (0 = apagar el sondeo).
+const VERSION_PING_MS = Math.max(0, parseInt(process.env.NESTOR_VERSION_PING_MS || '5000', 10));
+const VERSION_PING_TIMEOUT_MS = 4000;
+
+// Al detectar build nueva se borran datos y caché y se recarga solo.
+const AUTO_UPDATE_ON_BUILD_CHANGE = (process.env.NESTOR_AUTO_UPDATE || '1') === '1';
+
+// El borrado automático NO toca la sesión: obligar a re-loguear al cajero en
+// cada actualización del servidor es peor que dejar el token. NESTOR_UPDATE_KEEP_SESSION=0
+// lo iguala al botón manual de "Eliminar datos y caché", que sí cierra sesión.
+const KEEP_SESSION_ON_AUTO_CLEAR = (process.env.NESTOR_UPDATE_KEEP_SESSION || '1') !== '0';
+
+// Borradores y cola de tickets pendientes del POS. El frontend ya los protege
+// cuando limpia sesión por 401 (services/api/http.js): borrarlos tira ventas
+// capturadas que aún no llegan al servidor. El auto-borrado los respeta igual.
+const POS_DRAFT_KEYS = ['pos_draft_v1', 'pos_ticket_draft_v1', 'pos_ticket_outbox_v1'];
+const SESSION_KEYS = ['x-access-token'];
+
 let mainWindow = null;
 let configWindow = null;
 let localServer = null;
 let serverOrigin = DEFAULT_SERVER_ORIGIN;
 let savedZoomFactor = 1.0;
+
+// Build que corresponde al código cargado ahora mismo en la ventana.
+let currentBuildId = null;
+let versionTimer = null;
+let updateInFlight = false;
 
 function getWinMode(win) {
     if (!win) return { fullscreen: false, kiosk: false, simple: false };
@@ -134,8 +168,11 @@ async function saveZoomFactor(factor) {
     await writeJSON(clientConfigPath, cfg);
 }
 
-async function fetchJson(url) {
-    const res = await fetch(url, { cache: 'no-store' });
+async function fetchJson(url, timeoutMs) {
+    const opts = { cache: 'no-store' };
+    if (timeoutMs) opts.signal = AbortSignal.timeout(timeoutMs);
+
+    const res = await fetch(url, opts);
     const ct = res.headers.get('content-type') || '';
     const body = await res.text();
 
@@ -154,11 +191,25 @@ async function downloadBytes(url) {
     return Buffer.from(ab);
 }
 
+// Identidad de la build del servidor. Preferimos el commit; el hash del bundle
+// (version) es el respaldo para servidores viejos que aún no lo exponen.
+function buildIdOf(info) {
+    if (!info) return '';
+    const commit = String(info.build_commit || '').trim();
+    const version = String(info.version || '').trim();
+    if (!commit) return version;
+    return `${commit}|${version}`;
+}
+
+async function fetchRemoteBuild(origin, timeoutMs) {
+    return await fetchJson(`${origin}/__front/version.json`, timeoutMs);
+}
+
 async function ensureFrontendCached(origin) {
     const { wwwRoot, currentDir, metaPath } = getPaths();
     await fsp.mkdir(wwwRoot, { recursive: true });
 
-    const remoteVer = await fetchJson(`${origin}/__front/version.json`);
+    const remoteVer = await fetchRemoteBuild(origin);
     const localMeta = await readJSON(metaPath, { version: null, server_origin: null });
 
     const sameServer = (localMeta.server_origin || '') === origin;
@@ -180,35 +231,201 @@ async function ensureFrontendCached(origin) {
     await writeJSON(metaPath, {
         server_origin: origin,
         version: remoteVer.version,
+        build_commit: remoteVer.build_commit || '',
+        build_date: remoteVer.build_date || '',
+        build_id: buildIdOf(remoteVer),
         updated_at: new Date().toISOString()
     });
 
-    return { version: remoteVer.version };
+    currentBuildId = buildIdOf(remoteVer);
+    return remoteVer;
+}
+
+// Borra caché y datos locales. `frontend` tumba también el bundle descargado
+// (el llamador debe volver a bajarlo o relanzar); `storages` son los que se le
+// pasan a clearStorageData. localStorage NO se limpia aquí: eso se hace desde
+// el renderer con purgeRendererStorage, que sí puede respetar los borradores
+// del POS — clearStorageData es todo o nada.
+async function clearAppData({ frontend = false, storages = ['serviceworkers', 'cachestorage'] } = {}) {
+    const { wwwRoot, currentDir, metaPath } = getPaths();
+    const apiCacheDir = path.join(wwwRoot, 'api_cache');
+
+    await fsp.rm(apiCacheDir, { recursive: true, force: true });
+
+    if (frontend) {
+        await fsp.rm(currentDir, { recursive: true, force: true });
+        await fsp.rm(metaPath, { force: true });
+    }
+
+    try {
+        await session.defaultSession.clearCache();
+    } catch { }
+
+    try {
+        if (storages && storages.length) {
+            await session.defaultSession.clearStorageData({ storages });
+        }
+    } catch { }
+}
+
+// Limpia localStorage dentro de la página, preservando las llaves que no se
+// pueden perder. Se corre justo antes de recargar.
+async function purgeRendererStorage(win) {
+    if (!win || win.isDestroyed()) return -1;
+
+    const keep = KEEP_SESSION_ON_AUTO_CLEAR
+        ? [...POS_DRAFT_KEYS, ...SESSION_KEYS]
+        : [...POS_DRAFT_KEYS];
+
+    const js = `(() => {
+        try {
+            const keep = new Set(${JSON.stringify(keep)});
+            const doomed = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && !keep.has(k)) doomed.push(k);
+            }
+            doomed.forEach((k) => localStorage.removeItem(k));
+            return doomed.length;
+        } catch (e) { return -1; }
+    })()`;
+
+    try {
+        return await win.webContents.executeJavaScript(js, true);
+    } catch {
+        return -1;
+    }
 }
 
 async function refreshWithUpdate(win) {
     if (!win || win.isDestroyed()) return;
 
-    // Borrar caché de respuestas del proxy (no datos de sesión)
-    const { wwwRoot } = getPaths();
-    const apiCacheDir = path.join(wwwRoot, 'api_cache');
+    // Tomamos el candado para que el watcher no dispare una actualización
+    // encima de este refresh manual.
+    updateInFlight = true;
     try {
-        await fsp.rm(apiCacheDir, { recursive: true, force: true });
-    } catch { }
+        // Borrar caché de respuestas del proxy (no datos de sesión)
+        const { wwwRoot } = getPaths();
+        const apiCacheDir = path.join(wwwRoot, 'api_cache');
+        try {
+            await fsp.rm(apiCacheDir, { recursive: true, force: true });
+        } catch { }
 
-    // Intentar descargar la versión más reciente del frontend
+        // Intentar descargar la versión más reciente del frontend
+        try {
+            await ensureFrontendCached(serverOrigin);
+        } catch (e) {
+            console.warn('[refresh] No se pudo actualizar el frontend:', e && e.message ? e.message : e);
+        }
+
+        // Limpiar caché HTTP de Electron (NO localStorage/cookies/session)
+        try {
+            await session.defaultSession.clearCache();
+        } catch { }
+
+        if (!win.isDestroyed()) win.webContents.reload();
+    } finally {
+        updateInFlight = false;
+    }
+}
+
+// Aplica una build nueva: primero baja el bundle (rename atómico) y sólo
+// después borra caché y datos. Al revés, si el servidor está reiniciándose
+// —que es justo cuando cambia la build— la app se quedaría sin frontend.
+async function applyBuildChange(win, remoteId) {
+    const fresh = await ensureFrontendCached(serverOrigin);
+
+    await clearAppData({
+        frontend: false,
+        storages: ['serviceworkers', 'cachestorage', 'indexdb']
+    });
+
+    const removed = await purgeRendererStorage(win);
+    console.log(`[update] datos y caché borrados (localStorage: ${removed} llaves)`);
+
+    currentBuildId = buildIdOf(fresh) || remoteId;
+
+    if (win && !win.isDestroyed()) win.webContents.reloadIgnoringCache();
+}
+
+// Arranque: compara la build del servidor contra la que quedó registrada en
+// frontend_meta.json. Si cambió, limpia caché antes de abrir la ventana.
+async function clearCachesIfBuildChanged(origin) {
+    const { metaPath } = getPaths();
+    const localMeta = await readJSON(metaPath, null);
+
+    let remote;
     try {
-        await ensureFrontendCached(serverOrigin);
-    } catch (e) {
-        console.warn('[refresh] No se pudo actualizar el frontend:', e && e.message ? e.message : e);
+        remote = await fetchRemoteBuild(origin, VERSION_PING_TIMEOUT_MS);
+    } catch {
+        return false;
     }
 
-    // Limpiar caché HTTP de Electron (NO localStorage/cookies/session)
-    try {
-        await session.defaultSession.clearCache();
-    } catch { }
+    const remoteId = buildIdOf(remote);
+    const localId = localMeta ? (localMeta.build_id || buildIdOf(localMeta)) : '';
 
-    if (!win.isDestroyed()) win.webContents.reload();
+    // Sin meta previa (primera corrida o post "eliminar datos") no hay nada
+    // viejo que limpiar.
+    if (!localId) return false;
+
+    const sameServer = (localMeta.server_origin || '') === origin;
+    if (localId === remoteId && sameServer) return false;
+
+    console.log(`[update] build al arranque cambió: ${localId} -> ${remoteId}; limpiando caché`);
+    await clearAppData({ frontend: true });
+    return true;
+}
+
+async function checkForBuildChange(win) {
+    if (!AUTO_UPDATE_ON_BUILD_CHANGE) return;
+    if (updateInFlight) return;
+    if (!win || win.isDestroyed()) return;
+
+    let remote;
+    try {
+        remote = await fetchRemoteBuild(serverOrigin, VERSION_PING_TIMEOUT_MS);
+    } catch {
+        // Servidor caído, reiniciándose o sin red: reintentamos al próximo ping.
+        return;
+    }
+
+    const remoteId = buildIdOf(remote);
+    if (!remoteId) return;
+
+    // Sin baseline en memoria (el arranque no pudo hablar con el servidor):
+    // lo tomamos del meta en disco en vez de adoptar el remoto a ciegas, o el
+    // cliente se quedaría pegado en la build vieja para siempre.
+    if (currentBuildId === null) {
+        const meta = await readJSON(getPaths().metaPath, null);
+        currentBuildId = meta ? (meta.build_id || buildIdOf(meta)) : '';
+    }
+
+    // Si además arrancó sin bundle (servidor caído en el arranque), hay que
+    // bajarlo aunque la build no haya cambiado.
+    const haveFrontend = fs.existsSync(path.join(getPaths().currentDir, 'index.html'));
+    if (remoteId === currentBuildId && haveFrontend) return;
+
+    updateInFlight = true;
+    try {
+        console.log(`[update] build cambió: ${currentBuildId || '(sin frontend)'} -> ${remoteId}`);
+        await applyBuildChange(win, remoteId);
+    } catch (e) {
+        console.warn('[update] falló, se reintenta en el próximo ping:', e && e.message ? e.message : e);
+    } finally {
+        updateInFlight = false;
+    }
+}
+
+function startVersionWatcher(win) {
+    if (versionTimer) {
+        clearInterval(versionTimer);
+        versionTimer = null;
+    }
+    if (!VERSION_PING_MS || !AUTO_UPDATE_ON_BUILD_CHANGE) return;
+
+    versionTimer = setInterval(() => {
+        checkForBuildChange(win).catch(() => { });
+    }, VERSION_PING_MS);
 }
 
 function createMainWindow() {
@@ -244,7 +461,7 @@ function createMainWindow() {
 
     win.webContents.on('did-finish-load', () => notifyWinMode(win));
 
-    win.loadURL(`http://127.0.0.1:${LOCAL_FRONT_PORT}/`);
+    win.loadURL(IS_DEV ? `${DEV_URL}/` : `http://127.0.0.1:${LOCAL_FRONT_PORT}/`);
 
     win.once('ready-to-show', () => {
         if (wantKiosk) {
@@ -270,17 +487,20 @@ function createMainWindow() {
         win.on('leave-html-full-screen', () => { enforceMacNoTrafficLightsSoon(win); notifyWinMode(win); });
     } catch { }
 
-    // Interceptar window.location.reload() desde el renderer
-    win.webContents.on('will-navigate', (event, url) => {
-        try {
-            const curr = new URL(win.webContents.getURL());
-            const next = new URL(url);
-            if (curr.origin === next.origin && curr.pathname === next.pathname) {
-                event.preventDefault();
-                refreshWithUpdate(win);
-            }
-        } catch { }
-    });
+    // Interceptar window.location.reload() desde el renderer. En dev no: el
+    // HMR del dev server recarga solo y no hay bundle que volver a bajar.
+    if (!IS_DEV) {
+        win.webContents.on('will-navigate', (event, url) => {
+            try {
+                const curr = new URL(win.webContents.getURL());
+                const next = new URL(url);
+                if (curr.origin === next.origin && curr.pathname === next.pathname) {
+                    event.preventDefault();
+                    refreshWithUpdate(win);
+                }
+            } catch { }
+        });
+    }
 
     // Interceptar Ctrl+R / Cmd+R y atajos de zoom como navegador
     win.webContents.on('before-input-event', (event, input) => {
@@ -347,6 +567,13 @@ function createMainWindow() {
         // Reload: Ctrl/Cmd + R
         if (key === 'r') {
             event.preventDefault();
+
+            // En dev, recarga normal contra el dev server.
+            if (IS_DEV) {
+                win.webContents.reloadIgnoringCache();
+                return;
+            }
+
             dialog.showMessageBox(win, {
                 type: 'question',
                 buttons: ['Cancelar', 'Refrescar'],
@@ -544,20 +771,13 @@ function wireIpc() {
         return { ok: response === 1 };
     });
 
+    // Borrado manual: sí es total (incluye sesión y borradores del POS). El
+    // automático por cambio de build es más conservador a propósito.
     removeAndHandle('nestor:clear-data', async () => {
-        const { wwwRoot, currentDir, metaPath } = getPaths();
-        const apiCacheDir = path.join(wwwRoot, 'api_cache');
-
-        await fsp.rm(currentDir, { recursive: true, force: true });
-        await fsp.rm(apiCacheDir, { recursive: true, force: true });
-        await fsp.rm(metaPath, { force: true });
-
-        try {
-            await session.defaultSession.clearCache();
-            await session.defaultSession.clearStorageData({
-                storages: ['serviceworkers', 'cachestorage', 'localstorage', 'indexdb', 'cookies']
-            });
-        } catch { }
+        await clearAppData({
+            frontend: true,
+            storages: ['serviceworkers', 'cachestorage', 'localstorage', 'indexdb', 'cookies']
+        });
 
         app.relaunch();
         app.exit(0);
@@ -626,7 +846,21 @@ app.whenReady().then(async () => {
         serverOrigin = cfg.server_origin;
         savedZoomFactor = cfg.zoom_factor ?? 1.0;
 
+        // Se levanta también en dev: sirve /__client/config y el proxy /api/v1.
         localServer = await startLocalFrontendServer(currentDir, () => serverOrigin);
+
+        if (IS_DEV) {
+            console.log(`[dev] frontend desde ${DEV_URL} (sin bundle, sin auto-update); API hacia ${serverOrigin}`);
+            mainWindow = createMainWindow();
+            registerPosShortcuts(mainWindow);
+            return;
+        }
+
+        // Si el servidor cambió de build (o de origen) desde la última vez,
+        // arrancamos con caché limpio. Aquí todavía no hay ventana, así que no
+        // se toca localStorage: los borradores del POS de la sesión anterior
+        // (ventas encoladas sin subir) tienen que sobrevivir.
+        await clearCachesIfBuildChanged(serverOrigin);
 
         try {
             await ensureFrontendCached(serverOrigin);
@@ -636,6 +870,7 @@ app.whenReady().then(async () => {
 
         mainWindow = createMainWindow();
         registerPosShortcuts(mainWindow);
+        startVersionWatcher(mainWindow);
 
         const idx = path.join(currentDir, 'index.html');
         if (!fs.existsSync(idx)) {
@@ -648,10 +883,14 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+    try { if (versionTimer) clearInterval(versionTimer); } catch { }
+    versionTimer = null;
     try { if (localServer) localServer.close(); } catch { }
     app.quit();
 });
 
 app.on('will-quit', () => {
+    try { if (versionTimer) clearInterval(versionTimer); } catch { }
+    versionTimer = null;
     try { globalShortcut.unregisterAll(); } catch { }
 });

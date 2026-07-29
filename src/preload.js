@@ -56,13 +56,30 @@ let appObserver = null;
 let appReadyTimer = null;
 let renderDebounce = null;
 
-function shouldInjectTitlebar() {
+// En /pos la barra se oculta para dejar la pantalla completa al punto de venta
+// (puedes apagarlo con NESTOR_HIDE_TITLEBAR_ON_POS=0).
+const HIDE_TITLEBAR_ON_POS = (process.env.NESTOR_HIDE_TITLEBAR_ON_POS || '1') === '1';
+
+function currentPathname() {
     try {
-        const p = window.location && window.location.pathname ? window.location.pathname : '';
-        return !p.startsWith('/__client/config');
+        return window.location && window.location.pathname ? window.location.pathname : '';
     } catch {
-        return true;
+        return '';
     }
+}
+
+function isPosRoute() {
+    return /^\/pos(\/|$)/.test(currentPathname());
+}
+
+function shouldInjectTitlebar() {
+    return !currentPathname().startsWith('/__client/config');
+}
+
+function shouldShowTitlebar() {
+    if (!shouldInjectTitlebar()) return false;
+    if (HIDE_TITLEBAR_ON_POS && isPosRoute()) return false;
+    return true;
 }
 
 function ensureBaseStyle() {
@@ -299,8 +316,7 @@ function ensureTitlebarInjected() {
 function updateConfigBtnVisibility() {
     const btn = document.getElementById('nestor-config-btn');
     if (!btn) return;
-    const isPos = window.location.pathname.startsWith('/pos');
-    btn.style.display = isPos ? 'none' : '';
+    btn.style.display = isPosRoute() ? 'none' : '';
 }
 
 function setTitlebarVisible(visible) {
@@ -315,8 +331,33 @@ function setTitlebarVisible(visible) {
     applyAppLayout();
 }
 
+let lastTitlebarVisible = null;
+
+// Se llama en cada render del SPA: solo toca el DOM cuando cambió la ruta.
+function syncTitlebarForRoute() {
+    const visible = shouldShowTitlebar();
+    if (visible === lastTitlebarVisible) return;
+    lastTitlebarVisible = visible;
+    setTitlebarVisible(visible);
+}
+
 function applyWindowMode(mode) {
-    setTitlebarVisible(shouldInjectTitlebar());
+    lastTitlebarVisible = shouldShowTitlebar();
+    setTitlebarVisible(lastTitlebarVisible);
+}
+
+// vue-router navega con pushState y eso no dispara popstate. Parchear
+// history.pushState desde aquí no sirve: con contextIsolation el preload vive
+// en un mundo aparte y el parche no lo ve la página. Los eventos DOM sí cruzan,
+// y para pushState nos queda vigilar el pathname (barato: comparar strings).
+let routeWatchTimer = null;
+
+function watchSpaNavigation() {
+    window.addEventListener('popstate', () => syncTitlebarForRoute());
+    window.addEventListener('hashchange', () => syncTitlebarForRoute());
+
+    if (routeWatchTimer) return;
+    routeWatchTimer = setInterval(() => syncTitlebarForRoute(), 300);
 }
 
 function startAppWatcher() {
@@ -335,6 +376,7 @@ function startAppWatcher() {
         appObserver = new MutationObserver(() => {
             clearTimeout(renderDebounce);
             renderDebounce = setTimeout(() => {
+                syncTitlebarForRoute();
                 ensureTitlebarPlacement();
                 applyAppLayout();
                 updateConfigBtnVisibility();
@@ -350,6 +392,7 @@ function startAppWatcher() {
 
         window.addEventListener('resize', () => applyAppLayout());
         window.addEventListener('popstate', () => updateConfigBtnVisibility());
+        syncTitlebarForRoute();
     };
 
     appReadyTimer = setInterval(tryAttach, 100);
@@ -383,6 +426,7 @@ async function recheckWindowMode(times) {
 
 async function bootstrap() {
     ensureBaseStyle();
+    watchSpaNavigation();
     startAppWatcher();
 
     try {
