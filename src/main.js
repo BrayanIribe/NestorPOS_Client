@@ -927,7 +927,7 @@ function openConfigWindow() {
         autoHideMenuBar: true,
         parent: mainWindow || undefined,
         modal: !!mainWindow,
-        title: 'Configuración',
+        title: 'Configuración $',
 
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
