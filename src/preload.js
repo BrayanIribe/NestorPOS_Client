@@ -92,6 +92,93 @@ contextBridge.exposeInMainWorld('NestorClient', {
     // seguro. Devuelve la función para darse de baja.
     onUpdateAvailable: (cb) => subscribe('nestor:update-available', cb),
 
+    // ── Ventas en local ────────────────────────────────────────────────────
+    // Base SQLite de la caja, fuera del perfil de Electron: cada ticket, cada
+    // renglón y cada voucher de la terminal quedan en el equipo aunque el
+    // servidor no esté y aunque se limpie el navegador. Ver src/ledger.js.
+    //
+    // Aquí no se borra nada. `remove` es la única salida y no es un DELETE: pone
+    // una lápida sobre una venta que NUNCA se consolidó (deja de verse y de
+    // contar) dejando quién, cuándo y por qué. Una venta ya registrada en el
+    // servidor la rechaza el motor.
+    //
+    //   if (window.NestorClient?.ledger) {
+    //     await window.NestorClient.ledger.record({ key, total, products, ... });
+    //     const { items } = await window.NestorClient.ledger.list({ cut_id: 84 });
+    //   }
+    //
+    // Ninguna de estas llamadas lanza: responden { ok:false, error } cuando el
+    // ledger no está disponible (Electron sin node:sqlite, disco sin permisos).
+    // En navegador `window.NestorClient` no existe: validar siempre antes.
+    ledger: {
+        // ── Contrato de capacidades ────────────────────────────────────────
+        // El frontend lo sirve el BACKEND y el cliente lo cachea, así que las dos
+        // piezas se actualizan por su cuenta: es normal tener un frontend nuevo
+        // sobre un cliente de hace tres versiones. Sin una lista explícita, la
+        // única forma de saber qué hay del otro lado es llamar y ver si falla —y
+        // un canal que no existe hace que `invoke` RECHACE, no que devuelva un
+        // error manejable.
+        //
+        // Esta lista es estática (no cuesta un viaje por IPC y funciona aunque la
+        // base no haya abierto) y viaja DENTRO del cliente, así que siempre
+        // describe la versión que de verdad está instalada.
+        //
+        // Al agregar un canal nuevo: añadirlo aquí Y subir LEDGER_IPC_VERSION.
+        version: 2,
+        capabilities: [
+            // v1 — registro y consulta
+            'status', 'stats', 'record', 'mark', 'emv',
+            'list', 'get', 'summary', 'verify', 'export',
+            // v2 — retiro manual y "revisada por un supervisor"
+            'remove', 'acknowledge',
+        ],
+
+        status: () => invoke('nestor:ledger:status'),
+        stats: () => invoke('nestor:ledger:stats'),
+        // Anota o actualiza una venta (idempotente por `key` = uuid del carrito).
+        record: (entry) => invoke('nestor:ledger:record', entry || {}),
+        // Marca una venta ya anotada: registrada, rechazada, impresa, revisada.
+        mark: (patch) => invoke('nestor:ledger:mark', patch || {}),
+        // Retira a mano una venta SIN consolidar: lápida, no DELETE. El motivo es
+        // opcional; el quién/cuándo lo pone quien llama. Devuelve
+        // { ok:false, code:'E_LEDGER_TICKET_CONSOLIDATED' } si ya está registrada.
+        remove: (patch) => invoke('nestor:ledger:remove', patch || {}),
+        // Intento con la terminal EMV, aprobado o no, con el voucher completo.
+        emv: (entry) => invoke('nestor:ledger:emv', entry || {}),
+        // Listado por fecha de creación DESCENDENTE.
+        list: (query) => invoke('nestor:ledger:list', query || {}),
+        get: (key) => invoke('nestor:ledger:get', String(key || '')),
+        // Sumatoria de la caja para conciliar contra el servidor en el corte X/Z.
+        summary: (query) => invoke('nestor:ledger:summary', query || {}),
+        // Recorre la cadena de eventos y dice si alguien la tocó por fuera.
+        verify: (limit) => invoke('nestor:ledger:verify', limit || 0),
+        export: (query) => invoke('nestor:ledger:export', query || {}),
+    },
+
+    // ── Captura de sesiones XHR ───────────────────────────────────────────────
+    // El proceso principal graba TODO el XHR de la ventana en un HAR 1.2 desde el
+    // arranque, abre un archivo nuevo en cada login y lo cierra al salir de la
+    // aplicación. El frontend no tiene que hacer nada para que se capture; esto es
+    // sólo para consultarlo y para dejar marcas:
+    //
+    //   const st = await window.NestorClient.xhr.status();   // sesión en curso
+    //   await window.NestorClient.xhr.mark({ tipo: 'venta-fallida', folio });
+    //   const { ruta } = await window.NestorClient.xhr.saveNow('soporte');
+    //
+    // `mark` deja una nota dentro del .har (en `_fin.eventos`) para ubicar el
+    // momento exacto en el que algo falló. Ver src/xhr.capture.js.
+    xhr: {
+        status: () => invoke('nestor:xhr:status'),
+        list: (limit) => invoke('nestor:xhr:list', limit || 30),
+        // Cierra el .har de la sesión en curso (queda completo y abrible) y sigue
+        // capturando en uno nuevo. No cierra el punto de venta.
+        saveNow: (reason) => invoke('nestor:xhr:save-now', String(reason || 'manual')),
+        mark: (entry) => invoke('nestor:xhr:mark', entry || {}),
+        // Las capturas se borran solas a los 10 días; esto sólo adelanta el barrido.
+        sweep: () => invoke('nestor:xhr:sweep'),
+        openFolder: () => invoke('nestor:xhr:open-folder'),
+    },
+
     getWindowMode: () => invoke('win:get-mode'),
     toggleFullscreen: () => invoke('win:toggle-fullscreen'),
     toggleKiosk: () => invoke('win:toggle-kiosk'),

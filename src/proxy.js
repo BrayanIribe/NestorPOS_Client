@@ -46,7 +46,13 @@ function configHtml() {
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Nestor POS - Configuración</title>
   <style>
-    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif; padding: 20px; background-color:white; }
+    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif; margin: 0; padding: 0 20px 20px; background-color:white; }
+    .topbar { position: sticky; top: 0; z-index: 10; margin: 0 -20px 16px; height: 44px; padding: 0 14px; display:flex; align-items:center; justify-content:space-between; gap: 10px; background: rgba(255,255,255,0.94); border-bottom: 1px solid rgba(0,0,0,0.08); user-select:none; -webkit-app-region: drag; }
+    .topbar .title { font-size: 13px; font-weight: 600; color:#333; }
+    .topbar[hidden] { display:none; }
+    .close-x { -webkit-app-region: no-drag; width: 22px; height: 22px; padding: 0; border-radius: 999px; border: 1px solid rgba(0,0,0,0.18); background: #ff5f57; display:inline-flex; align-items:center; justify-content:center; }
+    .close-x:hover { background: #ff4b42; }
+    .close-x svg { pointer-events: none; }
     .card { max-width: 560px; margin: 0 auto; border: 1px solid #ddd; border-radius: 10px; padding: 18px; }
     label { display:block; font-weight: 600; margin-bottom: 6px; }
     input { width:100%; padding: 10px; border-radius: 8px; border: 1px solid #bbb; font-size: 14px; }
@@ -59,9 +65,20 @@ function configHtml() {
     .status { margin-top: 12px; font-size: 13px; white-space: pre-wrap; }
     hr { border: none; border-top: 1px solid #eee; margin: 18px 0 14px; }
     .danger-label { font-size: 11px; font-weight: 700; color: #c0392b; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+    .section-label { font-size: 11px; font-weight: 700; color: #444; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+    .kv { font-size: 13px; color:#333; line-height: 1.5; }
+    .kv b { font-weight: 600; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color:#555; word-break: break-all; }
   </style>
 </head>
 <body>
+  <div class="topbar" id="topbar" hidden>
+    <span class="title">Configuracion</span>
+    <button id="close-x" class="close-x" title="Cerrar (Esc)" aria-label="Cerrar">
+      <svg viewBox="0 0 12 12" width="12" height="12"><path d="M3 3l6 6M9 3L3 9" stroke="rgba(0,0,0,0.65)" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+
   <div class="card">
     <h2>Servidor Nestor POS</h2>
     <div class="hint">
@@ -78,9 +95,19 @@ function configHtml() {
     <div class="row">
       <button id="save">Guardar y reiniciar</button>
       <button id="test" class="secondary">Probar</button>
+      <button id="close" class="secondary" hidden>Cerrar</button>
     </div>
 
     <div id="status" class="status"></div>
+
+    <hr />
+    <div class="section-label">Captura de sesiones (XHR)</div>
+    <div id="xhr-state" class="kv">Consultando...</div>
+    <div id="xhr-path" class="mono"></div>
+    <div class="row">
+      <button id="xhr-save" class="secondary">Guardar sesión ahora</button>
+      <button id="xhr-folder" class="secondary">Abrir carpeta</button>
+    </div>
 
     <hr />
     <div class="danger-label">Zona de peligro</div>
@@ -89,13 +116,86 @@ function configHtml() {
 
 <script>
 (async function () {
+  // OJO: esta pagina se emite desde un template literal en configHtml(), asi que toda
+  // secuencia de escape va DOBLE (barra-barra-n) y aqui NO se usan backticks. Un escape
+  // simple mete el salto de linea literal dentro de la cadena y el navegador tira
+  // SyntaxError: eso no rompe una linea, rompe el script COMPLETO y deja la pagina
+  // muerta y muda (sin boton de cerrar y con todo en "Consultando...").
   const elServer = document.getElementById('server');
   const elStatus = document.getElementById('status');
 
   function setStatus(msg) { elStatus.textContent = msg || ''; }
 
-  const cfg = await window.NestorClient.getConfig();
-  elServer.value = cfg.serverOrigin || 'http://127.0.0.1:8180';
+  // Cada bloque va aislado: si uno falla, los demás siguen. El botón de cerrar es lo
+  // último que puede depender de que el resto de la página funcione.
+  function block(nombre, fn) {
+    try {
+      return fn();
+    } catch (e) {
+      console.error('[config] bloque ' + nombre + ' falló:', e);
+      setStatus('ERROR en ' + nombre + ': ' + (e && e.message ? e.message : String(e)));
+      return null;
+    }
+  }
+
+  const puente = !!(window.NestorClient && window.NestorClient.getConfig);
+
+  // ── Cerrar ────────────────────────────────────────────────────────────────
+  // La ventana no tiene marco (Windows) ni semáforos (macOS): si esto no se dibuja,
+  // no hay forma de cerrarla. Se dibuja SIEMPRE.
+  //
+  // El parametro modal=1 solo distingue la ventana de Configuracion de la MISMA pagina
+  // servida dentro de la ventana principal (primer arranque, cuando todavia no hay
+  // frontend): ahi cerrar es salir de la aplicacion, asi que se pregunta antes y Esc
+  // no cierra.
+  const IS_MODAL = new URLSearchParams(location.search).get('modal') === '1';
+
+  block('cerrar', () => {
+    const elTopbar = document.getElementById('topbar');
+    const elCloseX = document.getElementById('close-x');
+    const elClose = document.getElementById('close');
+
+    elTopbar.hidden = false;
+    elClose.hidden = false;
+
+    const cerrar = () => {
+      if (!IS_MODAL && !confirm('¿Cerrar Nestor POS?')) return;
+      try {
+        window.NestorClient.close();
+      } catch (e) {
+        try { window.close(); } catch (e2) { }
+      }
+    };
+
+    elCloseX.addEventListener('click', cerrar);
+    elClose.addEventListener('click', cerrar);
+
+    if (IS_MODAL) {
+      document.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') { ev.preventDefault(); cerrar(); }
+      });
+    }
+  });
+
+  if (!puente) {
+    // Página abierta fuera del cliente (un navegador contra el puerto local). Se dice,
+    // en vez de morir en el primer await y dejar todo en "Consultando...".
+    setStatus('Esta página necesita el cliente de Nestor POS: fuera de él no hay acceso a la configuración.');
+    document.getElementById('xhr-state').textContent = 'No disponible: abre la ventana de Configuración desde el cliente.';
+    ['save', 'test', 'clear-data', 'xhr-save', 'xhr-folder'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.disabled = true;
+    });
+    return;
+  }
+
+  // ── Servidor ──────────────────────────────────────────────────────────────
+  try {
+    const cfg = await window.NestorClient.getConfig();
+    elServer.value = (cfg && cfg.serverOrigin) || 'http://127.0.0.1:8180';
+  } catch (e) {
+    setStatus('ERROR al leer la configuración: ' + (e && e.message ? e.message : String(e)));
+  }
 
   document.getElementById('test').addEventListener('click', async () => {
     setStatus('Probando...');
@@ -118,6 +218,77 @@ function configHtml() {
     }
   });
 
+  // ── Captura de sesiones XHR ───────────────────────────────────────────────
+  const elXhrState = document.getElementById('xhr-state');
+  const elXhrPath = document.getElementById('xhr-path');
+
+  function fmtBytes(n) {
+    const b = Number(n) || 0;
+    if (b < 1024) return b + ' B';
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+    return (b / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  async function refreshXhr() {
+    if (!window.NestorClient.xhr) {
+      elXhrState.textContent = 'No disponible en esta versión del cliente.';
+      return;
+    }
+    try {
+      const st = await window.NestorClient.xhr.status();
+      if (!st || !st.enabled) {
+        elXhrState.textContent = 'Apagada (NESTOR_XHR_CAPTURE=0).';
+        elXhrPath.textContent = '';
+        return;
+      }
+
+      const dias = (st.topes && st.topes.dias_retencion) || 10;
+      const retencion = 'Se conservan ' + dias + ' días y se borran solas en esta caja.'
+        + (st.encabezados_de_sesion === 'incluidos' ? ' Encabezados de sesión INCLUIDOS.' : ' Encabezados de sesión tapados.')
+        + (st.ultima_limpieza ? ' Última limpieza: ' + st.ultima_limpieza.borradas + ' borradas, quedan ' + st.ultima_limpieza.quedan + '.' : '');
+
+      if (!st.sesion) {
+        elXhrState.innerHTML = 'Encendida, sin sesión abierta.' + (st.error ? ' ' + st.error : '') + '<br />' + retencion;
+        elXhrPath.textContent = st.dir || '';
+        return;
+      }
+
+      const s = st.sesion;
+      elXhrState.innerHTML = '<b>Grabando</b> — ' + s.peticiones + ' peticiones, ' + fmtBytes(s.bytes)
+        + (s.usuario ? ' — usuario ' + s.usuario : ' — sin sesión iniciada')
+        + (s.cuerpos_apagados ? ' — sólo metadatos (tope alcanzado)' : '')
+        + '<br />' + retencion;
+      elXhrPath.textContent = s.ruta || '';
+    } catch (e) {
+      elXhrState.textContent = 'ERROR ' + (e && e.message ? e.message : String(e));
+    }
+  }
+
+  document.getElementById('xhr-save').addEventListener('click', async () => {
+    setStatus('Guardando la sesión XHR...');
+    try {
+      const r = await window.NestorClient.xhr.saveNow('configuracion');
+      if (r && r.ok) setStatus('Sesión guardada (' + (r.peticiones || 0) + ' peticiones):\\n' + (r.ruta || ''));
+      else setStatus('ERROR\\n' + ((r && r.error) || 'no se pudo guardar'));
+    } catch (e) {
+      setStatus('ERROR\\n' + (e && e.message ? e.message : String(e)));
+    }
+    refreshXhr();
+  });
+
+  document.getElementById('xhr-folder').addEventListener('click', async () => {
+    try {
+      const r = await window.NestorClient.xhr.openFolder();
+      if (r && !r.ok) setStatus('ERROR\\n' + (r.error || 'no se pudo abrir la carpeta'));
+    } catch (e) {
+      setStatus('ERROR\\n' + (e && e.message ? e.message : String(e)));
+    }
+  });
+
+  refreshXhr();
+  setInterval(refreshXhr, 3000);
+
+  // ── Zona de peligro ───────────────────────────────────────────────────────
   document.getElementById('clear-data').addEventListener('click', async () => {
     const ok = confirm('¿Eliminar todos los datos y caché del cliente POS?\\n\\nSe borrarán los archivos del frontend, el caché de respuestas y el almacenamiento local. La aplicación se reiniciará.');
     if (!ok) return;
@@ -308,4 +479,4 @@ function startLocalFrontendServer(currentDir, getServerOriginFn) {
     });
 }
 
-module.exports = { startLocalFrontendServer };
+module.exports = { startLocalFrontendServer, configHtml };

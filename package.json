@@ -5,6 +5,7 @@
   "main": "src/main.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/proxy.js && node --check src/xhr.capture.js && node scripts/check-config-page.js",
     "start": "electron src/main.js",
     "dev": "NESTOR_DEV_URL=http://127.0.0.1:8081 NESTOR_SERVER=http://127.0.0.1:8180 NESTOR_FULLSCREEN=0 electron src/main.js",
     "dev:win": "set NESTOR_DEV_URL=http://127.0.0.1:8081&& set NESTOR_SERVER=http://127.0.0.1:8180&& set NESTOR_FULLSCREEN=0&& electron src/main.js",

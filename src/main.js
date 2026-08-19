@@ -1,9 +1,11 @@
-const { app, session, BrowserWindow, ipcMain, Menu, globalShortcut, dialog } = require('electron');
+const { app, session, BrowserWindow, ipcMain, Menu, globalShortcut, dialog, shell } = require('electron');
 const path = require('path');
 const fsp = require('fs/promises');
 const fs = require('fs');
 const AdmZip = require('adm-zip');
 const { startLocalFrontendServer } = require('./proxy');
+const ledger = require('./ledger');
+const xhr = require('./xhr.capture');
 
 app.commandLine.appendSwitch('disable-http-cache');
 
@@ -363,6 +365,11 @@ async function purgeRendererStorage(win, keep = null) {
 // una actualización de software no puede costar ventas capturadas que todavía no
 // llegan al servidor.
 //
+// NINGÚN preset toca "Ventas en local" (src/ledger.js), ni siquiera 'full'. Esa base
+// vive fuera de `userData` justo para que el borrado total del botón rojo no se lleve
+// el historial de ventas de la caja: lo que se borra aquí es caché y estado de sesión,
+// no el registro de lo que se cobró.
+//
 // Banderas (todas sobreescribibles una por una desde el IPC):
 //   redownload  vuelve a bajar el bundle del frontend ANTES de borrar nada
 //   frontend    tira el bundle descargado y su meta (obliga a re-descargar)
@@ -424,6 +431,10 @@ async function runCacheClear(win, options = {}) {
     for (const k of Object.keys(cfg)) {
         if (typeof opts[k] === 'boolean') cfg[k] = opts[k];
     }
+
+    // Queda anotado en la captura XHR: un borrado recarga la ventana, y sin esta marca
+    // el corte de peticiones en el .har parece una caída del servidor.
+    try { xhr.note('borrado-de-cache', { preset, motivo: reason }); } catch { }
 
     // En dev el frontend lo sirve el dev server de Vue: no hay bundle que bajar
     // ni que tirar.
@@ -750,6 +761,10 @@ function createMainWindow() {
     win.setMenuBarVisibility(false);
     enforceMacNoTrafficLights(win);
 
+    // Captura de sesiones XHR: se engancha ANTES del loadURL para que el primer
+    // /auth/check y el propio login queden dentro. Ver src/xhr.capture.js.
+    xhr.attach(win.webContents, 'principal');
+
     win.webContents.on('did-finish-load', () => notifyWinMode(win));
 
     win.loadURL(IS_DEV ? `${DEV_URL}/` : `http://127.0.0.1:${LOCAL_FRONT_PORT}/`);
@@ -902,8 +917,9 @@ function openConfigWindow() {
 
     configWindow = new BrowserWindow({
         width: 680,
-        height: 460,
+        height: 700,
         resizable: false,
+        closable: true,
         backgroundColor: '#ffffff',
         frame: isMac ? true : false,
         titleBarStyle: isMac ? 'hidden' : undefined,
@@ -924,7 +940,23 @@ function openConfigWindow() {
     configWindow.setMenuBarVisibility(false);
     enforceMacNoTrafficLights(configWindow);
 
-    configWindow.loadURL(`http://127.0.0.1:${LOCAL_FRONT_PORT}/__client/config`);
+    // La ventana no tiene marco (Windows) ni semaforos (macOS), asi que el
+    // unico cierre es el que ofrece la propia pagina. Esto es la red: Esc o
+    // Ctrl/Cmd+W la cierran aunque el script de la pagina no haya cargado.
+    configWindow.webContents.on('before-input-event', (event, input) => {
+        if (input.type !== 'keyDown') return;
+
+        const isEscape = input.key === 'Escape';
+        const isCloseCombo = (input.control || input.meta) && String(input.key).toLowerCase() === 'w';
+        if (!isEscape && !isCloseCombo) return;
+
+        event.preventDefault();
+        if (configWindow && !configWindow.isDestroyed()) configWindow.destroy();
+    });
+
+    // ?modal=1 le dice a la pagina que se esta dibujando en esta ventana y que
+    // puede ofrecer el cierre (en el primer arranque se sirve en la principal).
+    configWindow.loadURL(`http://127.0.0.1:${LOCAL_FRONT_PORT}/__client/config?modal=1`);
     configWindow.on('closed', () => { configWindow = null; });
 }
 
@@ -1128,6 +1160,67 @@ function wireIpc() {
             return { ok: false, error: msg, preset: opts.preset || 'update', reason: String(opts.reason || 'manual') };
         }
     });
+
+    // ── Ventas en local ────────────────────────────────────────────────────
+    // El POS anota aquí cada venta, cada renglón y cada voucher de la terminal.
+    // Ver src/ledger.js para el porqué y para las protecciones del archivo.
+    //
+    // Dos reglas que no se rompen:
+    //   1. NINGÚN canal borra un renglón. `remove` es lo más parecido y no lo
+    //      hace: pone una lápida (deja de verse y de contar) sobre una venta que
+    //      nunca se consolidó, con motivo y con su evento en la cadena. Una
+    //      venta que sí llegó al servidor la rechaza el propio motor.
+    //   2. Ninguno de estos canales LANZA. El ledger es instrumentación: un
+    //      fallo suyo no puede tumbar un cobro, así que responde
+    //      { ok:false, error } y el POS sigue con su bitácora de siempre.
+    const ledgerHandle = (channel, fn) => removeAndHandle(channel, (event, arg) => {
+        try {
+            return fn(arg);
+        } catch (e) {
+            const msg = e && e.message ? e.message : String(e);
+            console.warn(`[ledger] ${channel} falló:`, msg);
+            return { ok: false, error: msg };
+        }
+    });
+
+    ledgerHandle('nestor:ledger:status', () => ledger.status());
+    ledgerHandle('nestor:ledger:stats', () => ledger.stats());
+    ledgerHandle('nestor:ledger:record', (entry) => ledger.record(entry));
+    ledgerHandle('nestor:ledger:mark', (patch) => ledger.mark(patch));
+    ledgerHandle('nestor:ledger:remove', (patch) => ledger.remove(patch));
+    ledgerHandle('nestor:ledger:emv', (entry) => ledger.emv(entry));
+    ledgerHandle('nestor:ledger:list', (query) => ledger.list(query));
+    ledgerHandle('nestor:ledger:get', (key) => ledger.get(key));
+    ledgerHandle('nestor:ledger:summary', (query) => ledger.summary(query));
+    ledgerHandle('nestor:ledger:verify', (limit) => ledger.verify(limit));
+    ledgerHandle('nestor:ledger:export', (query) => ledger.exportAll(query));
+
+    // ── Captura de sesiones XHR ─────────────────────────────────────────────
+    // Misma regla que el ledger: es instrumentación, así que ningún canal lanza.
+    // `save-now` cierra el .har de la sesión en curso y sigue capturando en otro,
+    // que es lo que se pide para mandar una captura sin cerrar el punto de venta.
+    const xhrHandle = (channel, fn) => removeAndHandle(channel, (event, arg) => {
+        try {
+            return fn(arg);
+        } catch (e) {
+            const msg = e && e.message ? e.message : String(e);
+            console.warn(`[xhr] ${channel} falló:`, msg);
+            return { ok: false, error: msg };
+        }
+    });
+
+    xhrHandle('nestor:xhr:status', () => xhr.status());
+    xhrHandle('nestor:xhr:list', (limit) => xhr.list(limit));
+    xhrHandle('nestor:xhr:save-now', (reason) => xhr.saveNow(reason));
+    xhrHandle('nestor:xhr:mark', (entry) => xhr.mark(entry));
+    // Adelanta la limpieza por retención (corre sola cada 6 h en cada caja).
+    xhrHandle('nestor:xhr:sweep', () => xhr.sweep());
+    xhrHandle('nestor:xhr:open-folder', async () => {
+        const target = xhr.directory();
+        if (!target) return { ok: false, error: 'sin directorio de capturas' };
+        const err = await shell.openPath(target);
+        return { ok: !err, ruta: target, error: err || '' };
+    });
 }
 
 function exitFullscreenAndKiosk(win) {
@@ -1184,6 +1277,16 @@ app.whenReady().then(async () => {
 
         Menu.setApplicationMenu(null);
 
+        // "Ventas en local" — se abre ANTES que la ventana y antes de cualquier borrado
+        // de caché. Vive fuera de `userData`, así que nada de lo que hace runCacheClear
+        // (ni el botón rojo) lo alcanza; ver src/ledger.js.
+        ledger.init(app.getPath('userData'));
+
+        // Captura de sesiones XHR. También vive fuera de `userData` y también se abre
+        // antes de cualquier borrado de caché: lo que se quiere leer después de un
+        // borrado es justo lo que pasó antes. Ver src/xhr.capture.js.
+        xhr.init(app.getPath('userData'), { appVersion: app.getVersion() });
+
         wireIpc();
 
         const { currentDir } = getPaths();
@@ -1238,4 +1341,8 @@ app.on('will-quit', () => {
     try { if (versionTimer) clearInterval(versionTimer); } catch { }
     versionTimer = null;
     try { globalShortcut.unregisterAll(); } catch { }
+    // Cerrar la captura XHR de esta corrida: el .har queda completo y abrible.
+    try { xhr.shutdown(); } catch { }
+    // Consolidar el WAL para que el .db de ventas quede copiable tal cual (sin sidecar).
+    try { ledger.shutdown(); } catch { }
 });
