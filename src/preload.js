@@ -18,6 +18,21 @@ function invoke(channel, ...args) {
         });
 }
 
+// Suscripción main -> renderer. Devuelve la función para darse de baja (los
+// listeners de ipcRenderer no se limpian solos al desmontar un componente).
+function subscribe(channel, cb) {
+    if (typeof cb !== 'function') return () => { };
+
+    const handler = (event, payload) => {
+        try { cb(payload); } catch { }
+    };
+
+    ipcRenderer.on(channel, handler);
+    return () => {
+        try { ipcRenderer.removeListener(channel, handler); } catch { }
+    };
+}
+
 log('[preload] loaded');
 
 let initialConfig = null;
@@ -42,7 +57,40 @@ contextBridge.exposeInMainWorld('NestorClient', {
     relaunch: () => invoke('nestor:relaunch'),
 
     refresh: () => invoke('nestor:refresh'),
+
+    // Botón rojo "Eliminar datos y caché": borrado TOTAL (se lleva sesión y la
+    // cola de tickets del POS) + reinicio.
     clearData: () => invoke('nestor:clear-data'),
+
+    // Mismo motor que el botón rojo, pero para que el sistema vacíe el caché
+    // solo cuando haya una actualización de software:
+    //
+    //   await window.NestorClient.clearCache({ preset: 'update', reason: 'ota' })
+    //
+    // preset 'update' (default) conserva sesión y ventas encoladas, baja el
+    // bundle nuevo y recarga; 'cache' sólo tira caché; 'full' es el botón rojo.
+    // Devuelve { ok, cleared, build, localStorageKeysRemoved, ... } y NO lanza:
+    // si falla la descarga responde { ok:false, error } sin haber borrado nada.
+    clearCache: (options) => invoke('nestor:clear-cache', options || {}),
+
+    // Aviso de que el caché se borró (venga de donde venga). Ojo: la ventana que
+    // lo pidió normalmente se recarga o se reinicia justo después, así que esto
+    // sirve para reaccionar, no para confirmar.
+    onCacheCleared: (cb) => subscribe('nestor:cache-cleared', cb),
+
+    // Gate del auto-update. Mientras el POS lo tenga tomado (y siga en /pos), el
+    // cliente NO se recarga solo al cambiar la build del servidor: la anota y
+    // avisa. Hay que renovarlo cada <90 s o caduca — así una ventana colgada no
+    // deja a la caja sin actualizar nunca.
+    setUpdateGate: (active) => invoke('nestor:update-gate', { active: active !== false }),
+
+    // { available, currentBuildId, remoteBuildId, deferred, gate }
+    getUpdateStatus: () => invoke('nestor:update-status'),
+
+    // Se dispara cuando hay build nueva y el gate la difirió. Quien escucha es
+    // responsable de aplicarla con clearCache({ preset: 'update' }) cuando sea
+    // seguro. Devuelve la función para darse de baja.
+    onUpdateAvailable: (cb) => subscribe('nestor:update-available', cb),
 
     getWindowMode: () => invoke('win:get-mode'),
     toggleFullscreen: () => invoke('win:toggle-fullscreen'),

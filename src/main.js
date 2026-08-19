@@ -7,6 +7,24 @@ const { startLocalFrontendServer } = require('./proxy');
 
 app.commandLine.appendSwitch('disable-http-cache');
 
+// Autoplay CON audio sin exigir un gesto del usuario.
+//
+// Chromium bloquea por defecto la reproducción con sonido hasta que el usuario interactúa
+// con la página, y NO existe un permiso que se pueda pedir por API para eso. En un
+// navegador normal la única salida es capturar un gesto (el checador de precios muestra un
+// aviso de "toca para activar el sonido" y también se desbloquea con el primer escaneo).
+//
+// Aquí no hace falta: esta app ES el equipo del negocio, en modo kiosco, y la política de
+// autoplay se concede de una vez en el arranque. Con esto la propaganda digital del
+// Checador de Precios se reproduce con audio desde el primer video, sin que nadie toque
+// nada.
+//
+// Va en DOS lugares a propósito: el switch de línea de comandos cubre todo el proceso
+// (incluidos los webContents que no creamos nosotros) y `webPreferences.autoplayPolicy`
+// —más abajo, en cada BrowserWindow— es la garantía a nivel de ventana si un build de
+// Electron cambiara el manejo del switch.
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
 const DEFAULT_SERVER_ORIGIN = 'http://127.0.0.1:8180';
 const LOCAL_FRONT_PORT = parseInt(process.env.NESTOR_FRONT_PORT || '18180', 10);
 
@@ -58,6 +76,25 @@ let savedZoomFactor = 1.0;
 let currentBuildId = null;
 let versionTimer = null;
 let updateInFlight = false;
+
+// ── Gate del POS sobre el auto-update ──────────────────────────────────────
+// El auto-update por cambio de build recarga la ventana. Hacerlo a media venta
+// le tumba la pantalla al cajero, así que mientras el POS esté al frente NO se
+// aplica solo: se difiere y el propio POS lo dispara por `nestor:clear-cache`
+// cuando la caja está ociosa (cuenta vacía, sin cola de tickets, sin modales).
+//
+// Fail-safe hacia el comportamiento de siempre: el gate sólo cuenta si el POS lo
+// tomó explícitamente (IPC `nestor:update-gate`), sigue en la ruta /pos y su
+// último latido es reciente. Un frontend viejo —que no sabe de esto— nunca lo
+// toma, y entonces el cliente se actualiza como antes. Una ventana colgada deja
+// de renovarlo y el gate caduca sola.
+const POS_GATE_TTL_MS = 90 * 1000;
+let posUpdateGate = { active: false, at: 0 };
+
+// Build nueva detectada pero NO aplicada por el gate, y la última que ya se
+// anunció al renderer (para no repetir el evento en cada ping).
+let deferredBuildId = '';
+let announcedBuildId = '';
 
 function getWinMode(win) {
     if (!win) return { fullscreen: false, kiosk: false, simple: false };
@@ -270,16 +307,22 @@ async function clearAppData({ frontend = false, storages = ['serviceworkers', 'c
 
 // Limpia localStorage dentro de la página, preservando las llaves que no se
 // pueden perder. Se corre justo antes de recargar.
-async function purgeRendererStorage(win) {
+//
+// `keep` explícito es lo que usa runCacheClear: cada preset decide si la sesión
+// y los borradores del POS sobreviven. Sin él se cae al comportamiento del
+// auto-update por cambio de build (NESTOR_UPDATE_KEEP_SESSION).
+async function purgeRendererStorage(win, keep = null) {
     if (!win || win.isDestroyed()) return -1;
 
-    const keep = KEEP_SESSION_ON_AUTO_CLEAR
-        ? [...POS_DRAFT_KEYS, ...SESSION_KEYS]
-        : [...POS_DRAFT_KEYS];
+    const keepKeys = Array.isArray(keep)
+        ? keep
+        : (KEEP_SESSION_ON_AUTO_CLEAR
+            ? [...POS_DRAFT_KEYS, ...SESSION_KEYS]
+            : [...POS_DRAFT_KEYS]);
 
     const js = `(() => {
         try {
-            const keep = new Set(${JSON.stringify(keep)});
+            const keep = new Set(${JSON.stringify(keepKeys)});
             const doomed = [];
             for (let i = 0; i < localStorage.length; i++) {
                 const k = localStorage.key(i);
@@ -294,6 +337,194 @@ async function purgeRendererStorage(win) {
         return await win.webContents.executeJavaScript(js, true);
     } catch {
         return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// "Borrar caché" invocable
+//
+// Es la misma rutina del botón rojo ("Eliminar datos y caché" de la ventana de
+// Configuración), extraída para que la puedan disparar tres consumidores por el
+// mismo camino:
+//
+//   1. El botón rojo             -> IPC `nestor:clear-data`  (preset 'full')
+//   2. El auto-update por build  -> applyBuildChange()       (preset 'update')
+//   3. El sistema, desde el SPA  -> IPC `nestor:clear-cache` (preset a elegir)
+//
+// El (3) es el que existe para que, cuando el sistema detecte una actualización
+// de software, pueda vaciar el caché del cliente sin que nadie abra la ventana
+// de Configuración ni toque el botón rojo:
+//
+//   await window.NestorClient.clearCache({ preset: 'update', reason: 'ota' })
+//
+// Diferencia clave entre presets: el botón rojo es un borrado TOTAL (se lleva la
+// sesión del cajero y la cola de tickets del POS, y por eso reinicia la app). El
+// preset 'update' NO: conserva `x-access-token` y los borradores/outbox, porque
+// una actualización de software no puede costar ventas capturadas que todavía no
+// llegan al servidor.
+//
+// Banderas (todas sobreescribibles una por una desde el IPC):
+//   redownload  vuelve a bajar el bundle del frontend ANTES de borrar nada
+//   frontend    tira el bundle descargado y su meta (obliga a re-descargar)
+//   storage     toca localStorage/IndexedDB (si es false, sólo caché)
+//   session     también borra el token de sesión
+//   drafts      también borra borradores y cola de tickets del POS
+//   cookies     también borra cookies
+//   relaunch    reinicia el proceso al terminar
+//   reload      recarga la ventana ignorando caché (si no hay relaunch)
+function clearPreset(name) {
+    switch (String(name || '').trim()) {
+        // Botón rojo: borra TODO y reinicia.
+        case 'full':
+            return {
+                redownload: false, frontend: true, storage: true,
+                session: true, drafts: true, cookies: true,
+                relaunch: true, reload: false
+            };
+
+        // Sólo caché: HTTP de Electron, respuestas del proxy y service workers.
+        // No toca el bundle ni el almacenamiento local.
+        case 'cache':
+            return {
+                redownload: false, frontend: false, storage: false,
+                session: false, drafts: false, cookies: false,
+                relaunch: false, reload: true
+            };
+
+        // Actualización de software (default). Baja el bundle nuevo primero,
+        // luego limpia, y recarga sin reiniciar el proceso.
+        case 'update':
+        default:
+            return {
+                redownload: true, frontend: false, storage: true,
+                session: !KEEP_SESSION_ON_AUTO_CLEAR, drafts: false, cookies: false,
+                relaunch: false, reload: true
+            };
+    }
+}
+
+function broadcastCacheCleared(payload) {
+    for (const w of BrowserWindow.getAllWindows()) {
+        try {
+            if (!w.isDestroyed()) w.webContents.send('nestor:cache-cleared', payload);
+        } catch { }
+    }
+}
+
+// Ejecuta el borrado. Devuelve qué se borró; NO lanza salvo que falle la
+// descarga del bundle (y en ese caso no se borró nada todavía: la descarga va
+// primero justo para eso — si el servidor está reiniciándose, que es cuando más
+// probable es que cambie la build, la app no se queda sin frontend).
+async function runCacheClear(win, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const preset = opts.preset || 'update';
+    const reason = String(opts.reason || 'manual');
+
+    const cfg = clearPreset(preset);
+    for (const k of Object.keys(cfg)) {
+        if (typeof opts[k] === 'boolean') cfg[k] = opts[k];
+    }
+
+    // En dev el frontend lo sirve el dev server de Vue: no hay bundle que bajar
+    // ni que tirar.
+    if (IS_DEV) {
+        cfg.redownload = false;
+        cfg.frontend = false;
+    }
+
+    // `assumeLock` lo usa el auto-update, que ya tomó el candado. Cualquier otro
+    // llamador que caiga en medio de una actualización se va con busy en vez de
+    // pelearse por el mismo directorio.
+    const assumeLock = opts.assumeLock === true;
+    if (!assumeLock) {
+        if (updateInFlight) return { ok: false, busy: true, preset, reason };
+        updateInFlight = true;
+    }
+
+    try {
+        // El localStorage vive en el origen del servidor local, así que la
+        // ventana principal es la que hay que purgar aunque el IPC venga de la
+        // ventana de Configuración.
+        const target = (mainWindow && !mainWindow.isDestroyed()) ? mainWindow : win;
+
+        let bundle = null;
+        if (cfg.redownload) {
+            // Si truena, se propaga sin haber borrado nada.
+            bundle = await ensureFrontendCached(serverOrigin);
+            // Con el bundle nuevo en disco ya no hay build pendiente: si esto lo
+            // disparó el POS al quedar ocioso, el watcher no debe volver a
+            // anunciar la misma.
+            deferredBuildId = '';
+            announcedBuildId = '';
+        }
+
+        const storages = ['serviceworkers', 'cachestorage'];
+        if (cfg.storage) storages.push('indexdb');
+        if (cfg.cookies) storages.push('cookies');
+
+        // clearStorageData es todo o nada con localStorage: sólo se puede usar
+        // cuando de verdad se van a perder sesión Y borradores. En cualquier
+        // otro caso se purga desde el renderer con lista de exclusión.
+        const wipeAllLocalStorage = cfg.storage && cfg.session && cfg.drafts;
+        if (wipeAllLocalStorage) storages.push('localstorage');
+
+        // Con `redownload` el bundle ya se reemplazó de forma atómica: borrarlo
+        // ahora sería tirar el que acabamos de bajar.
+        await clearAppData({ frontend: cfg.frontend && !bundle, storages });
+
+        let removedKeys = -1;
+        if (cfg.storage && !wipeAllLocalStorage) {
+            const keep = [
+                ...(cfg.drafts ? [] : POS_DRAFT_KEYS),
+                ...(cfg.session ? [] : SESSION_KEYS)
+            ];
+            removedKeys = await purgeRendererStorage(target, keep);
+        }
+
+        // Quedarse sin bundle y sólo recargar deja la ventana en blanco: el
+        // frontend se vuelve a bajar en el arranque, así que hay que reiniciar.
+        if (cfg.frontend && !bundle && !cfg.relaunch) {
+            cfg.relaunch = true;
+            cfg.reload = false;
+        }
+
+        const result = {
+            ok: true,
+            preset,
+            reason,
+            cleared: { ...cfg },
+            build: bundle
+                ? {
+                    version: bundle.version || '',
+                    build_commit: bundle.build_commit || '',
+                    build_id: buildIdOf(bundle)
+                }
+                : null,
+            localStorageKeysRemoved: removedKeys,
+            relaunched: !!cfg.relaunch,
+            reloaded: !cfg.relaunch && !!cfg.reload
+        };
+
+        console.log(`[clear-cache] preset=${preset} reason=${reason} localStorage=${removedKeys} relaunch=${cfg.relaunch} reload=${result.reloaded}`);
+
+        // Se avisa antes de recargar/reiniciar: quien invocó ya tiene la
+        // respuesta del invoke, y esto es para las demás ventanas.
+        broadcastCacheCleared(result);
+
+        if (cfg.relaunch) {
+            // Con retraso para que la respuesta del invoke alcance a salir; el
+            // botón rojo antes salía en seco y el renderer nunca la veía.
+            setTimeout(() => {
+                app.relaunch();
+                app.exit(0);
+            }, 150);
+        } else if (cfg.reload && target && !target.isDestroyed()) {
+            target.webContents.reloadIgnoringCache();
+        }
+
+        return result;
+    } finally {
+        if (!assumeLock) updateInFlight = false;
     }
 }
 
@@ -332,20 +563,20 @@ async function refreshWithUpdate(win) {
 // Aplica una build nueva: primero baja el bundle (rename atómico) y sólo
 // después borra caché y datos. Al revés, si el servidor está reiniciándose
 // —que es justo cuando cambia la build— la app se quedaría sin frontend.
+// Ese orden y las exclusiones (sesión, borradores del POS) los pone el preset
+// 'update' de runCacheClear; aquí sólo se pasa el candado ya tomado.
 async function applyBuildChange(win, remoteId) {
-    const fresh = await ensureFrontendCached(serverOrigin);
-
-    await clearAppData({
-        frontend: false,
-        storages: ['serviceworkers', 'cachestorage', 'indexdb']
+    const res = await runCacheClear(win, {
+        preset: 'update',
+        reason: 'build-change',
+        assumeLock: true
     });
 
-    const removed = await purgeRendererStorage(win);
-    console.log(`[update] datos y caché borrados (localStorage: ${removed} llaves)`);
+    console.log(`[update] datos y caché borrados (localStorage: ${res.localStorageKeysRemoved} llaves)`);
 
-    currentBuildId = buildIdOf(fresh) || remoteId;
-
-    if (win && !win.isDestroyed()) win.webContents.reloadIgnoringCache();
+    currentBuildId = (res.build && res.build.build_id) || remoteId;
+    deferredBuildId = '';
+    announcedBuildId = '';
 }
 
 // Arranque: compara la build del servidor contra la que quedó registrada en
@@ -376,6 +607,48 @@ async function clearCachesIfBuildChanged(origin) {
     return true;
 }
 
+// ¿La ventana está parada en el POS? Se lee del webContents y no de lo que
+// declare el renderer: vue-router navega con pushState y eso sí se refleja aquí.
+function isOnPosRoute(win) {
+    try {
+        if (!win || win.isDestroyed()) return false;
+        const pathname = new URL(win.webContents.getURL()).pathname;
+        return pathname === '/pos' || pathname.startsWith('/pos/');
+    } catch {
+        return false;
+    }
+}
+
+// ¿Hay que diferir el auto-update? Las tres condiciones juntas; si falla
+// cualquiera, el cliente se actualiza como siempre.
+function posGateHolds(win) {
+    if (!posUpdateGate.active) return false;
+    if ((Date.now() - posUpdateGate.at) > POS_GATE_TTL_MS) return false;
+    return isOnPosRoute(win);
+}
+
+function updateStatusPayload() {
+    return {
+        available: !!deferredBuildId && deferredBuildId !== currentBuildId,
+        currentBuildId: currentBuildId || '',
+        remoteBuildId: deferredBuildId || '',
+        deferred: !!deferredBuildId,
+        gate: { active: !!posUpdateGate.active, at: posUpdateGate.at }
+    };
+}
+
+function announceUpdateAvailable(win, remoteId) {
+    if (announcedBuildId === remoteId) return;
+    announcedBuildId = remoteId;
+
+    console.log(`[update] build nueva diferida por el POS: ${currentBuildId || '(sin frontend)'} -> ${remoteId}`);
+    try {
+        if (win && !win.isDestroyed()) {
+            win.webContents.send('nestor:update-available', updateStatusPayload());
+        }
+    } catch { }
+}
+
 async function checkForBuildChange(win) {
     if (!AUTO_UPDATE_ON_BUILD_CHANGE) return;
     if (updateInFlight) return;
@@ -403,7 +676,21 @@ async function checkForBuildChange(win) {
     // Si además arrancó sin bundle (servidor caído en el arranque), hay que
     // bajarlo aunque la build no haya cambiado.
     const haveFrontend = fs.existsSync(path.join(getPaths().currentDir, 'index.html'));
-    if (remoteId === currentBuildId && haveFrontend) return;
+    if (remoteId === currentBuildId && haveFrontend) {
+        // La build volvió a coincidir (o ya se aplicó): no queda nada diferido.
+        deferredBuildId = '';
+        announcedBuildId = '';
+        return;
+    }
+
+    // El POS está al frente: se anota la build y se le avisa, pero la recarga la
+    // decide él. Excepción: sin bundle no hay nada que proteger —la ventana ya
+    // está rota— así que ahí se aplica igual.
+    if (haveFrontend && posGateHolds(win)) {
+        deferredBuildId = remoteId;
+        announceUpdateAvailable(win, remoteId);
+        return;
+    }
 
     updateInFlight = true;
     try {
@@ -452,7 +739,11 @@ function createMainWindow() {
             preload: path.join(__dirname, 'preload.js'),
             contextIsolation: true,
             nodeIntegration: false,
-            devTools: true
+            devTools: true,
+            // La propaganda digital del Checador de Precios se reproduce con audio sin
+            // exigir un gesto del usuario. Ver el comentario del switch de autoplay
+            // al inicio de este archivo.
+            autoplayPolicy: 'no-user-gesture-required'
         }
     });
 
@@ -527,6 +818,16 @@ function createMainWindow() {
                 }
                 // Si estamos en /pos, no interceptar → el renderer lo recibe
             } catch { }
+            return;
+        }
+
+        // Ctrl/Cmd+Alt+Shift+I → devtools. La combinación es deliberadamente
+        // incómoda: en kiosco un F12 suelto lo abriría cualquier cajero por
+        // accidente. Se compara input.code y no input.key porque en mac
+        // Option+Shift+i no produce la letra "i".
+        if (input.code === 'KeyI' && (input.control || input.meta) && input.alt && input.shift) {
+            event.preventDefault();
+            win.webContents.toggleDevTools();
             return;
         }
 
@@ -771,17 +1072,61 @@ function wireIpc() {
         return { ok: response === 1 };
     });
 
-    // Borrado manual: sí es total (incluye sesión y borradores del POS). El
-    // automático por cambio de build es más conservador a propósito.
-    removeAndHandle('nestor:clear-data', async () => {
-        await clearAppData({
-            frontend: true,
-            storages: ['serviceworkers', 'cachestorage', 'localstorage', 'indexdb', 'cookies']
+    // Botón rojo "Eliminar datos y caché". Borrado manual: sí es total (incluye
+    // sesión y borradores del POS) y reinicia. El automático por cambio de build
+    // es más conservador a propósito.
+    removeAndHandle('nestor:clear-data', async (event) => {
+        return await runCacheClear(winFromEvent(event), {
+            preset: 'full',
+            reason: 'manual-button'
         });
+    });
 
-        app.relaunch();
-        app.exit(0);
-        return { ok: true };
+    // El POS toma (o suelta) el gate del auto-update. Mientras lo tenga tomado y
+    // siga en /pos, el cliente NO se recarga solo al cambiar la build: la anota y
+    // avisa por `nestor:update-available`. Hay que renovarlo antes de POS_GATE_TTL_MS
+    // (el POS lo late cada 30 s) o caduca y el cliente vuelve a actualizarse solo.
+    removeAndHandle('nestor:update-gate', async (event, payload) => {
+        const active = !!(payload && payload.active);
+        posUpdateGate = { active, at: Date.now() };
+
+        // Al soltarlo, el siguiente ping del watcher aplica lo que quedó diferido.
+        if (!active && deferredBuildId) {
+            console.log('[update] el POS soltó el gate; se aplicará la build diferida');
+        }
+
+        return { ok: true, ...updateStatusPayload() };
+    });
+
+    // ¿Hay una build nueva esperando? Lo pregunta el POS al entrar (la build pudo
+    // cambiar antes de que la caja abriera) y cuando le conviene aplicarla.
+    removeAndHandle('nestor:update-status', async () => updateStatusPayload());
+
+    // Mismo motor que el botón rojo, pero invocable por el sistema: la idea es
+    // que el SPA lo llame cuando detecte una actualización de software y el
+    // caché del cliente tenga que vaciarse solo.
+    //
+    //   await window.NestorClient.clearCache({ preset: 'update', reason: 'ota' })
+    //
+    // Presets: 'update' (default, conserva sesión y ventas encoladas),
+    // 'cache' (sólo caché, no toca almacenamiento) y 'full' (idéntico al botón
+    // rojo: borra todo y reinicia). Cualquier bandera individual se puede
+    // sobreescribir en el mismo objeto.
+    removeAndHandle('nestor:clear-cache', async (event, options) => {
+        const opts = (options && typeof options === 'object') ? { ...options } : {};
+
+        // El candado es del proceso principal: nadie lo pide por IPC.
+        delete opts.assumeLock;
+
+        try {
+            return await runCacheClear(winFromEvent(event), opts);
+        } catch (e) {
+            const msg = e && e.message ? e.message : String(e);
+            console.warn('[clear-cache] falló:', msg);
+            // Falla la descarga del bundle => no se borró nada. Se responde en
+            // vez de lanzar para que el SPA pueda reintentar sin romperse.
+            return { ok: false, error: msg, preset: opts.preset || 'update', reason: String(opts.reason || 'manual') };
+        }
     });
 }
 

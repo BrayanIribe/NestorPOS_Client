@@ -123,7 +123,10 @@ function configHtml() {
     if (!ok) return;
     setStatus('Eliminando datos...');
     try {
-      await window.NestorClient.clearData();
+      const res = await window.NestorClient.clearData();
+      if (res && res.busy) setStatus('Hay una actualización en curso. Intenta de nuevo en unos segundos.');
+      else if (res && res.ok === false) setStatus('ERROR\\n' + (res.error || 'No se pudo borrar'));
+      else setStatus('Datos eliminados. Reiniciando...');
     } catch (e) {
       setStatus('ERROR\\n' + (e && e.message ? e.message : String(e)));
     }
