@@ -339,7 +339,19 @@ function startLocalFrontendServer(currentDir, getServerOriginFn) {
         headers.host = upstreamUrl.host;
         headers['x-forwarded-host'] = req.headers.host || '';
         headers['x-forwarded-proto'] = 'http';
-        headers['x-forwarded-for'] = req.socket.remoteAddress || '';
+
+        // Este proxy corre DENTRO de la caja: la conexión al servidor sale de este
+        // mismo equipo, así que el RemoteAddr que ve el backend ya ES la IP de la
+        // caja. Anexar un X-Forwarded-For con `req.socket.remoteAddress` —que es el
+        // loopback de la ventana hablando con este express, o sea ::1— sólo servía
+        // para mentirle: el backend confía en ese header para identificar el origen,
+        // así que TODOS los accesos desde el cliente de escritorio quedaban
+        // registrados en la bitácora como ::1, sin poder distinguir una caja de otra.
+        // Se borran también los que pudieran venir de la ventana: la única fuente de
+        // verdad aquí es la conexión TCP.
+        delete headers['x-forwarded-for'];
+        delete headers['x-real-ip'];
+        delete headers['xz-nestor-real-xyz-ip'];
 
         const options = {
             protocol: upstreamUrl.protocol,

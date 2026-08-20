@@ -54,6 +54,24 @@ const DEDUPE_WINDOW_MS = Math.max(0, parseInt(process.env.NESTOR_POS_ERRORS_WIND
 const MAX_PER_DAY = Math.max(1, parseInt(process.env.NESTOR_POS_ERRORS_MAX_DAY || '', 10) || 20);
 const KEEP_HAR = String(process.env.NESTOR_POS_ERRORS_KEEP_HAR || '1') !== '0';
 
+// Cuánto se conserva un paquete que no ha podido subir. Es una CADUCIDAD, no un número de
+// intentos: una tienda sin internet medio día no puede perder sus paquetes, y son justo los
+// días con la red caída los que más incidencias generan (las ventas se encolan y fallan).
+const KEEP_DAYS = Math.max(1, parseInt(process.env.NESTOR_POS_ERRORS_KEEP_DAYS || '', 10) || 7);
+
+// Tope del directorio de la cola. Con la red caída, 20 paquetes al día a ~22 MB llenan un
+// disco chico en una semana. Al pasarlo NO se tiran paquetes: se les quitan los adjuntos
+// PESADOS a los más viejos (primero el .har, luego la consola) y se conserva el manifiesto,
+// que es lo que contesta quién, en qué caja y qué falló. Sólo si aun así no cabe se
+// descartan paquetes enteros, del más viejo al más nuevo.
+const QUEUE_MAX_BYTES = Math.max(64 * 1024 * 1024,
+    parseInt(process.env.NESTOR_POS_ERRORS_MAX_BYTES || '', 10) || 1024 * 1024 * 1024);
+
+// Orden en el que se sacrifican los adjuntos cuando falta espacio. El manifiesto
+// (`incidencia.json`) y los dos volcados chicos no se tocan nunca: pesan KB y son los que
+// más veces bastan.
+const SACRIFICABLES = ['har', 'consola'];
+
 // Tope de lo que se pide al servidor. El anillo son 2000 líneas y la bitácora de errores se
 // acota por ventana: los dos caben de sobra aquí y el tope sólo evita una sorpresa.
 const SERVER_FETCH_TIMEOUT_MS = 4000;
@@ -361,6 +379,13 @@ async function report(info) {
         console.log(`[errores-pos] incidencia ${incidente} (${manifiesto.error_code || 'sin código'}): ` +
             `${archivos.length} archivos, ${archivos.reduce((a, f) => a + f.bytes, 0)} bytes`);
 
+        // Con la red caída los paquetes se acumulan: se poda AQUÍ, en cuanto entra uno
+        // nuevo, y no sólo en el temporizador — así el disco nunca depende de que alguien
+        // deje la caja encendida el tiempo suficiente.
+        try { pruneQueue(); } catch (e) {
+            console.warn('[errores-pos] la poda de la cola falló:', e && e.message);
+        }
+
         if (xhr) {
             xhr.note('error-pos', { incidente, codigo: manifiesto.error_code, folio: manifiesto.folio });
         }
@@ -428,8 +453,12 @@ function bumpOccurrences(incidente, veces) {
 // ── Cola y subida ───────────────────────────────────────────────────────────────
 
 const CHUNK_BYTES = 8 * 1024 * 1024;
-const MAX_ATTEMPTS = 12;
 let flushing = false;
+// Alguien pidió vaciar la cola mientras ya se estaba vaciando. No se puede ignorar: la
+// petición suele venir justo del momento que importa —acaba de volver la red, o soporte
+// tocó el botón— y descartarla dejaría la cola esperando al temporizador de 5 minutos.
+// Se anota y se repasa al terminar, una sola vez más.
+let flushWanted = false;
 let flushTimer = null;
 
 // En orden de creación, no el del sistema de archivos. Importa: el refresco del contador
@@ -545,9 +574,117 @@ function backoff(intentos) {
     return base + Math.floor(Math.random() * 10000);
 }
 
+// Bytes que ocupa un paquete en la cola (sus adjuntos, que es todo lo que pesa).
+function pesoDe(carpeta) {
+    let total = 0;
+    try {
+        for (const f of fs.readdirSync(carpeta)) {
+            try { total += fs.statSync(path.join(carpeta, f)).size; } catch { }
+        }
+    } catch { }
+    return total;
+}
+
+// Quita de un paquete el adjunto pesado que toque, conservando el manifiesto y los volcados
+// chicos. Devuelve los bytes liberados, o 0 si ya no queda nada que sacrificar.
+function aligerar(file, cola) {
+    const carpeta = path.dirname(file);
+
+    for (const clase of SACRIFICABLES) {
+        const idx = (cola.archivos || []).findIndex((a) => a.clase === clase);
+        if (idx < 0) continue;
+
+        const a = cola.archivos[idx];
+        let bytes = 0;
+        try { bytes = fs.statSync(a.ruta).size; } catch { bytes = 0; }
+        try { fs.rmSync(a.ruta, { force: true }); } catch { }
+
+        cola.archivos.splice(idx, 1);
+        cola.aligerado = cola.aligerado || [];
+        cola.aligerado.push({ archivo: a.nombre, clase, bytes, t: new Date().toISOString() });
+
+        // El manifiesto también lo dice: en el panel tiene que verse que ese adjunto no
+        // falta por un error, sino porque la caja se quedó sin espacio esperando red.
+        if (cola.manifiesto) {
+            cola.manifiesto.archivos = (cola.manifiesto.archivos || []).filter((x) => x.clase !== clase);
+            cola.manifiesto.error_message = String(cola.manifiesto.error_message || '');
+            cola.manifiesto.aligerado = cola.aligerado;
+        }
+        writeJson(file, cola);
+
+        console.warn(`[errores-pos] incidencia ${cola.incident_uuid}: se soltó el adjunto ` +
+            `"${clase}" (${bytes} bytes) para no llenar el disco esperando red`);
+        return bytes;
+    }
+    return 0;
+}
+
+/**
+ * Poda de la cola. Dos cortes, en este orden:
+ *
+ *   1. **Caducidad.** Un paquete que lleva más de KEEP_DAYS sin poder subir ya no se
+ *      diagnostica con él; se va entero.
+ *   2. **Bytes del directorio.** Al pasar el tope NO se tiran paquetes: se les quitan los
+ *      adjuntos pesados a los más viejos y se conserva el manifiesto. Sólo si aun así no
+ *      cabe se descartan enteros. Perder el .har de una incidencia vieja es barato; perder
+ *      la incidencia es lo que este módulo existe para evitar.
+ */
+function pruneQueue() {
+    if (!dir) return null;
+
+    const soltados = [];
+    const paquetes = pendientes().map((f) => {
+        const cola = readCola(f) || {};
+        return { file: f, carpeta: path.dirname(f), cola, creado: cola.creado || '', bytes: pesoDe(path.dirname(f)) };
+    });
+
+    const corte = Date.now() - KEEP_DAYS * 24 * 60 * 60 * 1000;
+    let vivos = [];
+    for (const p of paquetes) {
+        const t = Date.parse(p.creado);
+        if (Number.isFinite(t) && t < corte) {
+            try { fs.rmSync(p.carpeta, { recursive: true, force: true }); } catch { }
+            soltados.push({ uuid: p.cola.incident_uuid, motivo: `caducado (${KEEP_DAYS} días sin subir)`, bytes: p.bytes });
+        } else {
+            vivos.push(p);
+        }
+    }
+
+    // Del más viejo al más nuevo: es a los viejos a los que se les quita el peso.
+    vivos.sort((a, b) => String(a.creado).localeCompare(String(b.creado)));
+    let total = vivos.reduce((acc, p) => acc + p.bytes, 0);
+
+    for (const p of vivos) {
+        while (total > QUEUE_MAX_BYTES) {
+            const liberado = aligerar(p.file, p.cola);
+            if (!liberado) break;
+            total -= liberado;
+            p.bytes -= liberado;
+        }
+        if (total <= QUEUE_MAX_BYTES) break;
+    }
+
+    // Última red: si ni soltando adjuntos cabe, se descartan paquetes enteros.
+    while (total > QUEUE_MAX_BYTES && vivos.length) {
+        const p = vivos.shift();
+        try { fs.rmSync(p.carpeta, { recursive: true, force: true }); } catch { }
+        total -= p.bytes;
+        soltados.push({ uuid: p.cola.incident_uuid, motivo: 'sobre el tope de bytes de la cola', bytes: p.bytes });
+    }
+
+    if (soltados.length) {
+        console.warn(`[errores-pos] poda de la cola: ${soltados.length} paquetes descartados`);
+    }
+    return { descartados: soltados, bytes: total, paquetes: vivos.length };
+}
+
 /** Intenta subir lo que haya en la cola. Nunca lanza; se puede llamar tan seguido como se quiera. */
 async function flush() {
-    if (!ready() || flushing) return { ok: true, skipped: true };
+    if (!ready()) return { ok: false, error: initError || 'reporte de errores apagado' };
+    if (flushing) {
+        flushWanted = true;
+        return { ok: true, skipped: true, reason: 'ya había uno en curso; se repasará al terminar' };
+    }
 
     const id = xhr ? xhr.currentIdentity() : {};
     const token = String(id.token || '');
@@ -585,30 +722,65 @@ async function flush() {
                 cola.intentos = (cola.intentos || 0) + 1;
                 cola.ultimo_error = String((e && e.message) || e);
 
-                if (esDefinitivo(e) || cola.intentos >= MAX_ATTEMPTS) {
-                    console.warn(`[errores-pos] incidencia ${cola.incident_uuid} descartada tras ` +
-                        `${cola.intentos} intentos: ${cola.ultimo_error}`);
+                // Un rechazo DEFINITIVO se descarta en el acto: Fact no lo va a aceptar
+                // mañana tampoco. Todo lo demás —sin red, servidor caído, 401— se reintenta
+                // mientras el paquete no caduque. Contar intentos era el error: con la
+                // espera creciente, doce intentos son tres horas y media, así que una
+                // tienda con el internet caído medio día perdía todo lo del día.
+                if (esDefinitivo(e)) {
+                    console.warn(`[errores-pos] incidencia ${cola.incident_uuid} rechazada por el ` +
+                        `servidor: ${cola.ultimo_error}`);
                     fs.rmSync(carpeta, { recursive: true, force: true });
                 } else {
-                    cola.proximo_intento = Date.now() + backoff(cola.intentos);
-                    writeJson(file, cola);
+                    // Se RELEE antes de escribir y sólo se tocan los campos del reintento:
+                    // entre que este flush leyó la cola y falló la red pudo pasar la poda y
+                    // soltar un adjunto (`aligerar`). Escribir la copia en memoria lo
+                    // resucitaría en el manifiesto — el archivo ya no está en disco.
+                    const enDisco = readCola(file) || cola;
+                    enDisco.intentos = cola.intentos;
+                    enDisco.ultimo_error = cola.ultimo_error;
+                    enDisco.proximo_intento = Date.now() + backoff(cola.intentos);
+                    writeJson(file, enDisco);
+                    if (cola.intentos === 1 || cola.intentos % 20 === 0) {
+                        console.warn(`[errores-pos] incidencia ${cola.incident_uuid} sigue sin subir ` +
+                            `(intento ${cola.intentos}): ${cola.ultimo_error}`);
+                    }
                 }
             }
         }
     } finally {
         flushing = false;
     }
+
+    if (flushWanted) {
+        flushWanted = false;
+        const otra = await flush();
+        return { ok: true, subidos: subidos + ((otra && otra.subidos) || 0) };
+    }
     return { ok: true, subidos };
 }
 
 function status() {
     const cola = pendientes().map((f) => readCola(f)).filter(Boolean);
+
+    // Antigüedad del paquete más viejo sin subir. Es el número con el que soporte se entera
+    // de que una caja lleva días sin poder hablar con la nube, en vez de descubrirlo al ir
+    // a buscar una incidencia que nunca llegó.
+    let masViejoMs = 0;
+    for (const c of cola) {
+        const t = Date.parse(c.creado);
+        if (Number.isFinite(t)) masViejoMs = Math.max(masViejoMs, Date.now() - t);
+    }
+
     return {
         enabled: ENABLED,
         ok: ready(),
         error: initError,
         dir,
         pendientes: cola.length,
+        atorada_horas: masViejoMs ? Math.round(masViejoMs / 3600000) : 0,
+        dias_retencion: KEEP_DAYS,
+        tope_bytes: QUEUE_MAX_BYTES,
         bytes_pendientes: cola.reduce((a, c) => a + (c.archivos || []).reduce((b, x) => b + (x.bytes || 0), 0), 0),
         subidos_hoy: subidosHoy,
         tope_diario: MAX_PER_DAY,
@@ -619,6 +791,7 @@ function status() {
             creado: c.creado,
             intentos: c.intentos,
             codigo: c.manifiesto ? c.manifiesto.error_code : '',
+            aligerado: (c.aligerado || []).map((a) => a.clase),
             ultimo_error: c.ultimo_error || ''
         }))
     };
@@ -648,11 +821,19 @@ function init(userDataDir, options) {
 
     // Reintento periódico: una caja sin red guarda el paquete y lo sube cuando vuelve.
     if (flushTimer) clearInterval(flushTimer);
-    flushTimer = setInterval(() => { flush().catch(() => { }); }, 5 * 60 * 1000);
+    flushTimer = setInterval(() => {
+        try { pruneQueue(); } catch { }
+        flush().catch(() => { });
+    }, 5 * 60 * 1000);
     if (flushTimer.unref) flushTimer.unref();
+
+    // Al arrancar: primero se poda lo caducado de la corrida anterior y luego se intenta
+    // subir. Una caja que estuvo apagada una semana no arranca con la cola llena.
+    try { pruneQueue(); } catch { }
 
     const cola = pendientes().length;
     console.log(`[errores-pos] cola en ${dir}` + (cola ? ` (${cola} pendientes)` : ''));
+    flush().catch(() => { });
     return { ok: true, dir, pendientes: cola };
 }
 
