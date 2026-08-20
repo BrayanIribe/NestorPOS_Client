@@ -6,6 +6,7 @@ const AdmZip = require('adm-zip');
 const { startLocalFrontendServer } = require('./proxy');
 const ledger = require('./ledger');
 const xhr = require('./xhr.capture');
+const posError = require('./pos.error');
 
 app.commandLine.appendSwitch('disable-http-cache');
 
@@ -808,6 +809,23 @@ function createMainWindow() {
         });
     }
 
+    // Navegación cancelada por un beforeunload del renderer. Electron NO muestra el
+    // diálogo de Chromium: si nadie atiende este evento, la página simplemente NO se
+    // descarga y el renderer se queda donde estaba, sin enterarse — su
+    // `window.location.href = ...` no lanza ni devuelve nada.
+    //
+    // Así se perdieron nueve ventas el 20/ago/2026 (Victoria caja 2): el POS cerró sesión
+    // en el servidor y su navegación a /login se quedó aquí, en silencio, con la pantalla
+    // del POS entera y ya sin sesión. NO se hace preventDefault a propósito —el guard sigue
+    // valiendo, es lo que protege una transferencia o un ajuste a medias— pero queda
+    // anotado: este era el único punto donde el fallo era completamente invisible.
+    win.webContents.on('will-prevent-unload', () => {
+        try {
+            console.warn('[nav] una navegación se canceló por el beforeunload de la página:',
+                win.webContents.getURL());
+        } catch { }
+    });
+
     // Interceptar Ctrl+R / Cmd+R y atajos de zoom como navegador
     win.webContents.on('before-input-event', (event, input) => {
         if (input.type !== 'keyDown') return;
@@ -973,7 +991,14 @@ ipcMain.on('nestor:get-config-sync', (event) => {
     event.returnValue = {
         serverOrigin,
         localFront: `http://127.0.0.1:${LOCAL_FRONT_PORT}`,
-        apiBaseUrl: `http://127.0.0.1:${LOCAL_FRONT_PORT}/api/v1`
+        apiBaseUrl: `http://127.0.0.1:${LOCAL_FRONT_PORT}/api/v1`,
+        // Versión del ejecutable instalado. Es EXACTAMENTE la que se publicó en Fact:
+        // build.go la inyecta con `-c.extraMetadata.version=` y deploy.go sube ese mismo
+        // número a /panel/v1/installers. Va por el canal SÍNCRONO a propósito — la barra
+        // de estado del POS la pinta en el primer render y un `await` ahí se ve como un
+        // parpadeo en cada arranque de caja.
+        clientVersion: app.getVersion(),
+        platform: process.platform
     };
 });
 
@@ -1067,7 +1092,9 @@ function wireIpc() {
         return {
             serverOrigin,
             localFront: `http://127.0.0.1:${LOCAL_FRONT_PORT}`,
-            apiBaseUrl: `http://127.0.0.1:${LOCAL_FRONT_PORT}/api/v1`
+            apiBaseUrl: `http://127.0.0.1:${LOCAL_FRONT_PORT}/api/v1`,
+            clientVersion: app.getVersion(),
+            platform: process.platform
         };
     });
 
@@ -1194,6 +1221,10 @@ function wireIpc() {
     ledgerHandle('nestor:ledger:summary', (query) => ledger.summary(query));
     ledgerHandle('nestor:ledger:verify', (limit) => ledger.verify(limit));
     ledgerHandle('nestor:ledger:export', (query) => ledger.exportAll(query));
+    // Retención: saca de la base lo ya resuelto que pasó de los 180 días y deja el ancla.
+    // Corre solo al abrir y cada 6 h; esto sólo lo adelanta.
+    ledgerHandle('nestor:ledger:archive', (options) => ledger.archive(options));
+    ledgerHandle('nestor:ledger:archives', () => ledger.archives());
 
     // ── Captura de sesiones XHR ─────────────────────────────────────────────
     // Misma regla que el ledger: es instrumentación, así que ningún canal lanza.
@@ -1215,11 +1246,38 @@ function wireIpc() {
     xhrHandle('nestor:xhr:mark', (entry) => xhr.mark(entry));
     // Adelanta la limpieza por retención (corre sola cada 6 h en cada caja).
     xhrHandle('nestor:xhr:sweep', () => xhr.sweep());
+    // Identidad de la caja (licencia, caja, usuario, negocio) + el token de la sesión.
+    // La pone el POS al montar y en cada login; con ella se nombran las capturas y se
+    // identifica la incidencia en la nube. Ver xhr.capture.js → setIdentity.
+    xhrHandle('nestor:xhr:set-identity', (patch) => xhr.setIdentity(patch));
+
     xhrHandle('nestor:xhr:open-folder', async () => {
         const target = xhr.directory();
         if (!target) return { ok: false, error: 'sin directorio de capturas' };
         const err = await shell.openPath(target);
         return { ok: !err, ruta: target, error: err || '' };
+    });
+
+    // ── Errores POS ─────────────────────────────────────────────────────────
+    // Misma regla que el ledger y la captura: es instrumentación y NUNCA lanza. Un fallo
+    // aquí no puede tumbar el cobro que lo provocó — que es literalmente el momento en el
+    // que se llama.
+    removeAndHandle('nestor:diag:report', async (event, info) => {
+        try {
+            return await posError.report(info || {});
+        } catch (e) {
+            const msg = e && e.message ? e.message : String(e);
+            console.warn('[errores-pos] report falló:', msg);
+            return { ok: false, error: msg };
+        }
+    });
+
+    removeAndHandle('nestor:diag:status', async () => {
+        try { return posError.status(); } catch (e) { return { ok: false, error: String(e && e.message) }; }
+    });
+
+    removeAndHandle('nestor:diag:flush', async () => {
+        try { return await posError.flush(); } catch (e) { return { ok: false, error: String(e && e.message) }; }
     });
 }
 
@@ -1287,6 +1345,17 @@ app.whenReady().then(async () => {
         // borrado es justo lo que pasó antes. Ver src/xhr.capture.js.
         xhr.init(app.getPath('userData'), { appVersion: app.getVersion() });
 
+        // Errores POS. Va DESPUÉS de los otros dos porque los usa: arma el paquete de
+        // incidencia con la sesión de `xhr` y el volcado de `ledger`. `serverOrigin` se
+        // pasa como función, no como valor: se resuelve más abajo y el usuario puede
+        // cambiarlo desde la ventana de configuración sin reiniciar.
+        posError.init(app.getPath('userData'), {
+            appVersion: app.getVersion(),
+            serverOrigin: () => serverOrigin,
+            xhr,
+            ledger
+        });
+
         wireIpc();
 
         const { currentDir } = getPaths();
@@ -1345,4 +1414,6 @@ app.on('will-quit', () => {
     try { xhr.shutdown(); } catch { }
     // Consolidar el WAL para que el .db de ventas quede copiable tal cual (sin sidecar).
     try { ledger.shutdown(); } catch { }
+    // La cola de incidencias se queda en disco: lo que no se subió se sube al arrancar.
+    try { posError.shutdown(); } catch { }
 });

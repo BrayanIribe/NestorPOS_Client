@@ -17,7 +17,17 @@
 // Electron, que el proceso principal mantiene abierto de arranque a cierre y del que no se
 // borra nada.
 //
-// Con una salida, y sólo una: `remove()` retira a mano una venta que NUNCA se consolidó
+// Con dos salidas, y sólo dos. La primera, `archive()`, es la retención: a los 180 días una
+// venta YA RESUELTA (registrada, descartada, revisada o retirada) sale de la base — pero no
+// se pierde ni se puede ocultar. Sale a un `.jsonl.gz` firmado que queda en el mismo
+// directorio, y en la base se queda el ANCLA: un renglón en `ledger_archives` con el rango
+// de eventos retirado, el hash del último y el SHA-256 del archivo, más un evento
+// `archivo` en la propia cadena. `verify()` arranca desde el ancla, así que sigue diciendo
+// "alterada" si alguien saca eventos por su cuenta: archivar es la única forma de quitar
+// algo, y deja recibo. Una venta SIN resolver no se archiva por vieja que sea — es
+// exactamente la que no puede desaparecer.
+//
+// La segunda: `remove()` retira a mano una venta que NUNCA se consolidó
 // (una prueba, una captura duplicada, algo que jamás va a registrarse). Y "retirar" es una
 // LÁPIDA, no un DELETE: el renglón desaparece de los listados y de los conteos, pero se
 // queda en la base con quién lo quitó, cuándo y por qué. Una venta que sí llegó al servidor
@@ -63,6 +73,7 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const zlib = require('zlib');
 const crypto = require('crypto');
 
 let DatabaseSync = null;
@@ -80,7 +91,27 @@ const DB_FILENAME = 'ventas-local.db';
 const SHADOW_FILENAME = 'ventas-local.jsonl';
 
 // Versión del esquema. Sólo sube; las migraciones son aditivas (ver ensureSchema).
-const SCHEMA_VERSION = 1;
+// v2: `ledger_guard` + `ledger_archives` (retención por archivado con ancla).
+const SCHEMA_VERSION = 2;
+
+// Retención: 180 días de ventas RESUELTAS en la base viva. Lo anterior se archiva.
+// A ~190 tickets/día una caja ocupada llega a unos 340 MB en ese plazo, que es lo que se
+// puede copiar y consultar sin que la base estorbe.
+const RETENTION_DAYS = Math.max(30, parseInt(process.env.NESTOR_LEDGER_RETENTION_DAYS || '180', 10) || 180);
+
+// Cada cuánto se comprueba si toca archivar. Corre al abrir y luego junto al consolidado
+// del WAL: una caja se queda semanas encendida y nadie va a dispararlo a mano.
+const ARCHIVE_EVERY_MS = 6 * 60 * 60 * 1000;
+let lastArchiveCheck = 0;
+
+// Estados en los que una venta se considera RESUELTA y por tanto archivable. Todo lo demás
+// —cobrada sin registrar, en cola, fallida, rechazada— se queda en la base viva por muy
+// antigua que sea: son las que alguien todavía tiene que atender.
+const RESOLVED_FOR_ARCHIVE = ['registered', 'discarded'];
+
+// La misma lista, lista para incrustar en SQL. Se arma aquí y no a mano en cada consulta
+// para que no haya dos definiciones de "resuelta" que puedan separarse.
+const RESOLVED_SQL_IN = RESOLVED_FOR_ARCHIVE.map((s) => `'${s}'`).join(', ');
 
 // Tope del texto que se guarda por evento. Un voucher completo cabe de sobra; lo que se
 // corta son los volcados accidentales.
@@ -152,17 +183,36 @@ function resolveDirs(userDataDir) {
 // Un solo lugar con los triggers: cada tabla del ledger prohíbe DELETE, y las tres tablas
 // append-only prohíben además UPDATE. Los triggers viven EN EL ARCHIVO, así que valen
 // también para quien lo abra por fuera.
+// La guarda del borrado. El trigger ya no prohíbe el DELETE en absoluto: lo prohíbe
+// MIENTRAS la llave `ledger_guard.ok` valga 0, que es siempre salvo dentro de la
+// transacción de `archive()`.
+//
+// Por qué una llave y no quitar el trigger para archivar: quitarlo y volverlo a poner deja
+// la tabla desprotegida durante la operación y, si algo falla en medio, desprotegida para
+// siempre. La llave se levanta y se baja dentro de la MISMA transacción que borra, así que
+// un fallo la revierte con todo lo demás.
+//
+// Lo que se conserva de la promesa original: un `DELETE` a secas —desde esta aplicación,
+// desde el `sqlite3` de consola o desde cualquier visor— sigue abortando. Para borrar hay
+// que levantar la llave a propósito, y eso lo hace un solo camino, que deja recibo.
+//
+// Los triggers se RECREAN en cada apertura (drop + create, no `IF NOT EXISTS`): una caja
+// que ya venía anotando ventas tiene los triggers viejos sin guarda, y con `IF NOT EXISTS`
+// se quedarían así para siempre y `archive()` no podría trabajar.
 function guardsFor(table, { immutable = false } = {}) {
     const sql = [`
-        CREATE TRIGGER IF NOT EXISTS trg_${table}_no_delete
+        DROP TRIGGER IF EXISTS trg_${table}_no_delete;
+        CREATE TRIGGER trg_${table}_no_delete
         BEFORE DELETE ON ${table}
+        WHEN COALESCE((SELECT ok FROM ledger_guard WHERE id = 1), 0) = 0
         BEGIN
             SELECT RAISE(ABORT, 'ventas-local: los renglones de ${table} no se eliminan');
         END;`];
 
     if (immutable) {
         sql.push(`
-        CREATE TRIGGER IF NOT EXISTS trg_${table}_no_update
+        DROP TRIGGER IF EXISTS trg_${table}_no_update;
+        CREATE TRIGGER trg_${table}_no_update
         BEFORE UPDATE ON ${table}
         BEGIN
             SELECT RAISE(ABORT, 'ventas-local: los renglones de ${table} no se modifican');
@@ -182,6 +232,31 @@ function ensureSchema(handle) {
         CREATE TABLE IF NOT EXISTS ledger_meta (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+
+        -- Llave del borrado. Una sola fila, vale 0 salvo dentro de archive().
+        CREATE TABLE IF NOT EXISTS ledger_guard (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            ok INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- Recibos de archivado: el ANCLA de la cadena. Cada renglón dice qué tramo de
+        -- eventos salió de la base, con qué hash terminaba y en qué archivo está, para que
+        -- verify() pueda seguir desde ahí y para que nadie pueda quitar historia sin
+        -- dejar constancia. Esta tabla nunca se borra ni se modifica.
+        CREATE TABLE IF NOT EXISTS ledger_archives (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_seq   INTEGER NOT NULL DEFAULT 0,
+            to_seq     INTEGER NOT NULL DEFAULT 0,
+            last_hash  TEXT    NOT NULL DEFAULT '',
+            file       TEXT    NOT NULL DEFAULT '',
+            sha256     TEXT    NOT NULL DEFAULT '',
+            bytes      INTEGER NOT NULL DEFAULT 0,
+            tickets    INTEGER NOT NULL DEFAULT 0,
+            events     INTEGER NOT NULL DEFAULT 0,
+            cutoff_ms  INTEGER NOT NULL DEFAULT 0,
+            at_ms      INTEGER NOT NULL DEFAULT 0,
+            at         TEXT    NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS tickets (
@@ -272,6 +347,10 @@ function ensureSchema(handle) {
         CREATE INDEX IF NOT EXISTS idx_emv_vouchers_key ON emv_vouchers (ticket_key);
         CREATE INDEX IF NOT EXISTS idx_emv_vouchers_op  ON emv_vouchers (operation_number);
         CREATE INDEX IF NOT EXISTS idx_emv_vouchers_at  ON emv_vouchers (at_ms DESC);
+        -- La referencia es el segundo vínculo del voucher con su venta (ver list()/get()):
+        -- el intento se anota antes de que el ticket exista, así que hay vouchers cuya
+        -- única forma de encontrar su venta es ésta.
+        CREATE INDEX IF NOT EXISTS idx_emv_vouchers_ref ON emv_vouchers (reference);
 
         CREATE TABLE IF NOT EXISTS ticket_events (
             seq        INTEGER PRIMARY KEY,
@@ -289,10 +368,16 @@ function ensureSchema(handle) {
         CREATE INDEX IF NOT EXISTS idx_ticket_events_key ON ticket_events (ticket_key, seq);
     `);
 
+    // La llave existe SIEMPRE y arranca en 0: sin fila, el COALESCE del trigger la lee
+    // como 0 igual, pero dejarla explícita evita que un INSERT accidental la levante.
+    handle.exec('INSERT OR IGNORE INTO ledger_guard (id, ok) VALUES (1, 0)');
+    handle.exec('UPDATE ledger_guard SET ok = 0 WHERE id = 1');
+
     handle.exec(guardsFor('tickets'));
     handle.exec(guardsFor('ticket_products', { immutable: true }));
     handle.exec(guardsFor('emv_vouchers', { immutable: true }));
     handle.exec(guardsFor('ticket_events', { immutable: true }));
+    handle.exec(guardsFor('ledger_archives', { immutable: true }));
 
     // La identidad de un ticket no cambia: ni la llave, ni la caja, ni el instante en que
     // se abrió. El estado sí (una venta pasa de cobrada a registrada), por eso `tickets`
@@ -322,6 +407,11 @@ function ensureSchema(handle) {
     if (!version) {
         writeMeta(handle, 'schema_version', String(SCHEMA_VERSION));
         writeMeta(handle, 'created_at', new Date().toISOString());
+    } else if (parseInt(version, 10) < SCHEMA_VERSION) {
+        // Base de una versión anterior: las migraciones de arriba ya corrieron (son
+        // aditivas e idempotentes), aquí sólo se deja constancia de hasta dónde llegó.
+        writeMeta(handle, 'schema_version', String(SCHEMA_VERSION));
+        writeMeta(handle, 'migrated_at', new Date().toISOString());
     }
     writeMeta(handle, 'opened_at', new Date().toISOString());
 }
@@ -441,6 +531,9 @@ function init(userDataDir) {
         console.log(`[ledger] ventas en local: ${dbPath} (${counts ? counts.n : 0} tickets, ${lastSeq} eventos)`);
         if (shadowPath) console.log('[ledger] segundo ejemplar:', shadowPath);
         startCheckpointTimer();
+        // Retención: al abrir y luego junto al consolidado del WAL. Nunca bloquea el
+        // arranque — si falla, se anota y la caja sigue.
+        archiveIfDue();
     } catch (err) {
         db = null;
         initError = String((err && err.message) || err);
@@ -472,7 +565,13 @@ function checkpoint() {
 
 function startCheckpointTimer() {
     if (checkpointTimer) return;
-    checkpointTimer = setInterval(checkpoint, CHECKPOINT_MS);
+    checkpointTimer = setInterval(() => {
+        checkpoint();
+        // La retención no puede depender de que alguien cierre el punto de venta: una caja
+        // se queda semanas encendida. `archiveIfDue` trae su propio cooldown de 6 h, así
+        // que esto no es una consulta cada tres minutos.
+        archiveIfDue();
+    }, CHECKPOINT_MS);
     if (typeof checkpointTimer.unref === 'function') checkpointTimer.unref();
 }
 
@@ -491,6 +590,8 @@ const CAPABILITIES = [
     'status', 'stats', 'record', 'mark', 'emv',
     'list', 'get', 'summary', 'verify', 'export',
     'remove', 'acknowledge',
+    // v3 — retención por archivado con ancla
+    'archive', 'archives',
 ];
 
 function status() {
@@ -533,6 +634,12 @@ function folioOf(saleSpotId, invoiceNumber) {
 
 function sha256(text) {
     return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex');
+}
+
+// Sobre bytes, no sobre texto: el archivo de retención va comprimido y lo que se sella es
+// el archivo tal cual queda en disco, que es lo que alguien va a poder comprobar después.
+function sha256Buffer(buf) {
+    return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
 // ── Cadena de eventos ───────────────────────────────────────────────────────────
@@ -913,11 +1020,25 @@ function mark(input) {
  *      (el caso de los $313.00 con terminal). Si además se pudiera hacer desaparecer sin
  *      rastro, esta base no serviría para nada.
  *
- * La guarda que sí está aquí, y no sólo en la interfaz: **una venta consolidada no se
- * retira** (`document_id > 0`). Existe en el servidor y esta copia es su respaldo.
+ * **Y hoy no se retira NADA desde la caja.** Eran dos guardas y ahora cierran la lista
+ * completa:
  *
- * El motivo es opcional (la caja no lo pide: retirar tiene que ser un gesto rápido). Lo que
- * nunca falta es el QUIÉN y el CUÁNDO, que salen de la autorización del supervisor.
+ *   * `document_id > 0` — la venta consolidada existe en el servidor y esta copia es su
+ *     respaldo.
+ *   * sin registrar — es la que hay que RECUPERAR. Retirarla la saca de los listados, de
+ *     los contadores y de la conciliación del corte: borra el único aviso de que falta
+ *     registrar una venta ya cobrada. El 20/ago/2026 una caja juntó nueve así, una con
+ *     $192.00 ya cargados a una tarjeta; con el retiro disponible, "limpiar la lista"
+ *     habría dejado ese cargo sin contraparte en ningún lado y sin nadie que lo supiera.
+ *
+ * No es un permiso que a alguien le falte —no se desbloquea con la autorización de un
+ * supervisor—: es una operación que no debe existir en la caja. La razón 3 de arriba lo
+ * dice desde el principio; lo que faltaba era sacar la consecuencia. Sacar un renglón de
+ * verdad es trabajo de ingeniería sobre la base, deliberado y con el registro que deja.
+ *
+ * La guarda vive aquí, en el motor, y no sólo en la interfaz: el canal IPC lo puede llamar
+ * cualquiera, así que un frontend viejo —o cualquier otro llamador— recibe el mismo rechazo
+ * con su motivo en vez de retirar la venta.
  */
 function remove(input) {
     if (!db) return { ok: false, error: initError || 'ledger no disponible' };
@@ -925,8 +1046,6 @@ function remove(input) {
     const p = input && typeof input === 'object' ? input : {};
     const key = str(p.key).trim();
     if (!key) return { ok: false, error: 'ticket sin llave' };
-
-    const reason = clip(p.reason, 300).trim();
 
     try {
         const prev = db.prepare('SELECT * FROM tickets WHERE ticket_key = ?').get(key);
@@ -939,34 +1058,11 @@ function remove(input) {
                 error: `la venta está registrada en el servidor (documento ${num(prev.document_id)}) y no se puede retirar`,
             };
         }
-        if (num(prev.deleted_at) > 0) {
-            return { ok: true, key, already: true };
-        }
-
-        const now = Date.now();
-        db.prepare(`
-            UPDATE tickets SET
-                deleted_at = ?, deleted_by_user_id = ?, deleted_by_name = ?, deleted_reason = ?,
-                updated_at_ms = ?, updated_at = ?
-            WHERE ticket_key = ?
-        `).run(now, num(p.user_id), clip(p.user_name, 120), reason, now, isoOf(now), key);
-
-        appendEvent({
-            key,
-            kind: 'delete',
-            status: str(prev.status),
-            detail: `retirada manualmente por ${str(p.user_name) || 'un supervisor'}`
-                + (reason ? `: ${reason}` : ''),
-            total: num(prev.total),
-            atMs: now,
-            extra: {
-                folio: str(prev.folio),
-                identifier: str(prev.client_invoice_id),
-                deleted_by_user_id: num(p.user_id),
-            },
-        });
-
-        return { ok: true, key, seq: lastSeq };
+        return {
+            ok: false,
+            code: 'E_LEDGER_TICKET_UNREGISTERED',
+            error: 'la venta no está registrada en el servidor: hay que recuperarla, no retirarla',
+        };
     } catch (err) {
         console.error('[ledger] remove falló:', err && err.message);
         return { ok: false, error: String((err && err.message) || err) };
@@ -1041,6 +1137,15 @@ function list(query) {
 
         // Los cobros con terminal se adjuntan en una sola consulta: la tabla es chica y una
         // consulta por renglón se notaba al abrir el panel con el turno completo.
+        //
+        // Se buscan por ticket_key Y por reference. El intento se anota en cuanto la
+        // terminal responde —con la cuenta todavía abierta y, por tanto, sin ticket_key— y
+        // la fila queda sellada: el vínculo posterior sólo se anota como evento, así que un
+        // filtro por ticket_key a secas dejaba fuera precisamente los vouchers de las ventas
+        // que nunca llegaron a registrarse. Eso pasó el 20/ago/2026: la copia para soporte
+        // decía "emv: []" en la venta cuya tarjeta SÍ se había cobrado ($192.00, oper.
+        // 612915484). La referencia con la que se pide el cobro es el uuid del ticket (ver
+        // startSantanderEmvPayment), así que sirve de vínculo sin inventar nada.
         const keys = rows.map(r => String(r.ticket_key));
         const emvByKey = new Map();
         if (keys.length > 0) {
@@ -1048,10 +1153,14 @@ function list(query) {
             const emvRows = db.prepare(`
                 SELECT ticket_key, operation_number, auth, reference, card_last4, card_type,
                        result, value, vendor
-                FROM emv_vouchers WHERE ticket_key IN (${placeholders})
-            `).all(...keys);
+                FROM emv_vouchers
+                WHERE ticket_key IN (${placeholders})
+                   OR (ticket_key = '' AND reference IN (${placeholders}))
+            `).all(...keys, ...keys);
             for (const v of emvRows) {
-                const k = String(v.ticket_key);
+                // El voucher suelto se agrupa por su referencia: es el ticket al que
+                // pertenece, aunque su propia fila no lo diga.
+                const k = String(v.ticket_key) || String(v.reference);
                 if (!emvByKey.has(k)) emvByKey.set(k, []);
                 emvByKey.get(k).push(v);
             }
@@ -1079,7 +1188,13 @@ function get(key) {
         const products = db.prepare(
             'SELECT * FROM ticket_products WHERE ticket_key = ? AND rev = (SELECT MAX(rev) FROM ticket_products WHERE ticket_key = ?) ORDER BY line_no'
         ).all(k, k);
-        const vouchers = db.prepare('SELECT * FROM emv_vouchers WHERE ticket_key = ? ORDER BY at_ms').all(k);
+        // Igual que en list(): también los vouchers que se anotaron sueltos (sin ticket_key)
+        // y que corresponden a esta venta por su referencia.
+        const vouchers = db.prepare(
+            `SELECT * FROM emv_vouchers
+              WHERE ticket_key = ? OR (ticket_key = '' AND reference = ?)
+              ORDER BY at_ms`
+        ).all(k, k);
         const events = db.prepare('SELECT * FROM ticket_events WHERE ticket_key = ? ORDER BY seq').all(k);
 
         return { ok: true, ticket, products, vouchers, events };
@@ -1148,13 +1263,23 @@ function verify(limit) {
             'SELECT * FROM ticket_events ORDER BY seq LIMIT ?'
         ).all(max);
 
-        let prev = '';
-        let expectedSeq = 1;
+        // La cadena no empieza necesariamente en 1: si hubo archivado por retención,
+        // empieza donde lo dejó el último ancla y encadena con el hash que éste guardó.
+        // Ése es todo el truco — el hueco sólo se acepta si hay recibo de por medio, así
+        // que sacar eventos por fuera de archive() sigue saliendo como "alterada".
+        const ancla = db.prepare(
+            'SELECT to_seq, last_hash, file FROM ledger_archives ORDER BY to_seq DESC LIMIT 1'
+        ).get();
+
+        let prev = ancla ? String(ancla.last_hash) : '';
+        let expectedSeq = ancla ? num(ancla.to_seq) + 1 : 1;
+        const desdeArchivo = ancla ? String(ancla.file) : '';
         for (const r of rows) {
             if (num(r.seq) !== expectedSeq) {
                 return {
-                    ok: true, intact: false, checked: expectedSeq - 1, events: rows.length,
+                    ok: true, intact: false, checked: 0, events: rows.length,
                     broken_at: num(r.seq),
+                    archived_until: ancla ? num(ancla.to_seq) : 0,
                     reason: `falta el evento ${expectedSeq} (el siguiente en la base es el ${num(r.seq)})`,
                 };
             }
@@ -1178,7 +1303,11 @@ function verify(limit) {
             expectedSeq += 1;
         }
 
-        return { ok: true, intact: true, checked: rows.length, events: rows.length, broken_at: 0, reason: '' };
+        return {
+            ok: true, intact: true, checked: rows.length, events: rows.length, broken_at: 0, reason: '',
+            archived_until: ancla ? num(ancla.to_seq) : 0,
+            archived_file: desdeArchivo
+        };
     } catch (err) {
         return { ok: false, error: String((err && err.message) || err) };
     }
@@ -1205,8 +1334,17 @@ function stats() {
             try { shadowBytes = fs.statSync(shadowPath).size; } catch { shadowBytes = 0; }
         }
 
+        const archivados = db.prepare(
+            'SELECT COUNT(*) AS n, COALESCE(SUM(events),0) AS e, COALESCE(SUM(tickets),0) AS t, MAX(to_seq) AS s FROM ledger_archives'
+        ).get();
+
         return {
             ...base,
+            retention_days: RETENTION_DAYS,
+            archives: archivados ? num(archivados.n) : 0,
+            archived_events: archivados ? num(archivados.e) : 0,
+            archived_tickets: archivados ? num(archivados.t) : 0,
+            archived_until_seq: archivados ? num(archivados.s) : 0,
             tickets: tickets ? num(tickets.n) : 0,
             tickets_total: tickets ? num(tickets.t) : 0,
             unresolved: unresolved ? num(unresolved.n) : 0,
@@ -1219,6 +1357,244 @@ function stats() {
         };
     } catch (err) {
         return { ...base, error: String((err && err.message) || err) };
+    }
+}
+
+// ── Retención: archivado con ancla ──────────────────────────────────────────────
+//
+// Ver la cabecera del archivo. Resumen de las reglas, que son lo que hace que esto no sea
+// simplemente "borrar lo viejo":
+//
+//   1. Sólo salen ventas RESUELTAS. Una venta cobrada y sin registrar de hace un año se
+//      queda: es justo la que alguien tiene que atender.
+//   2. Los eventos salen por PREFIJO de la cadena (`seq <= toSeq`), nunca salteados: la
+//      cadena que queda sigue encadenando consigo misma.
+//   3. El corte del prefijo se retrasa hasta ANTES del primer evento de cualquier ticket
+//      que se queda. Así ningún ticket vivo pierde su historia.
+//   4. Antes de borrar se escribe el archivo y se calcula su SHA-256; el ancla lo guarda.
+//      Si el archivo no se pudo escribir, no se borra nada.
+//   5. El borrado va dentro de UNA transacción con la llave `ledger_guard` levantada. Un
+//      fallo a media operación revierte la llave junto con todo lo demás.
+
+function archivesDir() {
+    return path.join(path.dirname(dbPath), 'archivo');
+}
+
+/** Rango y contenido que le tocaría a un archivado ahora. No escribe nada. */
+function archivePlan(cutoffMs) {
+    const cutoff = num(cutoffMs);
+
+    const tope = db.prepare('SELECT MAX(seq) AS s FROM ticket_events WHERE at_ms < ?').get(cutoff);
+    let toSeq = num(tope && tope.s);
+    if (toSeq <= 0) return { toSeq: 0, keys: [] };
+
+    // Tickets que se QUEDAN. El corte del prefijo no puede pasarse de su primer evento.
+    const vivo = `
+        SELECT ticket_key FROM tickets
+        WHERE NOT (
+            updated_at_ms < ?
+            AND (status IN (${RESOLVED_SQL_IN}) OR deleted_at > 0 OR acknowledged_at > 0)
+        )`;
+    const frontera = db.prepare(
+        `SELECT MIN(seq) AS s, ticket_key AS k FROM ticket_events WHERE ticket_key <> '' AND ticket_key IN (${vivo})`
+    ).get(cutoff);
+    const primeroVivo = num(frontera && frontera.s);
+
+    // Consecuencia de la regla 3 que hay que tener presente: una venta ANTIGUA y SIN
+    // RESOLVER frena la retención de todo lo que vino después, porque el prefijo no puede
+    // rebasar su primer evento. Es el comportamiento que se quiere —esa venta no puede
+    // desaparecer— pero en silencio se convertiría en "la base no para de crecer y nadie
+    // sabe por qué". Así que se devuelve quién frena, y el llamador lo reporta.
+    let frenadoPor = '';
+    if (primeroVivo > 0 && primeroVivo - 1 < toSeq) frenadoPor = String((frontera && frontera.k) || '');
+    if (primeroVivo > 0) toSeq = Math.min(toSeq, primeroVivo - 1);
+    if (toSeq <= 0) return { toSeq: 0, keys: [], blockedBy: frenadoPor };
+
+    // Y de los archivables, sólo los que caben ENTEROS en el prefijo.
+    const keys = db.prepare(`
+        SELECT t.ticket_key AS k FROM tickets t
+        WHERE t.updated_at_ms < ?
+          AND (t.status IN (${RESOLVED_SQL_IN}) OR t.deleted_at > 0 OR t.acknowledged_at > 0)
+          AND COALESCE((SELECT MAX(e.seq) FROM ticket_events e WHERE e.ticket_key = t.ticket_key), 0) <= ?
+    `).all(cutoff, toSeq).map((r) => String(r.k));
+
+    return { toSeq, keys, blockedBy: frenadoPor };
+}
+
+/**
+ * Saca de la base lo que ya cumplió la retención y deja el ancla. Devuelve
+ * { ok, archived, file, tickets, events } — `archived:false` cuando no había nada que sacar,
+ * que es el caso normal en una caja nueva.
+ */
+function archive(options) {
+    if (!db) return { ok: false, error: initError || 'ledger no disponible' };
+
+    const o = options && typeof options === 'object' ? options : {};
+    const days = Math.max(1, num(o.days) || RETENTION_DAYS);
+    const cutoff = num(o.cutoff_ms) || (Date.now() - days * 24 * 60 * 60 * 1000);
+
+    try {
+        const { toSeq, keys, blockedBy } = archivePlan(cutoff);
+        if (toSeq <= 0) {
+            return {
+                ok: true, archived: false, blocked_by: blockedBy || '',
+                reason: blockedBy
+                    ? `la retención está frenada por la venta ${blockedBy}, que sigue sin resolverse`
+                    : 'no hay nada que cumpla la retención'
+            };
+        }
+        if (blockedBy) {
+            console.warn(`[ledger] la retención se detiene en la venta ${blockedBy} (sin resolver): ` +
+                'se archiva sólo lo anterior a ella');
+        }
+
+        const eventos = db.prepare('SELECT * FROM ticket_events WHERE seq <= ? ORDER BY seq').all(toSeq);
+        if (!eventos.length) return { ok: true, archived: false, reason: 'sin eventos en el tramo' };
+
+        const fromSeq = num(eventos[0].seq);
+        const lastRow = eventos[eventos.length - 1];
+        const lastHashDelTramo = String(lastRow.row_hash);
+
+        // Los renglones y vouchers de las ventas que salen. Se leen por lotes de llaves
+        // para no armar un IN(...) de miles de parámetros.
+        const enLotes = (sql, todas) => {
+            const out = [];
+            for (let i = 0; i < todas.length; i += 400) {
+                const lote = todas.slice(i, i + 400);
+                const marcas = lote.map(() => '?').join(',');
+                out.push(...db.prepare(sql.replace('{{in}}', marcas)).all(...lote));
+            }
+            return out;
+        };
+
+        const tickets = keys.length ? enLotes('SELECT * FROM tickets WHERE ticket_key IN ({{in}})', keys) : [];
+        const productos = keys.length ? enLotes('SELECT * FROM ticket_products WHERE ticket_key IN ({{in}})', keys) : [];
+        const vouchers = keys.length ? enLotes('SELECT * FROM emv_vouchers WHERE ticket_key IN ({{in}})', keys) : [];
+
+        // ── 1. El archivo, ANTES de tocar la base ──
+        const dir = archivesDir();
+        fs.mkdirSync(dir, { recursive: true });
+        const sello = new Date().toISOString().replace(/[:.]/g, '-');
+        const file = path.join(dir, `ventas-archivo-${sello}-seq${fromSeq}-${toSeq}.jsonl.gz`);
+
+        const lineas = [];
+        lineas.push(JSON.stringify({
+            _tipo: 'encabezado',
+            generado: new Date().toISOString(),
+            motivo: `retención de ${days} días`,
+            corte: new Date(cutoff).toISOString(),
+            desde_seq: fromSeq,
+            hasta_seq: toSeq,
+            eventos: eventos.length,
+            tickets: tickets.length,
+            renglones: productos.length,
+            vouchers: vouchers.length,
+            base: dbPath,
+            equipo: os.hostname(),
+            nota: 'Archivo de retención de ventas-local. La base viva conserva el ancla en ledger_archives.'
+        }));
+        for (const r of eventos) lineas.push(JSON.stringify({ _tipo: 'evento', ...r }));
+        for (const r of tickets) lineas.push(JSON.stringify({ _tipo: 'ticket', ...r }));
+        for (const r of productos) lineas.push(JSON.stringify({ _tipo: 'renglon', ...r }));
+        for (const r of vouchers) lineas.push(JSON.stringify({ _tipo: 'voucher', ...r }));
+
+        const gz = zlib.gzipSync(Buffer.from(lineas.join('\n') + '\n', 'utf8'), { level: 6 });
+        fs.writeFileSync(file, gz);
+        const sha = sha256Buffer(gz);
+        const bytes = gz.length;
+
+        // ── 2. Ancla + borrado, en una sola transacción ──
+        db.exec('BEGIN IMMEDIATE');
+        try {
+            db.prepare(`
+                INSERT INTO ledger_archives
+                    (from_seq, to_seq, last_hash, file, sha256, bytes, tickets, events, cutoff_ms, at_ms, at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(fromSeq, toSeq, lastHashDelTramo, path.basename(file), sha, bytes,
+                tickets.length, eventos.length, cutoff, Date.now(), new Date().toISOString());
+
+            // El propio archivado queda sellado en la cadena VIVA, después del tramo que
+            // se va. Es lo que hace que quitar historia no pueda pasar desapercibido.
+            appendEvent({
+                kind: 'archivo',
+                status: 'archived',
+                detail: `seq ${fromSeq}-${toSeq} → ${path.basename(file)} (${tickets.length} ventas, sha ${sha.slice(0, 12)})`,
+                atMs: Date.now(),
+                extra: { archivo: path.basename(file), sha256: sha, desde_seq: fromSeq, hasta_seq: toSeq }
+            });
+
+            db.exec('UPDATE ledger_guard SET ok = 1 WHERE id = 1');
+            if (keys.length) {
+                for (let i = 0; i < keys.length; i += 400) {
+                    const lote = keys.slice(i, i + 400);
+                    const marcas = lote.map(() => '?').join(',');
+                    db.prepare(`DELETE FROM ticket_products WHERE ticket_key IN (${marcas})`).run(...lote);
+                    db.prepare(`DELETE FROM emv_vouchers WHERE ticket_key IN (${marcas})`).run(...lote);
+                    db.prepare(`DELETE FROM tickets WHERE ticket_key IN (${marcas})`).run(...lote);
+                }
+            }
+            db.prepare('DELETE FROM ticket_events WHERE seq <= ?').run(toSeq);
+            db.exec('UPDATE ledger_guard SET ok = 0 WHERE id = 1');
+            db.exec('COMMIT');
+        } catch (err) {
+            try { db.exec('ROLLBACK'); } catch { }
+            // El archivo ya está escrito y la base intacta: se conserva. Un archivo de más
+            // no rompe nada; un borrado sin archivo sí.
+            throw err;
+        }
+
+        checkpoint();
+        console.log(`[ledger] archivado: ${eventos.length} eventos y ${tickets.length} ventas → ${file}`);
+
+        return {
+            ok: true, archived: true, file, sha256: sha, bytes,
+            blocked_by: blockedBy || '',
+            from_seq: fromSeq, to_seq: toSeq,
+            tickets: tickets.length, events: eventos.length,
+            cutoff: new Date(cutoff).toISOString()
+        };
+    } catch (err) {
+        const msg = String((err && err.message) || err);
+        console.warn('[ledger] el archivado falló:', msg);
+        return { ok: false, error: msg };
+    }
+}
+
+// Se llama al abrir y junto al consolidado del WAL. Con cooldown: comprobar el corte es
+// una consulta barata, pero no hace falta hacerla cada tres minutos durante semanas.
+function archiveIfDue() {
+    if (!db) return null;
+    const ahora = Date.now();
+    if (lastArchiveCheck && ahora - lastArchiveCheck < ARCHIVE_EVERY_MS) return null;
+    lastArchiveCheck = ahora;
+    try {
+        const r = archive();
+        return r && r.archived ? r : null;
+    } catch (err) {
+        console.warn('[ledger] archiveIfDue falló:', err && err.message);
+        return null;
+    }
+}
+
+/** Los archivados hechos en esta caja: el rastro de todo lo que salió de la base. */
+function archives() {
+    if (!db) return { ok: false, error: initError || 'ledger no disponible' };
+    try {
+        const rows = db.prepare('SELECT * FROM ledger_archives ORDER BY id DESC').all();
+        const dir = archivesDir();
+        return {
+            ok: true,
+            dir,
+            retention_days: RETENTION_DAYS,
+            items: rows.map((r) => {
+                const full = path.join(dir, String(r.file));
+                let existe = false;
+                try { existe = fs.statSync(full).size > 0; } catch { existe = false; }
+                return { ...r, ruta: full, existe };
+            })
+        };
+    } catch (err) {
+        return { ok: false, error: String((err && err.message) || err) };
     }
 }
 
@@ -1246,6 +1622,9 @@ module.exports = {
     checkpoint,
     status,
     stats,
+    archive,
+    archiveIfDue,
+    archives,
     record,
     mark,
     remove,

@@ -242,8 +242,9 @@ function configHtml() {
         return;
       }
 
-      const dias = (st.topes && st.topes.dias_retencion) || 10;
+      const dias = (st.topes && st.topes.dias_retencion) || 30;
       const retencion = 'Se conservan ' + dias + ' días y se borran solas en esta caja.'
+        + (st.consola ? ' Se guarda también el volcado de consola.' : '')
         + (st.encabezados_de_sesion === 'incluidos' ? ' Encabezados de sesión INCLUIDOS.' : ' Encabezados de sesión tapados.')
         + (st.ultima_limpieza ? ' Última limpieza: ' + st.ultima_limpieza.borradas + ' borradas, quedan ' + st.ultima_limpieza.quedan + '.' : '');
 

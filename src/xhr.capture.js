@@ -51,7 +51,7 @@
 //  5. **Topes en todo.** Cuerpo por petición, bytes por sesión, sesiones en disco y
 //     bytes del directorio. Un catálogo de 8 MB entra como metadato, no como cuerpo: la
 //     captura no puede llenarle el disco a la caja ni volverla lenta.
-//  6. **Se limpia sola, en la caja.** Retención de 10 días: se barre al arrancar y cada
+//  6. **Se limpia sola, en la caja.** Retención de 30 días: se barre al arrancar y cada
 //     6 horas mientras la caja esté abierta (que es como está de verdad: semanas sin
 //     cerrar). Nadie tiene que entrar a borrar capturas a mano en ningún equipo.
 //
@@ -61,9 +61,11 @@
 //   NESTOR_XHR_MAX_BODY=65536       tope de cuerpo por petición (bytes)
 //   NESTOR_XHR_KEEP_AUTH=0          tapa x-access-token / cookie / authorization
 //   NESTOR_XHR_SESSION_MAX_BYTES    tope por sesión; al pasarlo sigue el metadato, sin cuerpos
-//   NESTOR_XHR_RETENTION_DAYS=10    días que se conservan las sesiones en la caja
+//   NESTOR_XHR_RETENTION_DAYS=30    días que se conservan las sesiones en la caja
 //   NESTOR_XHR_SWEEP_MS             cada cuánto se barre lo caducado (por omisión 6 h)
-//   NESTOR_XHR_KEEP=30              tope de sesiones en disco (red, además de los días)
+//   NESTOR_XHR_KEEP=200             tope de sesiones en disco (red, además de los días)
+//   NESTOR_XHR_CONSOLE=1            volcado de consola junto al .har (0 lo apaga)
+//   NESTOR_XHR_CONSOLE_MAX_ARG      tope por argumento de consola (bytes)
 //   NESTOR_XHR_DIR_MAX_BYTES        tope del directorio completo
 //   NESTOR_XHR_TYPES=XHR,Fetch      tipos de recurso que se capturan
 
@@ -88,13 +90,17 @@ const MAX_BODY = intEnv('NESTOR_XHR_MAX_BODY', 64 * 1024);
 // duración, tamaños). Preferimos una sesión completa sin cuerpos a media sesión con ellos.
 const SESSION_MAX_BYTES = intEnv('NESTOR_XHR_SESSION_MAX_BYTES', 128 * 1024 * 1024);
 
-// Retención: 10 días. Es el techo real de la captura — una incidencia que nadie reportó
-// en diez días ya no se diagnostica con el HAR. Los otros dos topes (número de archivos y
-// bytes del directorio) son la red por si una caja hace un volumen anormal: el que
-// primero se cumple, manda.
-const RETENTION_DAYS = Math.max(1, intEnv('NESTOR_XHR_RETENTION_DAYS', 10));
-const KEEP_SESSIONS = Math.max(1, intEnv('NESTOR_XHR_KEEP', 30));
-const DIR_MAX_BYTES = intEnv('NESTOR_XHR_DIR_MAX_BYTES', 768 * 1024 * 1024);
+// Retención: 30 días. Es el techo real de la captura — una incidencia que nadie reportó
+// en un mes ya no se diagnostica con el HAR.
+//
+// Los otros dos topes NO son decorativos: en prune() los tres cortes se aplican en cadena
+// y manda el primero que se cumple. Una caja real genera ~3.5 sesiones y ~60 MB al día, así
+// que con los valores anteriores (30 archivos, 768 MB) la retención efectiva eran ~9 días
+// por más que los días dijeran 10 — subir sólo los días no habría cambiado nada. Los tres
+// se suben juntos o no se sube ninguno.
+const RETENTION_DAYS = Math.max(1, intEnv('NESTOR_XHR_RETENTION_DAYS', 30));
+const KEEP_SESSIONS = Math.max(1, intEnv('NESTOR_XHR_KEEP', 200));
+const DIR_MAX_BYTES = intEnv('NESTOR_XHR_DIR_MAX_BYTES', 8 * 1024 * 1024 * 1024);
 
 // La limpieza no puede depender de que alguien cierre el punto de venta: una caja se
 // queda semanas abierta. Se barre al arrancar y luego cada 6 horas.
@@ -115,6 +121,26 @@ const MAX_PENDING = 500;
 // Marcadores en memoria (login, detach por DevTools, borrado de caché...). Van al cierre
 // del archivo, en `_fin.eventos`.
 const MAX_MARKERS = 300;
+
+// ── Volcado de consola ──────────────────────────────────────────────────────────
+//
+// Vive DENTRO de este módulo, no en uno aparte, y no por comodidad: comparte exactamente
+// el ciclo de vida del .har — se abre y se cierra con la misma sesión, rueda en el mismo
+// login, se poda en el mismo barrido y lleva la misma identidad. Separarlo obligaba a
+// duplicar las cuatro cosas y a mantenerlas sincronizadas a mano, que es como se termina
+// con un archivo de consola que sobrevive al .har que explicaba.
+//
+// El formato es NDJSON (un evento por renglón), no HAR: un HAR no tiene dónde poner esto,
+// y una línea por evento se lee con `tail -f` y sobrevive a un corte de luz sin reparación.
+const CONSOLE_ENABLED = String(process.env.NESTOR_XHR_CONSOLE || '1') !== '0';
+
+// Tope por argumento. El POS registra objetos de venta completos en consola; lo que
+// interesa es que se registró y con qué forma, no el catálogo entero.
+const CONSOLE_MAX_ARG = intEnv('NESTOR_XHR_CONSOLE_MAX_ARG', 4 * 1024);
+
+// Tope del archivo de consola por sesión. Un bucle de error puede escupir miles de
+// renglones por minuto; pasado el tope se deja de anexar y se anota una sola vez.
+const CONSOLE_MAX_BYTES = intEnv('NESTOR_XHR_CONSOLE_MAX_BYTES', 32 * 1024 * 1024);
 
 // ── Qué se considera secreto ────────────────────────────────────────────────────
 
@@ -141,6 +167,25 @@ const TEXT_MIME = /(json|text\/|xml|javascript|x-www-form-urlencoded|csv|plain)/
 let dir = '';
 let initError = '';
 let appVersion = '';
+
+// Identidad de la caja. El .har por sí solo dice "usuario BLANCAD4 en DESKTOP-8E01MV8",
+// que no basta para archivarlo en la nube: la misma caja se llama distinto en cada
+// negocio y el mismo nombre de usuario se repite entre licencias. La llena el POS por
+// IPC (ver setIdentity) en cuanto conoce los tres datos, y de rebote el propio login,
+// que trae `sale_spot_id` en el cuerpo.
+//
+// `token` es el de la sesión del cajero y se guarda SÓLO en memoria: lo usa el
+// replicador para subir el paquete de incidencia con la misma credencial con la que el
+// POS habla con su servidor. No se escribe a disco por esta vía (en el .har sí va, como
+// encabezado, que es una decisión distinta y deliberada).
+let identity = {
+    license_number: '',
+    sale_spot_id: 0,
+    sale_spot_name: '',
+    user_name: '',
+    business_name: '',
+    token: ''
+};
 let current = null;      // sesión abierta: { fd, file, name, entries, bytes, ... }
 const attached = new Map(); // webContents.id -> { label, pending, wc, dbg, paused }
 let totalEntries = 0;
@@ -330,17 +375,33 @@ function ready() {
     return ENABLED && !!dir && !initError;
 }
 
+// Nombre base de la sesión, SIN extensión: de él cuelgan el `.har` y el `.jsonl` de la
+// consola, y así los dos se borran juntos en el barrido sin tener que emparejarlos.
+//
+// Lleva licencia y caja además del usuario porque el archivo ya no se queda en la caja:
+// viaja a la nube y ahí "sesion-...-blancad4.har" no identifica nada — el mismo nombre de
+// cajero existe en veinte negocios. Lo que falte sale del nombre y no rompe el patrón.
+//
 // El sello llega al segundo, y en un segundo caben dos sesiones (un login seguido de un
 // logout, o dos "guardar ahora"). Sin este desempate el segundo archivo se abría en modo
 // anexar sobre el primero: dos documentos HAR en un archivo, que no parsea.
-function sessionFileName(user, at) {
-    const base = `sesion-${stamp(at)}-${slug(user) || 'sin-sesion'}`;
+function sessionBaseName(user, at) {
+    const partes = ['sesion', stamp(at)];
+    if (identity.license_number) partes.push(slug(identity.license_number));
+    if (identity.sale_spot_id > 0) partes.push('c' + identity.sale_spot_id);
+    partes.push(slug(user) || 'sin-sesion');
 
+    const base = partes.join('-');
     for (let i = 1; i < 100; i++) {
-        const name = i === 1 ? `${base}.har` : `${base}-${i}.har`;
-        if (!fs.existsSync(path.join(dir, name))) return name;
+        const candidato = i === 1 ? base : `${base}-${i}`;
+        if (!fs.existsSync(path.join(dir, candidato + '.har'))) return candidato;
     }
-    return `${base}-${Date.now()}.har`;
+    return `${base}-${Date.now()}`;
+}
+
+// El volcado de consola de una sesión: mismo nombre, otra extensión.
+function consoleFileFor(harName) {
+    return String(harName || '').replace(/\.har$/, '') + '.consola.jsonl';
 }
 
 function writeChunk(text) {
@@ -358,11 +419,79 @@ function writeChunk(text) {
     }
 }
 
+// ── Volcado de consola (NDJSON) ─────────────────────────────────────────────────
+
+// Un valor de CDP (`Runtime.RemoteObject`) a algo legible en una línea. CDP entrega el
+// objeto YA serializado por el navegador cuando cabe (`value`/`preview`), así que no hace
+// falta pedirle nada de vuelta: pedir `Runtime.getProperties` por cada argumento haría una
+// ida y vuelta por renglón de consola y en un bucle de error eso ahoga al renderer.
+function remoteObjectToText(arg) {
+    if (!arg || typeof arg !== 'object') return String(arg);
+
+    if (arg.type === 'string') return String(arg.value == null ? '' : arg.value);
+    if (arg.unserializableValue) return String(arg.unserializableValue);
+    if (arg.value !== undefined) {
+        try { return typeof arg.value === 'object' ? JSON.stringify(arg.value) : String(arg.value); }
+        catch { return String(arg.value); }
+    }
+    if (arg.preview) {
+        const props = (arg.preview.properties || [])
+            .map((pr) => `${pr.name}: ${pr.value}`)
+            .join(', ');
+        const marca = arg.preview.overflow ? ', …' : '';
+        return `${arg.preview.description || arg.className || 'Object'} { ${props}${marca} }`;
+    }
+    return String(arg.description || arg.className || arg.type || '');
+}
+
+// Los argumentos pasan por la MISMA redacción que los cuerpos del HAR: el POS registra
+// tickets completos en consola y ahí viajan los mismos campos sensibles.
+function consoleArgText(arg) {
+    let text = remoteObjectToText(arg);
+    text = redactFormLike(text);
+    if (text.length > CONSOLE_MAX_ARG) text = text.slice(0, CONSOLE_MAX_ARG) + '…[recortado]';
+    return text;
+}
+
+// Sólo el marco de arriba de la pila. La pila completa por renglón multiplica por diez el
+// tamaño del archivo y para ubicar el origen basta con el primero.
+function stackTop(stackTrace) {
+    const marcos = stackTrace && stackTrace.callFrames;
+    if (!marcos || !marcos.length) return '';
+    const f = marcos[0];
+    return `${f.functionName || '(anónima)'} @ ${f.url || ''}:${f.lineNumber + 1}`;
+}
+
+function writeConsole(event) {
+    if (!current || current.consoleFd === null || current.consoleFd === undefined) return;
+    if (current.consoleOff) return;
+
+    try {
+        const buf = Buffer.from(JSON.stringify(event) + '\n', 'utf8');
+        fs.writeSync(current.consoleFd, buf);
+        current.consoleBytes += buf.length;
+        current.consoleEntries++;
+
+        if (current.consoleBytes > CONSOLE_MAX_BYTES) {
+            current.consoleOff = true;
+            note('tope-de-consola', {
+                bytes: current.consoleBytes,
+                nota: 'se deja de anexar consola en esta sesión'
+            });
+        }
+    } catch (e) {
+        // Igual que el .har: si el descriptor se cae, la consola se apaga y la caja sigue.
+        console.warn('[xhr] no se pudo escribir la consola:', e && e.message ? e.message : e);
+        current.consoleOff = true;
+    }
+}
+
 function openSession(reason, user) {
     if (!ready() || current) return null;
 
     const at = Date.now();
-    const name = sessionFileName(user, at);
+    const base = sessionBaseName(user, at);
+    const name = base + '.har';
     const file = path.join(dir, name);
 
     let fd = null;
@@ -374,10 +503,32 @@ function openSession(reason, user) {
         return null;
     }
 
+    // La consola es opcional y NO bloquea: si no abre, la sesión sigue con su .har. Nunca
+    // al revés — el .har es la fuente principal y la consola el complemento.
+    let consoleFd = null;
+    const consoleName = consoleFileFor(name);
+    const consoleFile = path.join(dir, consoleName);
+    if (CONSOLE_ENABLED) {
+        try {
+            consoleFd = fs.openSync(consoleFile, 'a');
+        } catch (e) {
+            console.warn('[xhr] no se pudo abrir el volcado de consola', consoleFile,
+                e && e.message ? e.message : e);
+        }
+    }
+
     current = {
         fd,
         file,
         name,
+        base,
+        consoleFd,
+        consoleFile,
+        consoleName: consoleFd ? consoleName : '',
+        consoleBytes: 0,
+        consoleEntries: 0,
+        consoleOff: false,
+        identity: Object.assign({}, identity, { token: undefined }),
         user: user || '',
         reason: reason || 'arranque',
         startedAt: at,
@@ -401,6 +552,14 @@ function openSession(reason, user) {
             iniciada: new Date(at).toISOString(),
             equipo: os.hostname(),
             plataforma: `${process.platform} ${os.release()}`,
+            // Identidad de la caja: es lo que permite archivar el archivo por licencia y
+            // caja cuando ya no está en el equipo que lo generó. Va también en el nombre.
+            licencia: identity.license_number || '',
+            caja_id: identity.sale_spot_id || 0,
+            caja: identity.sale_spot_name || '',
+            negocio: identity.business_name || '',
+            version_cliente: appVersion || '',
+            consola: current.consoleName || 'no disponible',
             tope_cuerpo: MAX_BODY,
             tope_sesion: SESSION_MAX_BYTES,
             // Para que quien reciba el archivo sepa qué tiene en la mano sin leer el código.
@@ -429,19 +588,34 @@ function finalizeSession(reason) {
         huecos: done.gaps
     };
 
+    fin.consola = done.consoleName
+        ? { archivo: done.consoleName, eventos: done.consoleEntries, bytes: done.consoleBytes }
+        : null;
+
     writeChunk('\n],"_fin":' + JSON.stringify(fin) + '}}\n');
 
     try { fs.closeSync(done.fd); } catch { }
+    if (done.consoleFd !== null && done.consoleFd !== undefined) {
+        try { fs.closeSync(done.consoleFd); } catch { }
+        done.consoleFd = null;
+    }
     current = null;
 
     appendIndex({
         archivo: done.name,
+        consola: done.consoleName || '',
         usuario: done.user,
+        licencia: (done.identity && done.identity.license_number) || '',
+        caja_id: (done.identity && done.identity.sale_spot_id) || 0,
+        caja: (done.identity && done.identity.sale_spot_name) || '',
+        version_cliente: appVersion || '',
         motivo: done.reason,
         iniciada: new Date(done.startedAt).toISOString(),
         cerrada: fin.cerrada,
         peticiones: done.entries,
+        eventos_consola: done.consoleEntries,
         bytes: done.bytes,
+        bytes_consola: done.consoleBytes,
         motivo_cierre: fin.motivo_cierre
     });
 
@@ -477,6 +651,11 @@ function note(tipo, data) {
 
 // ── Recuperación y retención ────────────────────────────────────────────────────
 
+// Una sesión son DOS archivos: el `.har` y su `.consola.jsonl`. El listado los devuelve
+// juntos y `size` es la suma de los dos, porque el tope de bytes del directorio tiene que
+// contar lo que de verdad ocupa la sesión — si sólo contara el .har, el volcado de consola
+// crecería fuera de todo tope. El .har manda: la consola sin su .har no se lista (se barre
+// aparte, como huérfana).
 function listSessionFiles() {
     try {
         return fs.readdirSync(dir)
@@ -490,12 +669,55 @@ function listSessionFiles() {
                     size = st.size;
                     mtime = st.mtimeMs;
                 } catch { }
-                return { name: f, file: full, size, mtime };
+
+                const consoleName = consoleFileFor(f);
+                const consoleFull = path.join(dir, consoleName);
+                let consoleSize = 0;
+                try {
+                    const st = fs.statSync(consoleFull);
+                    consoleSize = st.size;
+                    // La consola puede seguir escribiéndose después del último XHR (una
+                    // caja quieta con un bucle de error). La sesión caduca por la más
+                    // reciente de las dos, o se borraría una consola todavía viva.
+                    if (st.mtimeMs > mtime) mtime = st.mtimeMs;
+                } catch { }
+
+                return {
+                    name: f,
+                    file: full,
+                    size: size + consoleSize,
+                    harSize: size,
+                    consoleName: consoleSize ? consoleName : '',
+                    consoleFile: consoleSize ? consoleFull : '',
+                    consoleSize,
+                    mtime
+                };
             })
             .sort((a, b) => b.mtime - a.mtime);
     } catch {
         return [];
     }
+}
+
+// Volcados de consola cuyo .har ya no está (lo borró una versión anterior del barrido, o
+// alguien lo sacó a mano). Sin esto se quedan para siempre: ningún corte los mira.
+function pruneOrphanConsoles() {
+    let liberados = 0;
+    try {
+        for (const f of fs.readdirSync(dir)) {
+            if (!f.startsWith('sesion-') || !f.endsWith('.consola.jsonl')) continue;
+            const har = f.replace(/\.consola\.jsonl$/, '.har');
+            if (fs.existsSync(path.join(dir, har))) continue;
+            if (current && current.consoleName === f) continue;
+            try {
+                const full = path.join(dir, f);
+                const st = fs.statSync(full);
+                fs.rmSync(full, { force: true });
+                liberados += st.size;
+            } catch { }
+        }
+    } catch { }
+    return liberados;
 }
 
 // Un HAR abierto por un cierre sucio (corte de luz, kill del proceso) no tiene cierre.
@@ -568,6 +790,11 @@ function prune() {
     const remove = (f, motivo) => {
         try {
             fs.rmSync(f.file, { force: true });
+            // La consola se va con su .har SIEMPRE, incluso si el .har no se pudo borrar:
+            // un volcado de consola suelto no se diagnostica solo.
+            if (f.consoleFile) {
+                try { fs.rmSync(f.consoleFile, { force: true }); } catch { }
+            }
             removed.push({ archivo: f.name, bytes: f.size, motivo });
             return true;
         } catch (e) {
@@ -595,6 +822,8 @@ function prune() {
         const oldest = kept.pop();
         if (remove(oldest, 'sobre el tope de bytes del directorio')) total -= oldest.size;
     }
+
+    pruneOrphanConsoles();
 
     if (removed.length) {
         pruneIndex();
@@ -751,7 +980,23 @@ function attach(webContents, label) {
         note('network-enable-fallido', { label, error: e && e.message ? e.message : String(e) });
     });
 
-    note('enganchada', { label, tipos: [...CAPTURED_TYPES] });
+    // Consola. Son dos dominios distintos y hacen falta los dos:
+    //   * `Runtime` da los console.log/warn/error de la aplicación y las excepciones que
+    //     nadie atrapó (`exceptionThrown`), que es lo que se ve en rojo en DevTools;
+    //   * `Log` da lo que reporta el NAVEGADOR y no pasa por `console.*`: CORS, CSP,
+    //     recursos que no cargaron, avisos de seguridad. Justo la mitad que falta cuando
+    //     el cajero dice "no pasó nada, sólo dejó de funcionar".
+    // Si fallan, la sesión sigue con su .har: la consola nunca puede tumbar la captura.
+    if (CONSOLE_ENABLED) {
+        dbg.sendCommand('Runtime.enable').catch((e) => {
+            note('runtime-enable-fallido', { label, error: e && e.message ? e.message : String(e) });
+        });
+        dbg.sendCommand('Log.enable').catch((e) => {
+            note('log-enable-fallido', { label, error: e && e.message ? e.message : String(e) });
+        });
+    }
+
+    note('enganchada', { label, tipos: [...CAPTURED_TYPES], consola: CONSOLE_ENABLED });
     return { ok: true };
 }
 
@@ -770,9 +1015,64 @@ function detach(webContents, reason) {
 function onCdp(state, method, params) {
     if (!current) return;
 
+    // ── Consola ──
+    // Va ANTES que la red por frecuencia: en una caja con un bucle de error estos eventos
+    // son la mayoría, y no tiene sentido evaluar cinco comparaciones de red por cada uno.
+    if (method === 'Runtime.consoleAPICalled') {
+        writeConsole({
+            t: params.timestamp ? new Date(params.timestamp).toISOString() : new Date().toISOString(),
+            origen: 'console',
+            nivel: String(params.type || 'log'),
+            ventana: state.label,
+            args: (params.args || []).map(consoleArgText),
+            traza: stackTop(params.stackTrace)
+        });
+        return;
+    }
+
+    if (method === 'Runtime.exceptionThrown') {
+        const det = (params && params.exceptionDetails) || {};
+        writeConsole({
+            t: params.timestamp ? new Date(params.timestamp).toISOString() : new Date().toISOString(),
+            origen: 'excepcion',
+            nivel: 'error',
+            ventana: state.label,
+            args: [String(det.text || 'excepción sin texto'),
+                   det.exception ? consoleArgText(det.exception) : ''].filter(Boolean),
+            url: String(det.url || ''),
+            linea: det.lineNumber || 0,
+            traza: stackTop(det.stackTrace)
+        });
+        return;
+    }
+
+    if (method === 'Log.entryAdded') {
+        const e = (params && params.entry) || {};
+        writeConsole({
+            t: e.timestamp ? new Date(e.timestamp).toISOString() : new Date().toISOString(),
+            origen: String(e.source || 'navegador'),
+            nivel: String(e.level || 'info'),
+            ventana: state.label,
+            args: [String(e.text || '')],
+            url: String(e.url || ''),
+            linea: e.lineNumber || 0
+        });
+        return;
+    }
+
     if (method === 'Network.requestWillBeSent') {
         const { requestId, request, timestamp, wallTime, type, documentURL } = params;
         if (!request) return;
+
+        // Token de sesión, de rebote. El POS lo publica por `setIdentity`, pero el
+        // frontend lo sirve el BACKEND y el cliente lo cachea: se actualizan por separado,
+        // así que un cliente nuevo sobre un frontend viejo es normal — y sin token la cola
+        // de incidencias no sube nada. Aquí ya pasa por delante en cada petición.
+        // El explícito manda: esto sólo rellena el hueco.
+        if (!identity.token && request.headers) {
+            const t = request.headers['x-access-token'] || request.headers['X-Access-Token'];
+            if (t) identity.token = String(t);
+        }
 
         state.pending.set(requestId, {
             method: request.method || 'GET',
@@ -854,6 +1154,14 @@ function pathOf(url) {
     try { return new URL(url).pathname; } catch { return String(url || '').split('?')[0]; }
 }
 
+// El número de caja va en el cuerpo del login (`sale_spot_id`), que es lo único que se
+// conoce de la identidad antes de que el POS termine de arrancar.
+function loginSpotFrom(p) {
+    const req = safeParse(p.postData);
+    if (req && typeof req === 'object') return parseInt(req.sale_spot_id, 10) || 0;
+    return 0;
+}
+
 function loginUserFrom(p, responseText) {
     const req = safeParse(p.postData);
     if (req && typeof req === 'object' && req.user) return String(req.user);
@@ -882,7 +1190,16 @@ function writeEntry(p, meta, rawBody, base64Encoded) {
 
     if (esLogin) {
         const user = loginUserFrom(p, rawBody);
-        note('login', { usuario: user || '(sin nombre)', ruta });
+
+        // La caja sale del propio login (`sale_spot_id` viaja en el cuerpo) y hay que
+        // tomarla AQUÍ: el archivo se nombra en el `roll` de la línea siguiente, y el POS
+        // no alcanza a llamar a setIdentity antes — su vista todavía no ha montado. Sin
+        // esto la sesión del cajero, que es la que importa, nacería sin número de caja.
+        const spot = loginSpotFrom(p);
+        if (spot > 0 && identity.sale_spot_id !== spot) identity.sale_spot_id = spot;
+        identity.user_name = user || identity.user_name;
+
+        note('login', { usuario: user || '(sin nombre)', ruta, caja_id: identity.sale_spot_id });
         roll('login', user);
         if (!current) return;
         current.markers.push({ t: new Date().toISOString(), tipo: 'login', usuario: user || '' });
@@ -1016,18 +1333,35 @@ function status() {
             sesion: SESSION_MAX_BYTES,
             dias_retencion: RETENTION_DAYS,
             sesiones: KEEP_SESSIONS,
-            directorio: DIR_MAX_BYTES
+            directorio: DIR_MAX_BYTES,
+            consola: CONSOLE_MAX_BYTES
         },
+        consola: CONSOLE_ENABLED,
+        identidad: {
+            licencia: identity.license_number,
+            caja_id: identity.sale_spot_id,
+            caja: identity.sale_spot_name,
+            usuario: identity.user_name,
+            negocio: identity.business_name,
+            // El token NUNCA sale por aquí: `status()` lo lee el renderer y de ahí puede
+            // acabar en cualquier lado. Sólo se dice si hay uno.
+            con_token: !!identity.token
+        },
+        version_cliente: appVersion,
         ultima_limpieza: lastSweep,
         sesion: current ? {
             archivo: current.name,
             ruta: current.file,
+            consola: current.consoleName || '',
             usuario: current.user,
             motivo: current.reason,
             iniciada: new Date(current.startedAt).toISOString(),
             peticiones: current.entries,
+            eventos_consola: current.consoleEntries,
             bytes: current.bytes,
-            cuerpos_apagados: current.bodiesOff
+            bytes_consola: current.consoleBytes,
+            cuerpos_apagados: current.bodiesOff,
+            consola_apagada: current.consoleOff
         } : null,
         total_peticiones: totalEntries,
         descartadas: totalDropped
@@ -1053,7 +1387,11 @@ function list(limit) {
             {
                 archivo: f.name,
                 ruta: f.file,
+                consola: f.consoleName || '',
+                ruta_consola: f.consoleFile || '',
                 bytes: f.size,
+                bytes_har: f.harSize,
+                bytes_consola: f.consoleSize,
                 modificada: new Date(f.mtime).toISOString(),
                 abierta: !!current && current.file === f.file
             },
@@ -1080,10 +1418,55 @@ function saveNow(reason) {
         ok: !!done,
         archivo: done ? done.name : '',
         ruta: done ? done.file : '',
+        consola: done ? (done.consoleName || '') : '',
+        ruta_consola: done && done.consoleName ? done.consoleFile : '',
         peticiones: done ? done.entries : 0,
+        eventos_consola: done ? done.consoleEntries : 0,
         bytes: done ? done.bytes : 0,
+        bytes_consola: done ? done.consoleBytes : 0,
+        iniciada: done ? new Date(done.startedAt).toISOString() : '',
+        usuario: done ? done.user : '',
         sigue_en: current ? current.name : ''
     };
+}
+
+// Identidad de la caja, puesta por el POS en cuanto la conoce (ver preload → diag).
+//
+// No rueda el archivo: la sesión en curso conserva su nombre y su `_inicio` —renombrar un
+// archivo abierto en Windows con el descriptor vivo es justo la operación que falla— y la
+// identidad entra completa en la SIGUIENTE. En la práctica la primera sesión de la caja es
+// la de arranque ("sin-sesion") y el login rueda inmediatamente después, así que la sesión
+// del cajero ya nace identificada. La que sí se corrige siempre es la del índice, porque
+// `finalizeSession` lee la identidad viva al cerrar.
+function setIdentity(patch) {
+    if (!patch || typeof patch !== 'object') return { ok: false, error: 'identidad vacía' };
+
+    const antes = identity.license_number + '/' + identity.sale_spot_id;
+
+    if (patch.license_number !== undefined) identity.license_number = String(patch.license_number || '');
+    if (patch.sale_spot_id !== undefined) identity.sale_spot_id = parseInt(patch.sale_spot_id, 10) || 0;
+    if (patch.sale_spot_name !== undefined) identity.sale_spot_name = String(patch.sale_spot_name || '');
+    if (patch.user_name !== undefined) identity.user_name = String(patch.user_name || '');
+    if (patch.business_name !== undefined) identity.business_name = String(patch.business_name || '');
+    if (patch.token !== undefined) identity.token = String(patch.token || '');
+
+    const despues = identity.license_number + '/' + identity.sale_spot_id;
+    if (antes !== despues) {
+        note('identidad', {
+            licencia: identity.license_number,
+            caja_id: identity.sale_spot_id,
+            caja: identity.sale_spot_name
+        });
+    }
+    if (current) current.identity = Object.assign({}, identity, { token: undefined });
+
+    return { ok: true, identidad: { licencia: identity.license_number, caja_id: identity.sale_spot_id } };
+}
+
+// Copia de la identidad PARA USO INTERNO del proceso principal (el replicador la necesita
+// con token). No se expone por IPC: ver la nota de `status()`.
+function currentIdentity() {
+    return Object.assign({}, identity);
 }
 
 // Marcador desde el renderer: "aquí falló la venta". Cae en `_fin.eventos` del HAR.
@@ -1115,6 +1498,8 @@ module.exports = {
     saveNow,
     mark,
     note,
+    setIdentity,
+    currentIdentity,
     // Adelanta el barrido de retención (lo mismo que corre solo cada 6 horas).
     sweep: () => (ready() ? Object.assign({ ok: true }, prune()) : { ok: false, error: initError || 'captura apagada' }),
     shutdown,

@@ -45,6 +45,17 @@ try {
 contextBridge.exposeInMainWorld('NestorClient', {
     serverOrigin: initialConfig ? initialConfig.serverOrigin : null,
 
+    // Versión del ejecutable instalado, SÍNCRONA (viene con `get-config-sync`, sin viaje
+    // extra). Es la misma que se publicó en Fact al hacer el deploy: build.go la inyecta
+    // en el paquete y deploy.go sube ese número a /panel/v1/installers.
+    //
+    // La barra de estado del POS la pinta en el primer render; con una promesa se vería
+    // "CAJA: X, v" y un instante después el número, en cada arranque de caja.
+    // En navegador `window.NestorClient` no existe y el POS cae al User-Agent, que
+    // también la trae (`nestorpos_client/1.0.5`).
+    clientVersion: initialConfig ? String(initialConfig.clientVersion || '') : '',
+    platform: initialConfig ? String(initialConfig.platform || '') : '',
+
     minimize: () => invoke('win:minimize'),
     toggleMaximize: () => invoke('win:toggle-maximize'),
     close: () => invoke('win:close'),
@@ -124,13 +135,15 @@ contextBridge.exposeInMainWorld('NestorClient', {
         // describe la versión que de verdad está instalada.
         //
         // Al agregar un canal nuevo: añadirlo aquí Y subir LEDGER_IPC_VERSION.
-        version: 2,
+        version: 3,
         capabilities: [
             // v1 — registro y consulta
             'status', 'stats', 'record', 'mark', 'emv',
             'list', 'get', 'summary', 'verify', 'export',
             // v2 — retiro manual y "revisada por un supervisor"
             'remove', 'acknowledge',
+            // v3 — retención por archivado con ancla (180 días)
+            'archive', 'archives',
         ],
 
         status: () => invoke('nestor:ledger:status'),
@@ -153,6 +166,12 @@ contextBridge.exposeInMainWorld('NestorClient', {
         // Recorre la cadena de eventos y dice si alguien la tocó por fuera.
         verify: (limit) => invoke('nestor:ledger:verify', limit || 0),
         export: (query) => invoke('nestor:ledger:export', query || {}),
+        // Retención. Corre sola al abrir la base y cada 6 h; esto sólo la adelanta.
+        // NO es un borrado: saca de la base viva lo ya resuelto con más de 180 días y
+        // deja el ancla (rango de eventos, hash y SHA-256 del archivo) para que
+        // `verify()` siga detectando cualquier hueco que no venga de aquí.
+        archive: (options) => invoke('nestor:ledger:archive', options || {}),
+        archives: () => invoke('nestor:ledger:archives'),
     },
 
     // ── Captura de sesiones XHR ───────────────────────────────────────────────
@@ -177,6 +196,35 @@ contextBridge.exposeInMainWorld('NestorClient', {
         // Las capturas se borran solas a los 10 días; esto sólo adelanta el barrido.
         sweep: () => invoke('nestor:xhr:sweep'),
         openFolder: () => invoke('nestor:xhr:open-folder'),
+        // Identidad de la caja. El POS la manda al montar y en cada login; con ella se
+        // nombran las capturas (licencia + caja + usuario) y se identifica la incidencia
+        // en la nube. `token` es el de la sesión del cajero: el proceso principal lo usa
+        // para leer el log del servidor y para subir el paquete, y lo guarda SÓLO en
+        // memoria (nunca sale por `status()`).
+        setIdentity: (identity) => invoke('nestor:xhr:set-identity', identity || {}),
+    },
+
+    // ── Errores POS ───────────────────────────────────────────────────────────
+    // Cuando /pos/register-ticket falla, esto arma el paquete de incidencia —la sesión
+    // XHR completa, el volcado de consola, el estado de la base de ventas locales y el
+    // log del servidor leído EN ESE INSTANTE— y lo sube a Fact, donde el módulo
+    // "Errores POS" lo indexa por licencia, caja y usuario.
+    //
+    //   await window.NestorClient.diag.report({ code, message, status, folio, ... });
+    //
+    // Nunca lanza y nunca bloquea la venta: devuelve { ok:false, error } si algo falla,
+    // y { ok:true, reported:false, reason:'repetido' } cuando el mismo error ya subió
+    // hace poco (se deduplica por código + licencia + caja, ventana de 6 h).
+    //
+    // Al agregar un canal nuevo aquí: subir `version`.
+    diag: {
+        version: 1,
+        capabilities: ['report', 'status', 'flush'],
+        report: (info) => invoke('nestor:diag:report', info || {}),
+        status: () => invoke('nestor:diag:status'),
+        // Fuerza un intento de subida de la cola pendiente (la caja reintenta sola cada
+        // 5 min y al arrancar).
+        flush: () => invoke('nestor:diag:flush'),
     },
 
     getWindowMode: () => invoke('win:get-mode'),
