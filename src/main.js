@@ -2,6 +2,7 @@ const { app, session, BrowserWindow, ipcMain, Menu, globalShortcut, dialog, shel
 const path = require('path');
 const fsp = require('fs/promises');
 const fs = require('fs');
+const crypto = require('crypto');
 const AdmZip = require('adm-zip');
 const { startLocalFrontendServer } = require('./proxy');
 const ledger = require('./ledger');
@@ -30,6 +31,64 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
 const DEFAULT_SERVER_ORIGIN = 'http://127.0.0.1:8180';
 const LOCAL_FRONT_PORT = parseInt(process.env.NESTOR_FRONT_PORT || '18180', 10);
+const LOCAL_FRONT_URL = `http://127.0.0.1:${LOCAL_FRONT_PORT}`;
+
+// ── Una sola instancia por equipo ───────────────────────────────────────────
+//
+// Dos clientes abiertos a la vez se pelean el puerto 18180 y el perfil de Electron, y el
+// que pierde queda inservible SIN DARSE CUENTA: la ventana entera en pantalla y todas las
+// peticiones muriendo con ERR_CONNECTION_REFUSED (ver la nota de `/__client/ping` en
+// proxy.js). Es el doble clic de siempre en el acceso directo, o el Launcher abriendo
+// encima de una sesión que ya estaba.
+//
+// El candado es de Electron y se ata al `userData`, que es justo el recurso que se
+// disputan. NESTOR_SINGLE_INSTANCE=0 lo apaga (dos clientes deliberados en el mismo
+// equipo necesitan además NESTOR_FRONT_PORT distinto y otro perfil).
+const SINGLE_INSTANCE = (process.env.NESTOR_SINGLE_INSTANCE || '1') !== '0';
+
+// Reintentos del candado: el relanzamiento del auto-update arranca el proceso nuevo
+// mientras el viejo todavía se está muriendo, así que no obtenerlo en el primer intento es
+// normal y no significa "ya hay otro cliente abierto".
+const INSTANCE_LOCK_RETRIES = Math.max(0, parseInt(process.env.NESTOR_INSTANCE_LOCK_RETRIES || '8', 10));
+const INSTANCE_LOCK_WAIT_MS = Math.max(50, parseInt(process.env.NESTOR_INSTANCE_LOCK_WAIT_MS || '250', 10));
+
+// Cuánto se insiste cuando el candado está tomado pero NADIE contesta en el puerto local
+// (un proceso anterior que se está muriendo). Ver acquireInstanceLock.
+const INSTANCE_LOCK_GHOST_WAIT_MS = Math.max(0, parseInt(process.env.NESTOR_INSTANCE_LOCK_GHOST_MS || '15000', 10));
+
+// ── Reemplazar la ventana anterior ─────────────────────────────────────────
+//
+// Abrir el acceso directo con el POS ya abierto es, casi siempre, un doble clic de más:
+// la respuesta correcta es traer al frente la ventana que ya está trabajando, sin
+// molestar a nadie. Pero hay un caso real en el que eso no alcanza —la ventana anterior
+// quedó inservible (colgada, fuera de pantalla, en un escritorio virtual que ya no
+// existe)— y ahí el cajero se queda sin forma de abrir la caja: cada intento "no hace
+// nada".
+//
+// La señal de que estamos en ese caso es que el usuario INSISTE. Así que el primer
+// intento enfoca y calla; si vuelve a lanzar dentro de esta ventana de tiempo, se le
+// ofrece cerrar la anterior y quedarse con la nueva, DICIÉNDOLE qué se pierde.
+//
+// NESTOR_REPLACE_PROMPT=always pregunta desde el primer intento; =never nunca ofrece
+// reemplazo (comportamiento de sólo enfocar).
+const REPLACE_PROMPT_MODE = String(process.env.NESTOR_REPLACE_PROMPT || 'insist').toLowerCase();
+const REPLACE_ATTEMPT_WINDOW_MS = Math.max(5000, parseInt(process.env.NESTOR_REPLACE_WINDOW_MS || '45000', 10));
+// Plazo para que la instancia anterior se cierre por su cuenta tras pedírselo.
+const REPLACE_HANDOVER_MS = Math.max(2000, parseInt(process.env.NESTOR_REPLACE_HANDOVER_MS || '12000', 10));
+
+// Identidad de ESTE proceso como dueño del puerto local. El nonce se rifa en cada
+// arranque: es lo que distingue "mi express contesta" de "contesta el express de otro
+// proceso" cuando los dos están pegados al mismo puerto.
+const LOCAL_SERVER_ID = {
+    app: 'nestorpos_client',
+    pid: process.pid,
+    nonce: crypto.randomBytes(12).toString('hex'),
+    port: LOCAL_FRONT_PORT
+};
+
+// Cada cuánto se comprueba que el servidor local siga contestando (0 = apagar).
+const LOCAL_SERVER_WATCH_MS = Math.max(0, parseInt(process.env.NESTOR_LOCAL_WATCH_MS || '20000', 10));
+const LOCAL_SERVER_PROBE_TIMEOUT_MS = 2500;
 
 // Modo desarrollo: carga el frontend desde el dev server de Vue en vez del
 // bundle que publica el backend en /__front. El dev server no tiene ese
@@ -74,6 +133,13 @@ let configWindow = null;
 let localServer = null;
 let serverOrigin = DEFAULT_SERVER_ORIGIN;
 let savedZoomFactor = 1.0;
+
+// Estado del servidor local (el express de proxy.js). `null` en `listening` = todavía no
+// se ha comprobado. Lo mantiene ensureLocalServer() y lo lee el renderer por IPC.
+let localServerState = { listening: null, foreign: false, error: '', checkedAt: 0, repairs: 0, since: 0 };
+let localServerTimer = null;
+let localServerBusy = null;   // promesa en curso: las comprobaciones no se apilan
+let shuttingDown = false;     // apaga la vigilancia para que no reviva el puerto al salir
 
 // Build que corresponde al código cargado ahora mismo en la ventana.
 let currentBuildId = null;
@@ -144,9 +210,13 @@ function getPaths() {
     const userData = app.getPath('userData');
     const wwwRoot = path.join(userData, 'www');
     const currentDir = path.join(wwwRoot, 'current');
+    // Build anterior. Se conserva sólo para que los trozos perezosos del código que ya
+    // está corriendo sigan resolviendo después de un cambio de build; ver la nota del
+    // estático de respaldo en proxy.js.
+    const previousDir = path.join(wwwRoot, 'previous');
     const metaPath = path.join(wwwRoot, 'frontend_meta.json');
     const clientConfigPath = path.join(userData, 'client_config.json');
-    return { userData, wwwRoot, currentDir, metaPath, clientConfigPath };
+    return { userData, wwwRoot, currentDir, previousDir, metaPath, clientConfigPath };
 }
 
 async function readJSON(file, def) {
@@ -246,7 +316,7 @@ async function fetchRemoteBuild(origin, timeoutMs) {
 }
 
 async function ensureFrontendCached(origin) {
-    const { wwwRoot, currentDir, metaPath } = getPaths();
+    const { wwwRoot, currentDir, previousDir, metaPath } = getPaths();
     await fsp.mkdir(wwwRoot, { recursive: true });
 
     const remoteVer = await fetchRemoteBuild(origin);
@@ -265,7 +335,21 @@ async function ensureFrontendCached(origin) {
     const zip = new AdmZip(zipBytes);
     zip.extractAllTo(tmpDir, true);
 
-    await fsp.rm(currentDir, { recursive: true, force: true });
+    // Relevo del bundle: la build que se va pasa a `previous` (respaldo de los trozos
+    // perezosos del código que sigue corriendo) y la nueva entra por rename atómico. Sólo
+    // se guarda UNA generación: dos actualizaciones seguidas sin recargar la ventana
+    // dejan a la primera sin red, y para eso está el aviso del frontend.
+    await fsp.rm(previousDir, { recursive: true, force: true });
+    if (fs.existsSync(currentDir)) {
+        try {
+            await fsp.rename(currentDir, previousDir);
+        } catch (e) {
+            // Si el relevo no se puede hacer (permisos, antivirus), la actualización sigue
+            // su curso: perder el respaldo es un degradado, no un fallo.
+            console.warn('[front cache] no se pudo conservar la build anterior:', e && e.message ? e.message : e);
+            await fsp.rm(currentDir, { recursive: true, force: true });
+        }
+    }
     await fsp.rename(tmpDir, currentDir);
 
     await writeJSON(metaPath, {
@@ -287,13 +371,14 @@ async function ensureFrontendCached(origin) {
 // el renderer con purgeRendererStorage, que sí puede respetar los borradores
 // del POS — clearStorageData es todo o nada.
 async function clearAppData({ frontend = false, storages = ['serviceworkers', 'cachestorage'] } = {}) {
-    const { wwwRoot, currentDir, metaPath } = getPaths();
+    const { wwwRoot, currentDir, previousDir, metaPath } = getPaths();
     const apiCacheDir = path.join(wwwRoot, 'api_cache');
 
     await fsp.rm(apiCacheDir, { recursive: true, force: true });
 
     if (frontend) {
         await fsp.rm(currentDir, { recursive: true, force: true });
+        await fsp.rm(previousDir, { recursive: true, force: true });
         await fsp.rm(metaPath, { force: true });
     }
 
@@ -460,14 +545,30 @@ async function runCacheClear(win, options = {}) {
         const target = (mainWindow && !mainWindow.isDestroyed()) ? mainWindow : win;
 
         let bundle = null;
+        let bundleError = '';
         if (cfg.redownload) {
-            // Si truena, se propaga sin haber borrado nada.
-            bundle = await ensureFrontendCached(serverOrigin);
-            // Con el bundle nuevo en disco ya no hay build pendiente: si esto lo
-            // disparó el POS al quedar ocioso, el watcher no debe volver a
-            // anunciar la misma.
-            deferredBuildId = '';
-            announcedBuildId = '';
+            try {
+                bundle = await ensureFrontendCached(serverOrigin);
+                // Con el bundle nuevo en disco ya no hay build pendiente: si esto lo
+                // disparó el POS al quedar ocioso, el watcher no debe volver a
+                // anunciar la misma.
+                deferredBuildId = '';
+                announcedBuildId = '';
+            } catch (e) {
+                bundleError = e && e.message ? e.message : String(e);
+                // Por defecto se propaga sin haber borrado nada: si esto venía de un
+                // cambio de build, seguir adelante recargaría la MISMA build y el
+                // watcher volvería a intentarlo cada 5 s, en bucle.
+                //
+                // `bundleOptional` es para lo que NO es una actualización: una orden de
+                // "vaciar caché" del modo ingeniero pide justo eso, y no tiene por qué
+                // fracasar porque el servidor no publique bundle (o porque se esté
+                // reiniciando, que es cuando más falta hace). Con `frontend:false` no
+                // hay nada que perder: el bundle en disco no se toca.
+                if (opts.bundleOptional !== true || cfg.frontend === true) throw e;
+                console.warn(`[clear-cache] no se pudo bajar el bundle (${bundleError}); `
+                    + 'se limpia el caché igual (bundleOptional)');
+            }
         }
 
         const storages = ['serviceworkers', 'cachestorage'];
@@ -514,7 +615,9 @@ async function runCacheClear(win, options = {}) {
                 : null,
             localStorageKeysRemoved: removedKeys,
             relaunched: !!cfg.relaunch,
-            reloaded: !cfg.relaunch && !!cfg.reload
+            reloaded: !cfg.relaunch && !!cfg.reload,
+            // Se limpió, pero sin build nueva: quien llamó decide si eso le importa.
+            bundleError: bundleError || ''
         };
 
         console.log(`[clear-cache] preset=${preset} reason=${reason} localStorage=${removedKeys} relaunch=${cfg.relaunch} reload=${result.reloaded}`);
@@ -526,10 +629,7 @@ async function runCacheClear(win, options = {}) {
         if (cfg.relaunch) {
             // Con retraso para que la respuesta del invoke alcance a salir; el
             // botón rojo antes salía en seco y el renderer nunca la veía.
-            setTimeout(() => {
-                app.relaunch();
-                app.exit(0);
-            }, 150);
+            setTimeout(() => relaunchApp(`clear-cache ${preset}`), 150);
         } else if (cfg.reload && target && !target.isDestroyed()) {
             target.webContents.reloadIgnoringCache();
         }
@@ -617,6 +717,269 @@ async function clearCachesIfBuildChanged(origin) {
     console.log(`[update] build al arranque cambió: ${localId} -> ${remoteId}; limpiando caché`);
     await clearAppData({ frontend: true });
     return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EL SERVIDOR LOCAL, VIGILADO
+//
+// Todo lo que hace la ventana pasa por el express de proxy.js en 127.0.0.1:18180: el
+// frontend, el proxy de /api/v1 y la página de configuración. Hasta ahora se levantaba
+// una vez en el arranque y nadie volvía a mirarlo, y resultó que puede desaparecer con la
+// aplicación entera en pie (dos instancias peleándose el puerto en Windows: ver la nota de
+// `/__client/ping` en proxy.js). Sin nadie escuchando, cada petición muere con
+// ERR_CONNECTION_REFUSED y el cajero sólo ve "error de red" — para siempre, porque nada
+// vuelve a intentar el `listen`.
+//
+// Tres piezas: la PRUEBA (probeLocalServer: ¿contesta, y contesta MI proceso?), el
+// ARREGLO (ensureLocalServer: si no, volver a levantarlo) y la VIGILANCIA
+// (startLocalServerWatcher + el aviso del renderer, que llega antes que cualquier ronda).
+// ═══════════════════════════════════════════════════════════════════════════
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * ¿Quién contesta en el puerto local? Devuelve `mine` sólo si el nonce es el de este
+ * proceso; `foreign` si contesta un express que no es el nuestro (otra instancia del
+ * cliente, o un programa distinto ocupando el puerto).
+ */
+async function probeLocalServer(timeoutMs = LOCAL_SERVER_PROBE_TIMEOUT_MS) {
+    try {
+        const body = await fetchJson(`${LOCAL_FRONT_URL}/__client/ping`, timeoutMs);
+        const mine = !!body && body.nonce === LOCAL_SERVER_ID.nonce;
+        return {
+            ok: true,
+            mine,
+            foreign: !mine,
+            pid: body && body.pid,
+            app: (body && body.app) || '',
+            error: ''
+        };
+    } catch (e) {
+        return { ok: false, mine: false, foreign: false, error: e && e.message ? e.message : String(e) };
+    }
+}
+
+function localServerPayload() {
+    return {
+        ok: localServerState.listening === true,
+        listening: localServerState.listening,
+        foreign: localServerState.foreign,
+        error: localServerState.error,
+        url: LOCAL_FRONT_URL,
+        port: LOCAL_FRONT_PORT,
+        pid: LOCAL_SERVER_ID.pid,
+        repairs: localServerState.repairs,
+        checkedAt: localServerState.checkedAt,
+        since: localServerState.since
+    };
+}
+
+function broadcastLocalServer() {
+    const payload = localServerPayload();
+    for (const w of BrowserWindow.getAllWindows()) {
+        try {
+            if (!w.isDestroyed()) w.webContents.send('nestor:local-server', payload);
+        } catch { }
+    }
+}
+
+// Anota el estado y avisa al renderer SÓLO cuando cambia algo que se ve (si escucha o no,
+// y si el puerto es de otro). Así la ronda periódica no manda un evento cada 20 s.
+function setLocalServerState(patch) {
+    const before = `${localServerState.listening}|${localServerState.foreign}`;
+    Object.assign(localServerState, patch, { checkedAt: Date.now() });
+    const after = `${localServerState.listening}|${localServerState.foreign}`;
+    if (before !== after) {
+        if (localServerState.listening === true) localServerState.since = Date.now();
+        broadcastLocalServer();
+    }
+}
+
+// Levanta el express. Cierra antes el handle anterior: si quedó a medias (bound pero sin
+// aceptar), reusarlo es justo el bug que esto arregla.
+async function listenLocalServer() {
+    const { currentDir, previousDir } = getPaths();
+
+    if (localServer) {
+        const old = localServer;
+        localServer = null;
+        await new Promise((resolve) => {
+            try {
+                old.close(() => resolve());
+                // `close()` deja de aceptar y libera el puerto, pero no termina hasta que
+                // se cierran las conexiones vivas — y la ventana mantiene keep-alive. Se
+                // cortan: aquí se llega sólo cuando ese servidor ya no contesta, así que
+                // no hay nada que preservar y sí un puerto que liberar cuanto antes.
+                if (typeof old.closeAllConnections === 'function') old.closeAllConnections();
+            } catch { resolve(); }
+            setTimeout(resolve, 1000);
+        });
+    }
+
+    const server = await startLocalFrontendServer(currentDir, () => serverOrigin, {
+        previousDir,
+        identity: Object.assign({}, LOCAL_SERVER_ID, { version: app.getVersion() }),
+        // Lo que una instancia nueva necesita saber para advertir bien antes de ofrecer
+        // cerrar a ésta: ¿hay ventana?, ¿está en el POS?, ¿el POS está trabajando?
+        status: () => {
+            const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+            return {
+                has_window: !!win,
+                pos_route: isOnPosRoute(win),
+                pos_gate: posGateHolds(win)
+            };
+        }
+    });
+
+    // Si el socket se cae por su cuenta, la próxima ronda tiene que volver a levantarlo.
+    server.on('close', () => {
+        if (shuttingDown || localServer !== server) return;
+        console.warn('[local] el servidor local se cerró solo; se reintentará');
+        setLocalServerState({ listening: false, error: 'el servidor local se cerró' });
+        ensureLocalServer('close').catch(() => { });
+    });
+
+    localServer = server;
+    return server;
+}
+
+/**
+ * Garantiza que el puerto local sea NUESTRO y esté contestando. Idempotente y barata
+ * cuando todo está bien (una petición a /__client/ping).
+ *
+ * Se serializa en `localServerBusy`: el renderer puede avisar de diez peticiones caídas a
+ * la vez y aquí se atiende una sola vez.
+ */
+function ensureLocalServer(reason = 'check') {
+    if (localServerBusy) return localServerBusy;
+
+    localServerBusy = (async () => {
+        if (shuttingDown) return localServerPayload();
+
+        let first = await probeLocalServer();
+        // Segunda oportunidad antes de concluir nada. El proceso principal hace trabajo
+        // síncrono largo (descomprimir el bundle de 11-30 MB con AdmZip bloquea el bucle
+        // de eventos varios segundos), y ahí el propio sondeo se vence sin que el servidor
+        // tenga nada de malo. Declararlo caído por eso sería CERRAR un express vivo y
+        // tirarle las peticiones en vuelo a la ventana: el remedio peor que la enfermedad.
+        if (!first.ok) {
+            await sleep(300);
+            first = await probeLocalServer();
+        }
+        if (first.mine) {
+            setLocalServerState({ listening: true, foreign: false, error: '' });
+            return localServerPayload();
+        }
+
+        if (first.foreign) {
+            // Contesta un express que no es el mío. No se toca el puerto: quien manda es
+            // el otro proceso, y el nuestro no puede servir nada. Con el candado de
+            // instancia única esto sólo pasa con un cliente zombi (o una versión vieja).
+            console.error(`[local] el puerto ${LOCAL_FRONT_PORT} lo tiene otro proceso `
+                + `(${first.app || 'desconocido'} pid ${first.pid || '?'}); motivo=${reason}`);
+            setLocalServerState({
+                listening: false,
+                foreign: true,
+                error: `el puerto ${LOCAL_FRONT_PORT} lo tiene otro proceso (pid ${first.pid || '?'})`
+            });
+            return localServerPayload();
+        }
+
+        // Nadie contesta: hay que levantarlo. Varios intentos porque el puerto puede
+        // estar liberándose todavía (una instancia que acaba de salir).
+        console.warn(`[local] nadie contesta en ${LOCAL_FRONT_URL} (motivo=${reason}): ${first.error}`);
+
+        let lastError = first.error;
+        for (let intento = 1; intento <= 3; intento++) {
+            try {
+                await listenLocalServer();
+                const after = await probeLocalServer();
+                if (after.mine) {
+                    localServerState.repairs++;
+                    console.log(`[local] servidor local restablecido (intento ${intento}, motivo=${reason})`);
+                    setLocalServerState({ listening: true, foreign: false, error: '' });
+                    return localServerPayload();
+                }
+                if (after.foreign) {
+                    setLocalServerState({
+                        listening: false,
+                        foreign: true,
+                        error: `el puerto ${LOCAL_FRONT_PORT} lo tiene otro proceso (pid ${after.pid || '?'})`
+                    });
+                    return localServerPayload();
+                }
+                lastError = after.error || 'el servidor no contesta después de levantarlo';
+            } catch (e) {
+                lastError = e && e.message ? e.message : String(e);
+                console.warn(`[local] no se pudo levantar el servidor local (intento ${intento}): ${lastError}`);
+            }
+            if (intento < 3) await sleep(400);
+        }
+
+        // EADDRINUSE con nadie contestando el ping: el puerto está tomado por un socket
+        // que no sirve peticiones (una instancia colgada, o un programa ajeno). Se
+        // reporta como ajeno igual: no es algo que este proceso pueda arreglar solo.
+        const ocupado = /EADDRINUSE/i.test(String(lastError));
+        setLocalServerState({
+            listening: false,
+            foreign: ocupado,
+            error: ocupado ? `el puerto ${LOCAL_FRONT_PORT} está ocupado (EADDRINUSE)` : lastError
+        });
+        return localServerPayload();
+    })().finally(() => { localServerBusy = null; });
+
+    return localServerBusy;
+}
+
+function startLocalServerWatcher() {
+    if (localServerTimer) {
+        clearInterval(localServerTimer);
+        localServerTimer = null;
+    }
+    if (!LOCAL_SERVER_WATCH_MS) return;
+
+    localServerTimer = setInterval(() => {
+        if (shuttingDown) return;
+        ensureLocalServer('ronda').catch(() => { });
+    }, LOCAL_SERVER_WATCH_MS);
+    if (localServerTimer.unref) localServerTimer.unref();
+}
+
+function stopLocalServerWatcher() {
+    if (localServerTimer) clearInterval(localServerTimer);
+    localServerTimer = null;
+}
+
+// Salida ordenada: apaga la vigilancia (para que nadie reviva el puerto a media salida) y
+// cierra las bitácoras. `app.exit(0)` NO dispara `will-quit`, así que sin esto cada
+// relanzamiento del auto-update dejaba la captura XHR sin cerrar —el `.har` quedaba
+// inválido, con su `_fin` anexado a la fuerza en el arranque siguiente— y el WAL de la
+// base de ventas sin consolidar.
+function shutdownForExit(reason) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[salida] ${reason}`);
+    stopLocalServerWatcher();
+    try { if (versionTimer) clearInterval(versionTimer); } catch { }
+    versionTimer = null;
+    try { if (localServer) localServer.close(); } catch { }
+    localServer = null;
+    try { globalShortcut.unregisterAll(); } catch { }
+    try { xhr.shutdown(); } catch { }
+    try { ledger.shutdown(); } catch { }
+    try { posError.shutdown(); } catch { }
+}
+
+// Reinicio de la aplicación. Suelta el candado de instancia única ANTES de relanzar: el
+// proceso nuevo lo pide mientras este todavía se está muriendo, y si lo encuentra tomado
+// se sale — la app no volvería a abrir después de una actualización.
+function relaunchApp(reason) {
+    shutdownForExit(`relanzamiento (${reason})`);
+    try { if (SINGLE_INSTANCE) app.releaseSingleInstanceLock(); } catch { }
+    app.relaunch();
+    app.exit(0);
 }
 
 // ¿La ventana está parada en el POS? Se lee del webContents y no de lo que
@@ -1110,9 +1473,23 @@ function wireIpc() {
     });
 
     removeAndHandle('nestor:relaunch', async () => {
-        app.relaunch();
-        app.exit(0);
+        relaunchApp('ipc');
         return { ok: true };
+    });
+
+    // ── Servidor local ─────────────────────────────────────────────────────
+    // El renderer es el primero que se entera de que el servidor local se cayó (sus
+    // peticiones mueren con ERR_NETWORK), así que es también el que dispara la
+    // comprobación: llega antes que la ronda periódica. `repair` y `status` son la
+    // misma rutina —comprobar y, si hace falta, volver a levantarlo—; se separan sólo
+    // para que el nombre diga qué espera quien llama.
+    removeAndHandle('nestor:local-server-status', async () => {
+        return await ensureLocalServer('renderer:status');
+    });
+
+    removeAndHandle('nestor:local-server-repair', async (event, payload) => {
+        const reason = String((payload && payload.reason) || 'renderer');
+        return await ensureLocalServer(`renderer:${reason}`.slice(0, 120));
     });
 
     removeAndHandle('nestor:refresh', async (event) => {
@@ -1326,8 +1703,214 @@ function registerPosShortcuts(win) {
 
 }
 
+/**
+ * Toma el candado de instancia única. Con reintentos: el proceso que relanza el
+ * auto-update arranca mientras el anterior todavía se está muriendo, y ahí "el candado
+ * está tomado" significa "espera un momento", no "ya hay otro cliente abierto".
+ */
+async function acquireInstanceLock() {
+    if (!SINGLE_INSTANCE) return true;
+
+    for (let intento = 0; intento <= INSTANCE_LOCK_RETRIES; intento++) {
+        if (app.requestSingleInstanceLock()) return true;
+        if (intento < INSTANCE_LOCK_RETRIES) await sleep(INSTANCE_LOCK_WAIT_MS);
+    }
+
+    // Se agotaron los reintentos. Antes de rendirse —que aquí significa "la caja no
+    // vuelve a abrir sola"— hay que distinguir los dos casos que se ven igual desde el
+    // candado:
+    //
+    //   a) De verdad hay otro cliente trabajando: contesta en el puerto local. Salirse es
+    //      lo correcto (y `second-instance` ya trajo su ventana al frente).
+    //   b) El candado es de un proceso que se está MURIENDO. Es el relanzamiento del
+    //      auto-update: Electron arranca el proceso nuevo mientras el viejo termina de
+    //      salir. Rendirse aquí deja la caja apagada tras una actualización, con el cajero
+    //      esperando y nadie que la abra. Así que se sigue esperando mientras nadie
+    //      conteste en el puerto.
+    //
+    // `relaunchApp()` suelta el candado antes de relanzar, así que (b) casi nunca debería
+    // llegar hasta aquí. Esto es la red por si ese camino no se cumple (un cierre por
+    // señal, una versión anterior que no lo suelta, un proceso colgado).
+    const deadline = Date.now() + INSTANCE_LOCK_GHOST_WAIT_MS;
+    while (Date.now() < deadline) {
+        const who = await probeLocalServer(1200);
+        if (who.ok) {
+            // (a) Hay otro cliente VIVO. Su ventana ya se enfocó (el primario atendió el
+            // evento `second-instance` en cuanto pedimos el candado). Si con eso no basta
+            // —el usuario insiste—, se le ofrece el relevo.
+            if (await offerReplaceOther(who)) return true;
+            console.warn('[instancia] el otro cliente contesta en el puerto '
+                + `(pid ${who.pid || '?'}): esta instancia se sale`);
+            return false;
+        }
+        console.warn('[instancia] el candado está tomado pero NADIE contesta en el puerto: '
+            + 'se espera (probable relanzamiento en curso)');
+        await sleep(INSTANCE_LOCK_WAIT_MS);
+        if (app.requestSingleInstanceLock()) {
+            console.log('[instancia] candado obtenido tras esperar al proceso anterior');
+            return true;
+        }
+    }
+    return false;
+}
+
+// ── Intentos de apertura ───────────────────────────────────────────────────
+// Se anotan en disco porque cada intento es un PROCESO distinto: la única forma de saber
+// que el usuario insiste es que el anterior dejó constancia. Sólo se conservan los de la
+// ventana de tiempo vigente.
+function recordLaunchAttempt() {
+    const { userData } = getPaths();
+    const file = path.join(userData, 'launch_attempts.json');
+    const now = Date.now();
+    let previous = [];
+    try {
+        const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (Array.isArray(raw && raw.at)) previous = raw.at;
+    } catch { /* primera vez, o archivo ilegible */ }
+
+    const recent = previous
+        .map((t) => Number(t) || 0)
+        .filter((t) => t > 0 && (now - t) < REPLACE_ATTEMPT_WINDOW_MS);
+    recent.push(now);
+
+    try {
+        fs.mkdirSync(userData, { recursive: true });
+        fs.writeFileSync(file, JSON.stringify({ at: recent.slice(-5) }));
+    } catch (e) {
+        console.warn('[instancia] no se pudo anotar el intento de apertura:',
+            e && e.message ? e.message : e);
+    }
+    return recent.length;
+}
+
+function clearLaunchAttempts() {
+    try {
+        fs.rmSync(path.join(getPaths().userData, 'launch_attempts.json'), { force: true });
+    } catch { /* noop */ }
+}
+
+/**
+ * Ofrece cerrar la instancia anterior y quedarse con ésta. Devuelve true SÓLO si el
+ * relevo se completó (candado en mano y puerto libre): el llamador puede seguir con el
+ * arranque normal.
+ *
+ * La advertencia dice lo que de verdad está en juego, que no es la cuenta en captura —el
+ * borrador vive en el servidor y en la bitácora local, y se rehidrata sola— sino lo que
+ * esté EN VUELO: una venta a medio registrar (queda por comprobar) y, sobre todo, un
+ * cobro con tarjeta en curso, que puede quedar aprobado en la terminal sin ticket.
+ */
+async function offerReplaceOther(who) {
+    if (REPLACE_PROMPT_MODE === 'never') return false;
+
+    const intentos = recordLaunchAttempt();
+    if (REPLACE_PROMPT_MODE !== 'always' && intentos < 2) {
+        // Primer intento: la ventana anterior ya se trajo al frente. Con eso basta en el
+        // caso normal (un doble clic de más) y no se molesta a nadie con un diálogo.
+        console.log('[instancia] primer intento: se enfocó la ventana existente');
+        return false;
+    }
+
+    const enPos = who.pos_route === true;
+    const trabajando = who.pos_gate === true;
+
+    const detalle = [
+        enPos
+            ? 'La ventana que ya está abierta tiene el PUNTO DE VENTA en pantalla'
+            + (trabajando ? ' y la caja está trabajando.' : '.')
+            : 'Ya hay una ventana de Nestor POS abierta en este equipo.',
+        '',
+        'Si la cierras y te quedas con esta:',
+        '  • La cuenta en captura NO se pierde (se recupera al volver a entrar).',
+        '  • Las ventas que estén en la cola tampoco se pierden.',
+        '  • Sí se interrumpe lo que esté a medias: una venta a medio registrar quedará',
+        '    pendiente de comprobar y un COBRO CON TARJETA en curso puede quedar',
+        '    aprobado en la terminal sin ticket.',
+        '',
+        'Si sólo no encuentras la ventana anterior, esta opción es la correcta.'
+    ].join('\n');
+
+    const { response } = await dialog.showMessageBox({
+        type: 'warning',
+        buttons: ['Usar la ventana abierta', 'Cerrar la anterior y abrir esta'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+        title: 'Nestor POS ya está abierto',
+        message: '¿Cerrar la ventana anterior?',
+        detail: detalle
+    });
+
+    if (response !== 1) {
+        console.log('[instancia] el usuario prefirió la ventana ya abierta');
+        return false;
+    }
+
+    // Se le pide el relevo por el mismo canal del candado: el primario recibe
+    // `second-instance` con este dato y se cierra EN ORDEN (bitácoras consolidadas).
+    console.warn(`[instancia] relevo aceptado: se pide el cierre del pid ${who.pid || '?'}`);
+    app.requestSingleInstanceLock({ nestor_replace: true, at: Date.now() });
+
+    const deadline = Date.now() + REPLACE_HANDOVER_MS;
+    while (Date.now() < deadline) {
+        await sleep(250);
+        if (app.requestSingleInstanceLock()) {
+            // El puerto puede tardar un instante más en quedar libre; de eso se encarga
+            // ensureLocalServer, que reintenta el listen.
+            console.log('[instancia] relevo completado: esta ventana toma el lugar de la anterior');
+            clearLaunchAttempts();
+            return true;
+        }
+    }
+
+    // No se cerró: el proceso anterior está colgado de verdad (no atiende ni el IPC), así
+    // que no hay nada que esta instancia pueda hacer sin matarlo por la fuerza.
+    dialog.showErrorBox(
+        'No se pudo cerrar la ventana anterior',
+        'La ventana de Nestor POS que ya estaba abierta no respondió al cierre.\n\n'
+        + `Ciérrala desde el Administrador de tareas (proceso ${who.pid || 'Nestor POS'}) `
+        + 'y vuelve a abrir la aplicación.'
+    );
+    return false;
+}
+
+// Alguien volvió a abrir el acceso directo: en vez de arrancar un segundo cliente (que se
+// pelearía el puerto y el perfil), se trae al frente el que ya está.
+app.on('second-instance', (event, argv, workingDirectory, additionalData) => {
+    // La instancia nueva pidió el relevo y su usuario ya confirmó la advertencia (ver
+    // acquireInstanceLock): esta ventana se cierra en orden —consolidando bitácoras y
+    // soltando puerto y candado— para que la nueva pueda tomar su lugar.
+    if (additionalData && additionalData.nestor_replace === true) {
+        console.warn('[instancia] una ventana nueva pidió reemplazar a ésta: se cierra en orden');
+        shutdownForExit('reemplazo por una ventana nueva');
+        try { if (SINGLE_INSTANCE) app.releaseSingleInstanceLock(); } catch { }
+        app.exit(0);
+        return;
+    }
+
+    console.log('[instancia] se intentó abrir un segundo cliente; se enfoca el que ya está');
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : BrowserWindow.getAllWindows()[0];
+    if (!win || win.isDestroyed()) return;
+    try {
+        if (win.isMinimized()) win.restore();
+        win.show();
+        win.focus();
+    } catch { }
+});
+
 app.whenReady().then(async () => {
     try {
+        // Lo PRIMERO: si no somos la única instancia, salir sin haber tocado nada — ni el
+        // puerto, ni la base de ventas, ni la captura XHR (que si no, le anexa un cierre
+        // a la fuerza al .har que la otra instancia tiene abierto).
+        if (!await acquireInstanceLock()) {
+            console.warn('[instancia] ya hay un cliente de Nestor POS abierto en este equipo; se sale');
+            app.exit(0);
+            return;
+        }
+        // Somos la única instancia: los intentos anotados por aperturas anteriores ya no
+        // dicen nada (ver offerReplaceOther).
+        clearLaunchAttempts();
+
         await session.defaultSession.clearCache();
         await session.defaultSession.clearStorageData({
             storages: ['serviceworkers', 'cachestorage']
@@ -1364,7 +1947,23 @@ app.whenReady().then(async () => {
         savedZoomFactor = cfg.zoom_factor ?? 1.0;
 
         // Se levanta también en dev: sirve /__client/config y el proxy /api/v1.
-        localServer = await startLocalFrontendServer(currentDir, () => serverOrigin);
+        //
+        // No basta con que el `listen` no truene: hay que comprobar que el que contesta en
+        // el puerto sea ESTE proceso (ver ensureLocalServer). Si el puerto es de alguien
+        // más, abrir la ventana significa mostrarle al cajero el frontend de otro proceso
+        // sobre datos de otro servidor, así que se dice y se sale.
+        await ensureLocalServer('arranque');
+        if (localServerState.listening !== true) {
+            const detalle = localServerState.foreign
+                ? `El puerto ${LOCAL_FRONT_PORT} lo tiene otro proceso.\n\n`
+                + 'Lo más probable es que ya haya un cliente de Nestor POS abierto (o uno que '
+                + 'quedó colgado). Ciérralo desde el Administrador de tareas y vuelve a abrir.'
+                : `No se pudo levantar el servidor local en ${LOCAL_FRONT_URL}.\n\n${localServerState.error || ''}`;
+            dialog.showErrorBox('Nestor POS no puede iniciar', detalle);
+            app.exit(1);
+            return;
+        }
+        startLocalServerWatcher();
 
         if (IS_DEV) {
             console.log(`[dev] frontend desde ${DEV_URL} (sin bundle, sin auto-update); API hacia ${serverOrigin}`);
@@ -1400,20 +1999,15 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-    try { if (versionTimer) clearInterval(versionTimer); } catch { }
-    versionTimer = null;
-    try { if (localServer) localServer.close(); } catch { }
+    // Se cerró la última ventana: apagar la vigilancia del puerto ANTES de cerrarlo, o el
+    // `close` del socket dispararía un nuevo `listen` a media salida.
+    shutdownForExit('se cerraron todas las ventanas');
     app.quit();
 });
 
 app.on('will-quit', () => {
-    try { if (versionTimer) clearInterval(versionTimer); } catch { }
-    versionTimer = null;
-    try { globalShortcut.unregisterAll(); } catch { }
-    // Cerrar la captura XHR de esta corrida: el .har queda completo y abrible.
-    try { xhr.shutdown(); } catch { }
-    // Consolidar el WAL para que el .db de ventas quede copiable tal cual (sin sidecar).
-    try { ledger.shutdown(); } catch { }
-    // La cola de incidencias se queda en disco: lo que no se subió se sube al arrancar.
-    try { posError.shutdown(); } catch { }
+    // Cierra la captura XHR (el .har queda completo y abrible), consolida el WAL de la
+    // base de ventas y deja la cola de incidencias en disco. Es idempotente: si ya se
+    // hizo desde `window-all-closed` o desde un relanzamiento, aquí no hace nada.
+    shutdownForExit('will-quit');
 });

@@ -404,6 +404,67 @@ function consoleFileFor(harName) {
     return String(harName || '').replace(/\.har$/, '') + '.consola.jsonl';
 }
 
+// ── Dueño de una captura ────────────────────────────────────────────────────
+//
+// Este directorio es compartido: dos clientes abiertos a la vez lo escriben los dos. Y el
+// arranque cierra "las capturas que dejó un cierre sucio" —cualquier .har sin `_fin`—
+// recortándole el final y anexándole el cierre.
+//
+// Sobre una captura VIVA eso es demolición: el 20/ago/2026 (DESKTOP-L3JNQ0R) una segunda
+// instancia arrancó 4 segundos después de la primera y le anexó su `_fin` al .har que la
+// primera tenía abierto. La primera siguió escribiendo entradas DESPUÉS del cierre y el
+// archivo quedó con dos documentos pegados: JSON inválido, imposible de abrir en DevTools,
+// justo el archivo que se necesitaba para diagnosticar la caída.
+//
+// El candado es un archivo al lado con el pid del dueño. Mientras ese proceso viva, ni la
+// recuperación ni la poda tocan su captura. Con el candado de instancia única del cliente
+// esto ya no debería pasar; queda porque el costo es un archivo de 20 bytes y lo que
+// protege es la única prueba de lo que pasó en la caja.
+function lockFileFor(harFile) {
+    return String(harFile || '').replace(/\.har$/, '') + '.dueno.json';
+}
+
+function writeOwnerLock(harFile) {
+    try {
+        fs.writeFileSync(lockFileFor(harFile), JSON.stringify({
+            pid: process.pid,
+            equipo: os.hostname(),
+            abierta: new Date().toISOString()
+        }));
+    } catch { }
+}
+
+function clearOwnerLock(harFile) {
+    try { fs.rmSync(lockFileFor(harFile), { force: true }); } catch { }
+}
+
+/**
+ * ¿Esta captura la tiene abierta OTRO proceso vivo? `false` también cuando el candado es
+ * de un pid que ya murió (un cierre sucio: ahí sí hay que recuperar el archivo).
+ */
+function lockedByOtherProcess(harFile) {
+    let owner;
+    try {
+        owner = JSON.parse(fs.readFileSync(lockFileFor(harFile), 'utf8'));
+    } catch {
+        return false;
+    }
+
+    const pid = Number(owner && owner.pid);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    if (pid === process.pid) return false;
+    // Otro equipo (directorio en red): no se puede saber si vive, así que se respeta.
+    if (owner.equipo && owner.equipo !== os.hostname()) return true;
+
+    try {
+        process.kill(pid, 0);   // no manda señal: sólo pregunta si el proceso existe
+        return true;
+    } catch (e) {
+        // EPERM = existe pero es de otro usuario. ESRCH = ya no está.
+        return e && e.code === 'EPERM';
+    }
+}
+
 function writeChunk(text) {
     if (!current) return;
     try {
@@ -568,6 +629,7 @@ function openSession(reason, user) {
         })
         + ',"pages":[],"entries":[\n';
 
+    writeOwnerLock(file);
     writeChunk(head);
     console.log(`[xhr] captura abierta: ${file}`);
     return current;
@@ -599,6 +661,9 @@ function finalizeSession(reason) {
         try { fs.closeSync(done.consoleFd); } catch { }
         done.consoleFd = null;
     }
+    // La captura ya está cerrada en regla: soltar el candado (si no, el arranque
+    // siguiente la vería "de otro proceso" hasta que ese pid se reciclara).
+    clearOwnerLock(done.file);
     current = null;
 
     appendIndex({
@@ -724,10 +789,17 @@ function pruneOrphanConsoles() {
 // Aquí se le pone: se recorta el último renglón si quedó a medias y se anexa el `_fin`
 // marcado como recuperado. El archivo queda abrible como cualquier otro.
 function repairSession(file) {
+    // Una captura que otro proceso vivo tiene abierta NO está sucia: está en uso.
+    if (lockedByOtherProcess(file)) {
+        console.log('[xhr] captura en uso por otro proceso, no se toca:', file);
+        return false;
+    }
+
     let st;
     try { st = fs.statSync(file); } catch { return false; }
     if (!st.size) {
         try { fs.rmSync(file, { force: true }); } catch { }
+        clearOwnerLock(file);
         return false;
     }
 
@@ -769,6 +841,8 @@ function repairSession(file) {
             cerrada: new Date().toISOString(),
             nota: 'La aplicación no cerró limpiamente; el cierre se anexó en el arranque siguiente.'
         }) + '}}\n');
+        // El candado que quedó es de un proceso muerto: se suelta con la recuperación.
+        clearOwnerLock(file);
         console.log('[xhr] captura recuperada:', file);
         return true;
     } catch (e) {
@@ -783,7 +857,11 @@ function repairSession(file) {
 function prune() {
     if (!dir) return null;
 
-    const files = listSessionFiles().filter((f) => !current || f.file !== current.file);
+    // Ni la propia ni las que otro proceso vivo tiene abiertas: borrarle el .har a una
+    // captura en curso deja al otro cliente escribiendo en un archivo que ya no existe.
+    const files = listSessionFiles()
+        .filter((f) => !current || f.file !== current.file)
+        .filter((f) => !lockedByOtherProcess(f.file));
     const cutoff = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
     const removed = [];
@@ -795,6 +873,7 @@ function prune() {
             if (f.consoleFile) {
                 try { fs.rmSync(f.consoleFile, { force: true }); } catch { }
             }
+            clearOwnerLock(f.file);
             removed.push({ archivo: f.name, bytes: f.size, motivo });
             return true;
         } catch (e) {

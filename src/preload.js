@@ -82,6 +82,11 @@ contextBridge.exposeInMainWorld('NestorClient', {
     // bundle nuevo y recarga; 'cache' sólo tira caché; 'full' es el botón rojo.
     // Devuelve { ok, cleared, build, localStorageKeysRemoved, ... } y NO lanza:
     // si falla la descarga responde { ok:false, error } sin haber borrado nada.
+    //
+    // `bundleOptional: true` invierte eso: se limpia igual aunque el bundle no se
+    // pueda bajar, y el motivo viene en `bundleError`. Es para lo que NO es una
+    // actualización —una orden de "vaciar caché" del modo ingeniero—, que no debe
+    // fracasar porque el servidor esté reiniciándose.
     clearCache: (options) => invoke('nestor:clear-cache', options || {}),
 
     // Aviso de que el caché se borró (venga de donde venga). Ojo: la ventana que
@@ -102,6 +107,27 @@ contextBridge.exposeInMainWorld('NestorClient', {
     // responsable de aplicarla con clearCache({ preset: 'update' }) cuando sea
     // seguro. Devuelve la función para darse de baja.
     onUpdateAvailable: (cb) => subscribe('nestor:update-available', cb),
+
+    // ── Servidor local ─────────────────────────────────────────────────────
+    // Todo lo que pide la ventana (el frontend y /api/v1) pasa por el express que este
+    // mismo proceso levanta en 127.0.0.1:18180. Si ese servidor se cae, la ventana sigue
+    // en pantalla y CADA petición muere con ERR_NETWORK — que desde el renderer es
+    // indistinguible de "no hay red" o "el servidor del negocio está apagado".
+    //
+    // Esto es la vía para preguntarlo y para arreglarlo:
+    //
+    //   const st = await window.NestorClient.localServer.repair('login')
+    //   if (!st.ok) { /* avisar: el cliente perdió su servidor local */ }
+    //
+    // Devuelve { ok, listening, foreign, error, url, port, pid, repairs }. `foreign:true`
+    // = el puerto lo tiene otro proceso (otra instancia del cliente): eso no se arregla
+    // desde aquí, hay que cerrar la otra o reiniciar.
+    localServer: {
+        status: () => invoke('nestor:local-server-status'),
+        repair: (reason) => invoke('nestor:local-server-repair', { reason: String(reason || 'manual') }),
+        // Cambios de estado (cayó / volvió). Devuelve la función para darse de baja.
+        onChange: (cb) => subscribe('nestor:local-server', cb)
+    },
 
     // ── Ventas en local ────────────────────────────────────────────────────
     // Base SQLite de la caja, fuera del perfil de Electron: cada ticket, cada

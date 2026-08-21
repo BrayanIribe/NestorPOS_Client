@@ -309,14 +309,50 @@ function configHtml() {
 </html>`;
 }
 
-function startLocalFrontendServer(currentDir, getServerOriginFn) {
+function startLocalFrontendServer(currentDir, getServerOriginFn, options = {}) {
     const ex = express();
 
     const cacheDir = process.env.NESTOR_API_CACHE_DIR || path.join(currentDir, '..', 'api_cache');
 
+    // Identidad de ESTE proceso. Es lo único que permite saber si el que contesta en
+    // 127.0.0.1:18180 soy yo. Ver `/__client/ping`.
+    const identity = Object.assign({ app: 'nestorpos_client', pid: process.pid, nonce: '' }, options.identity || {});
+
     ex.get('/__client/config', (req, res) => {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         res.end(configHtml());
+    });
+
+    // ── ¿De quién es el puerto? ────────────────────────────────────────────────
+    //
+    // Que `listen()` no truene NO prueba que las peticiones de la ventana lleguen a
+    // ESTE express. En Windows, dos procesos pueden quedar pegados al mismo
+    // 127.0.0.1:18180 (semántica de SO_REUSEADDR: el segundo bind no falla y cuál de
+    // los dos recibe las conexiones queda indefinido), y cuando el otro se cierra el
+    // socket que queda no acepta nada: todo responde ERR_CONNECTION_REFUSED con la
+    // ventana entera en pantalla.
+    //
+    // Caso real (20/ago/2026, DESKTOP-L3JNQ0R): dos instancias abiertas con 4 segundos
+    // de diferencia; al cerrarse la primera, la segunda se quedó una hora entera sin
+    // poder hacer login —ni un solo POST salió— sin que nada en el proceso se enterara.
+    //
+    // Este endpoint es la prueba: main.js lo consulta después de cada `listen` y cada
+    // pocos segundos, y compara el `nonce`. Si contesta otro nonce, el puerto es de
+    // otro proceso; si no contesta nadie, hay que volver a levantarlo.
+    ex.get('/__client/ping', (req, res) => {
+        // `status` lo resuelve main.js en el momento (en qué pantalla está la ventana, si
+        // el POS tiene tomado el gate): es lo que permite a una instancia nueva advertir
+        // con precisión ANTES de ofrecer cerrar a la anterior.
+        let live = {};
+        try { live = (typeof options.status === 'function' && options.status()) || {}; } catch { live = {}; }
+
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(JSON.stringify(Object.assign({ ok: true }, identity, live, {
+            server_origin: (() => { try { return getServerOriginFn(); } catch { return ''; } })(),
+            frontend_dir: currentDir,
+            uptime_s: Math.round(process.uptime())
+        })));
     });
 
     ex.use('/api/v1', async (req, res) => {
@@ -367,7 +403,14 @@ function startLocalFrontendServer(currentDir, getServerOriginFn) {
         const cacheFile = path.join(cacheDir, sha256Hex(cacheKey) + '.json');
 
         const disallowCache = [
-            '/pos/status'
+            '/pos/status',
+            // Sondeo de vida del backend. Este proxy sirve respuestas CACHEADAS cuando el
+            // servidor no contesta (ver serveCached), así que un 200 no prueba que haya
+            // servidor: el arranque del frontend necesita al menos UNA ruta que nunca
+            // mienta para poder decidir si retoma la sesión del POS sin conexión (ver
+            // NestorPOS_Frontend/src/pos/offline.session.js). Es la más barata que hay
+            // (140 bytes) y ya se pide en cada arranque.
+            '/system/connectivity'
         ];
 
         const canCacheRequest = (req.method === 'GET') && !disallowCache.includes(req.url)
@@ -477,6 +520,26 @@ function startLocalFrontendServer(currentDir, getServerOriginFn) {
 
     ex.use(express.static(currentDir, { fallthrough: true }));
 
+    // ── El bundle ANTERIOR, como red ───────────────────────────────────────────
+    //
+    // El frontend se parte en trozos que se piden cuando se necesitan (`/js/744.<hash>.js`
+    // al abrir la reimpresión de un ticket, por ejemplo). Al aplicar una build nueva el
+    // directorio se reemplaza completo, así que la ventana que sigue abierta —el POS con
+    // su gate de auto-update, que difiere la recarga a propósito para no tumbarle la
+    // pantalla al cajero— se queda pidiendo trozos con el hash viejo, que ya no existen:
+    //
+    //   Error al reimprimir ticket: Loading chunk 744 failed.
+    //   (missing: http://127.0.0.1:18180/js/744.82a0b3a6.js)
+    //
+    // Y no se arregla solo: hasta que alguien cierra y vuelve a abrir, cada pantalla
+    // perezosa que el cajero no hubiera visitado todavía está muerta. Guardar la build
+    // anterior y servirla como respaldo hace que el código que está corriendo siga
+    // completo hasta que se recargue. `index.html` NO sale de aquí: el estático de
+    // `currentDir` va primero, así que una recarga siempre entra a la build nueva.
+    if (options.previousDir) {
+        ex.use(express.static(options.previousDir, { fallthrough: true, index: false }));
+    }
+
     ex.get(/.*/, (req, res) => {
         const idx = path.join(currentDir, 'index.html');
         if (fs.existsSync(idx)) {
@@ -486,9 +549,33 @@ function startLocalFrontendServer(currentDir, getServerOriginFn) {
         res.redirect('/__client/config');
     });
 
+    // ── El `listen` que mentía ─────────────────────────────────────────────────
+    //
+    // ESTO era el origen del incidente del 20/ago/2026: el cliente arrancaba creyendo que
+    // el puerto era suyo cuando no lo era.
+    //
+    // `app.listen(port, host, cb)` de express 5 NO es `http.Server.listen`: si el último
+    // argumento es una función, express la usa para las DOS salidas —éxito y error—
+    // (`server.once('error', done)`, lib/application.js). O sea, es un callback
+    // error-first, y la versión anterior de este código lo trataba como "ya está
+    // escuchando":
+    //
+    //     const server = ex.listen(PORT, '127.0.0.1', () => resolve(server));  // ⛔
+    //     server.on('error', reject);
+    //
+    // Con el puerto ocupado, `cb` se llamaba con el EADDRINUSE dentro, la promesa
+    // resolvía un servidor MUERTO (`server.listening === false`, `address() === null`),
+    // el `reject` de la línea siguiente ya no tenía efecto y main.js seguía adelante y
+    // abría la ventana. Esa ventana funcionaba —contra el express de la OTRA instancia—
+    // hasta que la otra se cerró: a partir de ahí, ERR_CONNECTION_REFUSED en cada
+    // petición, una hora entera, sin que nada del proceso se enterara.
+    //
+    // Se resuelve con el evento real y nada más. Reproducible en cualquier plataforma
+    // (probado en macOS con express 5.2.1), no es una rareza de Windows.
     return new Promise((resolve, reject) => {
-        const server = ex.listen(LOCAL_FRONT_PORT, '127.0.0.1', () => resolve(server));
-        server.on('error', reject);
+        const server = ex.listen(LOCAL_FRONT_PORT, '127.0.0.1');
+        server.once('listening', () => resolve(server));
+        server.once('error', reject);
     });
 }
 
