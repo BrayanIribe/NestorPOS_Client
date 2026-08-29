@@ -8,6 +8,7 @@ const { startLocalFrontendServer } = require('./proxy');
 const ledger = require('./ledger');
 const xhr = require('./xhr.capture');
 const posError = require('./pos.error');
+const services = require('./services.watchdog');
 
 app.commandLine.appendSwitch('disable-http-cache');
 
@@ -785,6 +786,41 @@ function broadcastLocalServer() {
     }
 }
 
+// Estado del daemon de servicios (impresión y terminal EMV) hacia la ventana. Sólo se
+// manda cuando cambia algo visible; de eso se encarga el propio daemon.
+function broadcastServices(payload) {
+    for (const w of BrowserWindow.getAllWindows()) {
+        try {
+            if (!w.isDestroyed()) w.webContents.send('nestor:services', payload);
+        } catch { }
+    }
+}
+
+/**
+ * Observa las peticiones de la ventana hacia los microservicios de la caja.
+ *
+ * Es la compuerta automática del daemon: sin que el frontend pida nada, saber que
+ * hubo tráfico hacia :8331 o :5000 hace unos segundos basta para NO reiniciar el
+ * servicio que se está usando ahora mismo. Rescatar el EMV mata el proceso, y hacerlo
+ * a media lectura de tarjeta mata el cobro.
+ *
+ * Va sobre webRequest y no sobre la captura XHR (que engancha por CDP y se desengancha
+ * cuando alguien abre DevTools): esto tiene que ver TODAS las peticiones, siempre.
+ */
+function watchServiceTraffic() {
+    try {
+        session.defaultSession.webRequest.onBeforeRequest(
+            { urls: ['http://127.0.0.1:8331/*', 'http://localhost:8331/*', 'http://127.0.0.1:5000/*', 'http://localhost:5000/*'] },
+            (details, callback) => {
+                try { services.noteTraffic(details.url); } catch { }
+                callback({});
+            }
+        );
+    } catch (e) {
+        console.warn('[servicios] no se pudo observar el tráfico local:', e && e.message ? e.message : e);
+    }
+}
+
 // Anota el estado y avisa al renderer SÓLO cuando cambia algo que se ve (si escucha o no,
 // y si el puerto es de otro). Así la ronda periódica no manda un evento cada 20 s.
 function setLocalServerState(patch) {
@@ -967,6 +1003,7 @@ function shutdownForExit(reason) {
     try { if (localServer) localServer.close(); } catch { }
     localServer = null;
     try { globalShortcut.unregisterAll(); } catch { }
+    try { services.shutdown(); } catch { }
     try { xhr.shutdown(); } catch { }
     try { ledger.shutdown(); } catch { }
     try { posError.shutdown(); } catch { }
@@ -1656,6 +1693,41 @@ function wireIpc() {
     removeAndHandle('nestor:diag:flush', async () => {
         try { return await posError.flush(); } catch (e) { return { ok: false, error: String(e && e.message) }; }
     });
+
+    // ── Daemon de servicios ─────────────────────────────────────────────────
+    // Misma regla que el resto de la instrumentación: NINGÚN canal lanza. Estos se
+    // llaman desde el arranque del punto de venta y desde la barra de estado; que un
+    // fallo del daemon impida abrir la caja sería exactamente al revés de para lo que
+    // existe. Ver src/services.watchdog.js.
+    const servicesHandle = (channel, fn) => removeAndHandle(channel, async (event, arg) => {
+        try {
+            return await fn(arg);
+        } catch (e) {
+            const msg = e && e.message ? e.message : String(e);
+            console.warn(`[servicios] ${channel} falló:`, msg);
+            return { ok: false, error: msg };
+        }
+    });
+
+    servicesHandle('nestor:services:status', () => services.status());
+    // Pone un servicio bajo vigilancia y lo levanta si no está. Es lo que llama el POS
+    // al entrar a /pos para la terminal EMV.
+    servicesHandle('nestor:services:ensure', (arg) => services.ensure(
+        arg && arg.id, { immediate: !(arg && arg.immediate === false) }
+    ));
+    servicesHandle('nestor:services:release', (arg) => services.release(arg && arg.id));
+    // Reparación pedida a mano: se salta el backoff, no la compuerta de trabajo en vuelo.
+    servicesHandle('nestor:services:repair', (arg) => services.repair(arg && arg.id));
+    // "No toques esto mientras cobro." Ver la nota de hold() en el daemon.
+    servicesHandle('nestor:services:hold', (arg) => services.hold(arg && arg.id, arg && arg.ms));
+    servicesHandle('nestor:services:unhold', (arg) => services.unhold(arg && arg.id));
+
+    servicesHandle('nestor:services:open-folder', async () => {
+        const target = services.directory();
+        if (!target) return { ok: false, error: 'sin directorio de bitácora' };
+        const err = await shell.openPath(target);
+        return { ok: !err, ruta: target, error: err || '' };
+    });
 }
 
 function exitFullscreenAndKiosk(win) {
@@ -1964,6 +2036,20 @@ app.whenReady().then(async () => {
             return;
         }
         startLocalServerWatcher();
+
+        // Daemon de servicios de la caja: vigila el servicio de impresión (:8331) y la
+        // terminal EMV (:5000) y los levanta cuando se caen. Va después del servidor
+        // local porque comparte su forma de trabajar (sondeo → reparación serializada)
+        // y antes de la ventana porque el printer se vigila desde el arranque, no desde
+        // que alguien entra al punto de venta. Ver src/services.watchdog.js.
+        watchServiceTraffic();
+        services.init(app.getPath('userData'), {
+            onChange: broadcastServices,
+            // El daemon sólo reporta cuando se da por vencido con un servicio: el canal
+            // de errores POS arma un paquete pesado (sesión XHR, consola, log del
+            // servidor) y deduplica por 6 h, así que no es para telemetría de rutina.
+            report: (info) => posError.report(info)
+        });
 
         if (IS_DEV) {
             console.log(`[dev] frontend desde ${DEV_URL} (sin bundle, sin auto-update); API hacia ${serverOrigin}`);

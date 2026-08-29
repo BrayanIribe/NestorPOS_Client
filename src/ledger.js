@@ -121,6 +121,17 @@ const MAX_DETAIL = 500;
 // completo, no sólo el resumen.
 const RISKY = ['charged', 'closing', 'queued', 'failed', 'discarded', 'rejected'];
 
+// Base de una referencia EMV = el uuid del ticket con el que se pidió el cobro, que es
+// justamente el `ticket_key` de su venta.
+//
+// La referencia es única POR INTENTO: el primero va con el uuid pelado y los siguientes
+// con sufijo "-2", "-3"… (ver Ticket.nextEmvReference en el frontend; el adquirente no
+// reprocesa una referencia a la que ya le dio desenlace). Así que el cruce del voucher
+// suelto con su venta compara contra la base, no contra la referencia completa: `instr`
+// se aplica sobre `reference || '-'` para que las referencias sin sufijo —todas las
+// anteriores a ese cambio— sigan devolviéndose enteras.
+const EMV_REF_BASE = "substr(reference, 1, instr(reference || '-', '-') - 1)";
+
 let db = null;
 let shadowPath = '';
 let dbPath = '';
@@ -349,8 +360,13 @@ function ensureSchema(handle) {
         CREATE INDEX IF NOT EXISTS idx_emv_vouchers_at  ON emv_vouchers (at_ms DESC);
         -- La referencia es el segundo vínculo del voucher con su venta (ver list()/get()):
         -- el intento se anota antes de que el ticket exista, así que hay vouchers cuya
-        -- única forma de encontrar su venta es ésta.
+        -- única forma de encontrar su venta es ésta. El índice plano sirve a la
+        -- deduplicación de insertEmv (compara la referencia completa); el de la BASE de la
+        -- referencia sirve al cruce con la venta, que recorta el sufijo del intento
+        -- (ver EMV_REF_BASE).
         CREATE INDEX IF NOT EXISTS idx_emv_vouchers_ref ON emv_vouchers (reference);
+        CREATE INDEX IF NOT EXISTS idx_emv_vouchers_refbase
+            ON emv_vouchers (substr(reference, 1, instr(reference || '-', '-') - 1));
 
         CREATE TABLE IF NOT EXISTS ticket_events (
             seq        INTEGER PRIMARY KEY,
@@ -1144,23 +1160,24 @@ function list(query) {
         // filtro por ticket_key a secas dejaba fuera precisamente los vouchers de las ventas
         // que nunca llegaron a registrarse. Eso pasó el 20/ago/2026: la copia para soporte
         // decía "emv: []" en la venta cuya tarjeta SÍ se había cobrado ($192.00, oper.
-        // 612915484). La referencia con la que se pide el cobro es el uuid del ticket (ver
-        // startSantanderEmvPayment), así que sirve de vínculo sin inventar nada.
+        // 612915484). La referencia con la que se pide el cobro lleva el uuid del ticket
+        // como prefijo (ver startSantanderEmvPayment), así que sirve de vínculo sin
+        // inventar nada: se compara contra su base (EMV_REF_BASE).
         const keys = rows.map(r => String(r.ticket_key));
         const emvByKey = new Map();
         if (keys.length > 0) {
             const placeholders = keys.map(() => '?').join(',');
             const emvRows = db.prepare(`
                 SELECT ticket_key, operation_number, auth, reference, card_last4, card_type,
-                       result, value, vendor
+                       result, value, vendor, ${EMV_REF_BASE} AS ref_base
                 FROM emv_vouchers
                 WHERE ticket_key IN (${placeholders})
-                   OR (ticket_key = '' AND reference IN (${placeholders}))
+                   OR (ticket_key = '' AND ${EMV_REF_BASE} IN (${placeholders}))
             `).all(...keys, ...keys);
             for (const v of emvRows) {
-                // El voucher suelto se agrupa por su referencia: es el ticket al que
-                // pertenece, aunque su propia fila no lo diga.
-                const k = String(v.ticket_key) || String(v.reference);
+                // El voucher suelto se agrupa por la base de su referencia: es el ticket al
+                // que pertenece, aunque su propia fila no lo diga.
+                const k = String(v.ticket_key) || String(v.ref_base);
                 if (!emvByKey.has(k)) emvByKey.set(k, []);
                 emvByKey.get(k).push(v);
             }
@@ -1189,10 +1206,11 @@ function get(key) {
             'SELECT * FROM ticket_products WHERE ticket_key = ? AND rev = (SELECT MAX(rev) FROM ticket_products WHERE ticket_key = ?) ORDER BY line_no'
         ).all(k, k);
         // Igual que en list(): también los vouchers que se anotaron sueltos (sin ticket_key)
-        // y que corresponden a esta venta por su referencia.
+        // y que corresponden a esta venta por su referencia (por su base — la referencia
+        // es única por intento, ver EMV_REF_BASE).
         const vouchers = db.prepare(
             `SELECT * FROM emv_vouchers
-              WHERE ticket_key = ? OR (ticket_key = '' AND reference = ?)
+              WHERE ticket_key = ? OR (ticket_key = '' AND ${EMV_REF_BASE} = ?)
               ORDER BY at_ms`
         ).all(k, k);
         const events = db.prepare('SELECT * FROM ticket_events WHERE ticket_key = ? ORDER BY seq').all(k);

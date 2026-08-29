@@ -253,6 +253,50 @@ contextBridge.exposeInMainWorld('NestorClient', {
         flush: () => invoke('nestor:diag:flush'),
     },
 
+    // ── Servicios de la caja ──────────────────────────────────────────────────
+    // El punto de venta depende de dos microservicios que corren FUERA del cliente y
+    // que se caen solos: el servicio de impresión (127.0.0.1:8331) y la terminal
+    // Santander EMV (127.0.0.1:5000). Hasta ahora había que levantarlos a mano —
+    // `sc start NestorPrinter` y un .ps1 para el EMV— y el cajero mientras tanto sólo
+    // veía "no imprime" o "no pasa la tarjeta".
+    //
+    // El proceso principal ahora los vigila y los rescata. Esto es la vía para
+    // encender esa vigilancia, consultarla y pedir una reparación:
+    //
+    //   // al entrar a /pos, si esta caja tiene terminal:
+    //   await window.NestorClient.services.ensure('emv');
+    //   // alrededor de un cobro largo, para que nadie toque el servicio:
+    //   await window.NestorClient.services.hold('emv', 90000);
+    //
+    // Ninguna llamada lanza: responden { ok:false, error }. En navegador
+    // `window.NestorClient` no existe — validar siempre antes.
+    //
+    // Al agregar un canal nuevo: añadirlo a `capabilities` Y subir `version`. El
+    // frontend lo sirve el BACKEND y el cliente se actualiza por su cuenta, así que un
+    // frontend nuevo sobre un cliente viejo es lo normal, y un canal inexistente hace
+    // que `invoke` RECHACE en vez de devolver un error manejable.
+    services: {
+        version: 1,
+        capabilities: ['status', 'ensure', 'release', 'repair', 'hold', 'unhold', 'openFolder', 'onChange'],
+
+        // { ok, enabled, rescue, mode, services: [{ id, state, detail, warn, ... }] }
+        status: () => invoke('nestor:services:status'),
+        // Pone el servicio bajo vigilancia y, si no contesta, lo levanta AHORA.
+        ensure: (id, options) => invoke('nestor:services:ensure', Object.assign({ id }, options || {})),
+        // Deja de vigilarlo (no apaga nada). El de impresión se vigila siempre.
+        release: (id) => invoke('nestor:services:release', { id }),
+        // Reparación pedida por una persona: se salta la espera entre intentos.
+        repair: (id) => invoke('nestor:services:repair', { id }),
+        // "No toques este servicio durante los próximos ms." Imprescindible en un cobro
+        // con tarjeta: relanzar el EMV mata el proceso, y con él la autorización.
+        hold: (id, ms) => invoke('nestor:services:hold', { id, ms }),
+        unhold: (id) => invoke('nestor:services:unhold', { id }),
+        openFolder: () => invoke('nestor:services:open-folder'),
+        // Cambios de estado (se cayó / se está rescatando / volvió). Devuelve la
+        // función para darse de baja.
+        onChange: (cb) => subscribe('nestor:services', cb)
+    },
+
     getWindowMode: () => invoke('win:get-mode'),
     toggleFullscreen: () => invoke('win:toggle-fullscreen'),
     toggleKiosk: () => invoke('win:toggle-kiosk'),
