@@ -218,6 +218,31 @@ Las dos cosas que lo hacen útil, y que son la razón de que no sea un formulari
   el SCM y las tareas, y contesta con un renglón por comprobación. Sin eso habría que
   guardar, esperar la siguiente ronda y deducir el resultado del color de una pastilla.
 
+### Nunca se toca un servicio ajeno
+
+**El incidente del Spooler.** El Spooler de Windows se llama «Cola de impresión», y el
+filtro que destacaba «lo que parece nuestro» miraba también el nombre visible: el
+Spooler subía al grupo de arriba del desplegable, junto a los nuestros. Elegirlo era lo
+natural —dice impresión— y a partir de ahí, cada vez que `nestor_printer` no contestaba
+en `:8331`, el rescate veía el Spooler en RUNNING y le hacía `sc stop` + `sc start`.
+Hasta cinco veces por hora; cuando el arranque no prendía, la máquina se quedaba sin
+imprimir **nada**, y el síntoma no se parecía en nada a su causa.
+
+Tres barreras, y las tres se comprueban en `check-services-watchdog.js`:
+
+1. **No se destaca.** `pareceServicioNuestro()` mira el **nombre**, nunca el nombre
+   visible. Destacar de más aquí no es una molestia: es una trampa.
+2. **No se guarda.** `SERVICIOS_PROTEGIDOS` en `services.config.js` (Spooler, RPC, WMI,
+   Programador de tareas, Escritorio remoto…) se rechaza al guardar **y** al leer el
+   archivo — uno editado a mano, o escrito por una versión anterior, choca contra el
+   mismo muro y el daemon lo dice en la bitácora. En la lista se ven, bloqueados y con
+   el motivo: esconderlos haría que quien busca «Cola de impresión» pensara que la lista
+   está incompleta y lo escribiera a mano.
+3. **No se reinicia.** `puedeReiniciarServicio()` corre **antes de cualquier `sc stop`**:
+   si el nombre no empieza por `Nestor`, se consulta el ejecutable con `sc qc` y sólo se
+   sigue si la ruta es nuestra. Si no se puede comprobar, no se toca. Un `sc stop` sobre
+   un servicio ajeno no se puede deshacer.
+
 Lo que el asistente **no** hace es registrar el servicio ni la tarea: eso es cosa del
 instalador y pide elevación, y el cliente no corre elevado (ver *Dos landmines de
 despliegue*). Cuando faltan, lo dice con esas palabras en vez de intentarlo.

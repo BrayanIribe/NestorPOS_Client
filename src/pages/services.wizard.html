@@ -107,6 +107,7 @@
     <div id="sin-puente" class="aviso-global" hidden>
       Esta página necesita el cliente de Nestor POS: fuera de él no hay acceso a los servicios de la caja.
     </div>
+    <div id="aviso-vetados" class="aviso-global" hidden></div>
 
     <!-- ── Paso 1 ─────────────────────────────────────────────────────────── -->
     <section class="paso" data-paso="1" hidden>
@@ -159,6 +160,7 @@
         </div>
         <input type="text" data-clave="printer_service" id="txt-printer-service" placeholder="NestorPrinter" hidden />
         <span class="ayuda"></span><span class="fijado" hidden></span>
+        <span id="aviso-servicio" class="fijado" hidden></span>
         <span id="printer-resuelto" class="detalle"></span>
       </label>
 
@@ -387,6 +389,7 @@
     sincronizaCombo('sel-printer-service', 'txt-printer-service', 'printer_service');
     sincronizaCombo('sel-printer-task', 'txt-printer-task', 'printer_rescue_task');
     sincronizaCombo('sel-emv-task', 'txt-emv-task', 'emv_task');
+    avisoServicio();
   }
 
   document.addEventListener('change', (ev) => {
@@ -395,6 +398,7 @@
     const clave = el.dataset.clave;
     if (env[clave]) return;
     borrador[clave] = leeControl(clave);
+    if (clave === 'printer_service') avisoServicio();
   });
   document.addEventListener('input', (ev) => {
     const el = ev.target;
@@ -402,6 +406,7 @@
     const clave = el.dataset.clave;
     if (env[clave]) return;
     borrador[clave] = leeControl(clave);
+    if (clave === 'printer_service') avisoServicio();
   });
 
   // ── Listas descubiertas ───────────────────────────────────────────────────
@@ -419,7 +424,12 @@
       g.label = grupo;
       lista.forEach((x) => {
         const etiqueta = x.display ? (x.name + ' — ' + x.display) : x.name;
-        g.appendChild(new Option(etiqueta, x.name));
+        // Los servicios del sistema se enseñan y se bloquean. Esconderlos haría que
+        // quien busca «Cola de impresión» pensara que la lista está incompleta y lo
+        // escribiera a mano, que es exactamente lo que hay que evitar.
+        const op = new Option(x.protegido ? (etiqueta + '  ·  del sistema, no se puede usar') : etiqueta, x.name);
+        if (x.protegido) op.disabled = true;
+        g.appendChild(op);
       });
       sel.appendChild(g);
     };
@@ -468,6 +478,7 @@
         $(idTxt).value = sel.value;
         $(idTxt).hidden = true;
       }
+      avisoServicio();
     });
   }
   enlazaCombo('sel-printer-service', 'txt-printer-service', 'printer_service');
@@ -495,6 +506,21 @@
     }).join('') || '';
 
     pintarCampos();
+  }
+
+  /**
+   * El servicio de impresión de Nestor se llama "Nestor…". Cualquier otra cosa se
+   * avisa aquí y además el daemon se niega a reiniciarla: es la lección del Spooler,
+   * que se llama «Cola de impresión» y parecía el correcto.
+   */
+  function avisoServicio() {
+    const el = $('aviso-servicio');
+    if (!el) return;
+    const v = String(borrador.printer_service || '').trim();
+    if (!v || /^nestor/i.test(v)) { el.hidden = true; return; }
+    el.hidden = false;
+    el.textContent = 'Ojo: "' + v + '" no parece el servicio de Nestor (los suyos empiezan por «Nestor»). '
+      + 'Si no lo es, el cliente se negará a reiniciarlo — no va a parar un servicio ajeno.';
   }
 
   function escapa(s) {
@@ -662,10 +688,17 @@
       // Un valor que el daemon descarta por inválido (un campo que quedó vacío, por
       // ejemplo) desaparecería sin más: el resumen se vaciaría y parecería guardado.
       const ignoradasClaves = (r.ignoradas || []).map((i) => i.clave);
-      const descartadas = pedidas.filter((k) => aplicadas.indexOf(k) < 0 && ignoradasClaves.indexOf(k) < 0);
+      // Las rechazadas ya se explican con su motivo abajo: contarlas también aquí sería
+      // decir dos veces lo mismo con dos redacciones distintas.
+      const rechazadasClaves = (r.rechazadas || []).map((i) => i.clave);
+      const descartadas = pedidas.filter((k) => aplicadas.indexOf(k) < 0
+        && ignoradasClaves.indexOf(k) < 0 && rechazadasClaves.indexOf(k) < 0);
       if (descartadas.length) {
         txt += '\nSe descartaron por no ser un valor válido: '
           + descartadas.map((k) => esquema[k].label).join(', ') + '. Quedaron como estaban.';
+      }
+      if (r.rechazadas && r.rechazadas.length) {
+        txt += '\nNO se guardó: ' + r.rechazadas.map((x) => x.motivo).join(' ');
       }
       el.textContent = txt;
       pintarResumen();
@@ -692,6 +725,16 @@
 
   // ── Arranque ──────────────────────────────────────────────────────────────
   function adopta(c) {
+    const vetados = c.vetados || (c.config && c.config.vetados) || [];
+    const av = $('aviso-vetados');
+    if (av) {
+      av.hidden = !vetados.length;
+      if (vetados.length) {
+        av.textContent = 'Esta caja tenía guardado algo que el cliente ya no aplica: '
+          + vetados.map((v) => v.motivo).join(' ') + ' Se está usando el valor de siempre.';
+      }
+    }
+
     esquema = c.esquema || {};
     valores = Object.assign({}, c.valores);
     borrador = Object.assign({}, c.valores);

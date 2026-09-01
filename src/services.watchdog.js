@@ -367,9 +367,15 @@ function resolvePrinterService() {
     if (printerServiceCache !== null) return printerServiceCache;
 
     // Configurado a mano (asistente o variable de entorno): manda y no se descubre.
+    // Salvo que sea un servicio del sistema: ahí se ignora y se sigue descubriendo,
+    // porque el daño de obedecer es dejar la máquina sin imprimir nada.
     if (cfg.valores.printer_service) {
-        printerServiceCache = cfg.valores.printer_service;
-        return printerServiceCache;
+        const veto = configStore.motivoProhibido('printer_service', cfg.valores.printer_service);
+        if (!veto) {
+            printerServiceCache = cfg.valores.printer_service;
+            return printerServiceCache;
+        }
+        log(`[printer] se ignora el servicio configurado: ${veto}`);
     }
 
     const candidatos = PRINTER_INSTANCE_FILE
@@ -435,6 +441,54 @@ async function serviceState(nombre) {
         }
     }
     return { state: 'desconocido', raw: salida };
+}
+
+/**
+ * Ejecutable detrás de un servicio, según el SCM.
+ *
+ * Es lo que permite contestar la única pregunta que importa antes de un `sc stop`:
+ * ¿este servicio es NUESTRO? Windows en español imprime NOMBRE_RUTA_BINARIO; el nombre
+ * del campo se traduce, así que se aceptan los dos y, si no aparece ninguno, se cae a
+ * la primera línea que tenga un .exe.
+ */
+async function serviceBinary(nombre) {
+    if (!IS_WIN) return '';
+    const r = await run(sysExe('sc.exe'), ['qc', nombre], 8000);
+    const salida = `${r.stdout}\n${r.stderr}`;
+    const m = /(?:BINARY_PATH_NAME|NOMBRE_RUTA_BINARIO)\s*:\s*(.+)/i.exec(salida);
+    if (m) return m[1].trim();
+    const alt = /^.*\.exe.*$/im.exec(salida);
+    return alt ? alt[0].trim() : '';
+}
+
+/**
+ * ¿Se puede reiniciar este servicio? '' si sí; si no, por qué no.
+ *
+ * El daemon existe para reiniciar EL PRINTER DE NESTOR. Si la configuración apunta a
+ * otra cosa, la respuesta correcta es decirlo, no ejecutarlo: `sc stop` sobre un
+ * servicio ajeno hace un daño que el daemon no puede deshacer y que además no se
+ * parece en nada al síntoma que lo provocó.
+ *
+ * Caso real: con el Spooler configurado por error, cada fallo de nestor_printer
+ * terminaba en `sc stop Spooler` — y la máquina dejaba de imprimir por completo.
+ */
+async function puedeReiniciarServicio(nombre) {
+    const veto = configStore.motivoProhibido('printer_service', nombre);
+    if (veto) return veto;
+
+    if (/^nestor/i.test(String(nombre || '').trim())) return '';
+
+    // El nombre no lo delata: se mira de quién es el ejecutable. El instalador lo deja
+    // bajo C:\NestorMX (con NSSM), así que la ruta lleva "nestor" aunque el servicio se
+    // llame de otra forma en una instancia adicional.
+    const binario = await serviceBinary(nombre);
+    if (!binario) {
+        return `no se pudo comprobar de quién es el servicio "${nombre}" (sc qc no contestó); no se toca`;
+    }
+    if (/nestor/i.test(binario)) return '';
+
+    return `el servicio "${nombre}" no es de Nestor (${binario.slice(0, 120)}): reiniciarlo no arreglaría la impresión `
+        + 'y sí puede romper otra cosa. Corrige el servicio en Configuración → Servicios de la caja.';
 }
 
 /** ¿Está vivo el proceso del EMV? El servicio no es un servicio de Windows: es un exe. */
@@ -552,6 +606,13 @@ function textoEstadoEmv(body) {
 async function rescuePrinter(st) {
     const svc = resolvePrinterService();
     const sc = sysExe('sc.exe');
+
+    // Antes que nada: ¿es nuestro? Un `sc stop` sobre un servicio ajeno no se puede
+    // deshacer, y el rescate se repetiría cada hora sin arreglar jamás el síntoma.
+    const veto = await puedeReiniciarServicio(svc);
+    if (veto) {
+        return { ok: false, step: 'comprobación de identidad', fatal: true, error: veto };
+    }
 
     const estado = await serviceState(svc);
     log(`[printer] SCM dice "${estado.state}" para el servicio ${svc}`);
@@ -711,6 +772,9 @@ function status() {
         // alguien lo configuró" en vez de dejarlo como un misterio.
         configurado: Object.values(cfg.fuentes).some((f) => f !== 'fábrica'),
         configFile: cfg.archivo,
+        // Ajustes guardados que NO se están aplicando (un servicio del sistema que
+        // quedó en el archivo de una versión anterior). Se enseña donde se vea.
+        vetados: cfg.vetados || [],
         services: Object.values(servicios).map(payloadDe)
     };
 }
@@ -1158,6 +1222,20 @@ function readInstanceFiles() {
 }
 
 /**
+ * ¿Este servicio de Windows parece uno nuestro? Decide qué se destaca en el asistente.
+ *
+ * Por el NOMBRE, nunca por el nombre visible. Aquí había un
+ * `/nestor|printer|impres|emv|santander/i` aplicado a "nombre + nombre visible", y el
+ * Spooler de Windows se llama «Cola de impresión»: encajaba con "impres" y subía al
+ * grupo de arriba del desplegable, junto a los nuestros. Elegirlo era lo natural —dice
+ * impresión— y a partir de ahí el rescate le hacía `sc stop` cada vez que
+ * nestor_printer no contestaba. Destacar de más aquí no es una molestia: es una trampa.
+ */
+function pareceServicioNuestro(name, display) {
+    return /^nestor/i.test(String(name || '').trim()) || /nestor/i.test(String(display || ''));
+}
+
+/**
  * Todo lo que el asistente necesita para ofrecer listas en vez de campos vacíos.
  *
  * Se marca lo que "parece" nuestro (nestor / printer / emv / santander) para poder
@@ -1166,15 +1244,22 @@ function readInstanceFiles() {
  */
 async function discover() {
     const [servs, tareas] = await Promise.all([listWindowsServices(), listScheduledTasks()]);
-    const pinta = /nestor|printer|impres|emv|santander/i;
+
+    const protegido = (n) => configStore.SERVICIOS_PROTEGIDOS.includes(String(n).toLowerCase());
 
     return {
         ok: true,
         esWindows: IS_WIN,
         // En macOS/Linux esto viene vacío y el asistente lo dice, en vez de enseñar
         // listas vacías que parecen un error.
-        servicios: servs.map((x) => ({ ...x, sugerido: pinta.test(`${x.name} ${x.display}`) })),
-        tareas: tareas.map((name) => ({ name, sugerido: pinta.test(name) })),
+        servicios: servs.map((x) => ({
+            ...x,
+            sugerido: pareceServicioNuestro(x.name, x.display),
+            // El asistente los enseña, pero no deja elegirlos: verlos y entender por qué
+            // no valen es mejor que no encontrarlos y pensar que la lista está mal.
+            protegido: protegido(x.name)
+        })),
+        tareas: tareas.map((name) => ({ name, sugerido: /nestor|santander/i.test(name) })),
         instancias: readInstanceFiles(),
         servicioResuelto: IS_WIN ? resolvePrinterService() : ''
     };
@@ -1436,6 +1521,9 @@ function init(userDataDir, options) {
     aplicaConfigValores();
     aplicaVigilancia();
     if (cfg.error) log(`la configuración no se pudo leer (${cfg.error}); se corre con los valores de fábrica`);
+    for (const v of cfg.vetados || []) {
+        log(`AVISO: se ignora ${v.clave}="${v.valor}" guardado en esta caja — ${v.motivo}`);
+    }
 
     if (!ENABLED) {
         log(`daemon apagado por configuración (${cfg.fuentes.enabled})`);
@@ -1476,6 +1564,10 @@ module.exports = {
     resetConfig,
     discover,
     probeTarget,
+    // Expuestas para scripts/check-services-watchdog.js: son las dos decisiones que
+    // impidieron el incidente del Spooler, y las dos son puras.
+    pareceServicioNuestro,
+    puedeReiniciarServicio,
     ensure,
     release,
     repair,

@@ -120,6 +120,43 @@ try {
     try { fsp.rmSync(tmp, { recursive: true, force: true }); } catch { }
 }
 
+// ── Nunca tocar un servicio que no es nuestro ───────────────────────────────────
+//
+// Incidente real: el Spooler de Windows se llama «Cola de impresión», y el filtro que
+// destacaba "lo que parece nuestro" miraba también el nombre visible. El Spooler subía
+// al grupo de arriba del desplegable, alguien lo elegía —dice impresión— y a partir de
+// ahí, cada vez que nestor_printer no contestaba en :8331, el rescate le hacía
+// `sc stop` + `sc start`. Hasta cinco veces por hora, y cuando el arranque no prendía
+// la máquina se quedaba sin imprimir NADA.
+//
+// Tres barreras, y las tres se comprueban aquí: no se destaca, no se guarda, no se
+// reinicia.
+const SUGERENCIAS = [
+    ['Spooler', 'Cola de impresión', false, 'el Spooler de Windows (el caso del incidente)'],
+    ['PrintNotify', 'Extensiones y notificaciones de impresora', false, 'notificaciones de impresora de Windows'],
+    ['PrintWorkflowUserSvc', 'Flujo de trabajo de impresión', false, 'flujo de impresión de Windows'],
+    ['NestorPrinter', 'Nestor Printer', true, 'el nuestro'],
+    ['NestorPrinter_2', '', true, 'el nuestro en una instancia adicional'],
+    ['nestorprinter', '', true, 'el nuestro en minúsculas']
+];
+for (const [name, display, esperado, que] of SUGERENCIAS) {
+    if (svc.pareceServicioNuestro(name, display) !== esperado) {
+        fallas.push(esperado
+            ? `"${name}" (${que}) NO se destaca en el asistente y debería`
+            : `"${name}" (${que}) se destaca como si fuera nuestro: es como se acaba reiniciando un servicio del sistema`);
+    }
+}
+
+const cfgStore = require('../src/services.config');
+for (const nombre of ['Spooler', 'spooler', 'SPOOLER']) {
+    if (!cfgStore.motivoProhibido('printer_service', nombre)) {
+        fallas.push(`"${nombre}" se puede guardar como servicio de impresión: el rescate lo pararía`);
+    }
+}
+if (cfgStore.motivoProhibido('printer_service', 'NestorPrinter')) {
+    fallas.push('el servicio de Nestor está siendo rechazado por la lista de protegidos');
+}
+
 svc.shutdown();
 
 if (fallas.length) {

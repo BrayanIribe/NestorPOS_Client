@@ -34,6 +34,51 @@ const path = require('path');
 const NOMBRE_ARCHIVO = 'config.json';
 
 /**
+ * Servicios de Windows que este daemon NO puede tocar jamás.
+ *
+ * Nació de un incidente real: el Spooler de Windows se llama «Cola de impresión», así
+ * que el filtro que destaca "lo que parece nuestro" lo subía al grupo de arriba del
+ * desplegable, junto a los nuestros. Elegirlo era lo natural — dice impresión— y a
+ * partir de ahí, cada vez que nestor_printer no contestaba en :8331, el rescate veía el
+ * Spooler en RUNNING y le hacía `sc stop` + `sc start`. Hasta cinco veces por hora, y
+ * cuando el arranque no prendía, la máquina entera se quedaba sin imprimir NADA.
+ *
+ * La lista vive aquí y no en la interfaz porque lo que hace daño es el `sc stop`, no el
+ * desplegable: un config.json editado a mano tiene que chocar contra el mismo muro.
+ * Se compara en minúsculas y por nombre exacto de servicio.
+ */
+const SERVICIOS_PROTEGIDOS = [
+    'spooler',          // Cola de impresión. El caso que provocó esta lista.
+    'winmgmt',          // WMI
+    'rpcss',            // RPC
+    'dcomlaunch',
+    'lanmanserver', 'lanmanworkstation',
+    'dhcp', 'dnscache',
+    'eventlog',
+    'schedule',         // Programador de tareas: el propio rescate lo necesita
+    'plugplay',
+    'power',
+    'profsvc',
+    'termservice',      // Escritorio remoto: sin él nadie entra a arreglar la caja
+    'audiosrv',
+    'wuauserv',
+    'mssqlserver',      // Bases de datos de terceros que conviven en las cajas
+    'mysql', 'mysql80'
+];
+
+/** '' si se puede usar; si no, la razón por la que no. */
+function motivoProhibido(clave, valor) {
+    if (clave !== 'printer_service') return '';
+    const nombre = String(valor || '').trim().toLowerCase();
+    if (!nombre) return '';
+    if (SERVICIOS_PROTEGIDOS.includes(nombre)) {
+        return `"${valor}" es un servicio del sistema: pararlo y arrancarlo dejaría la máquina peor de lo que está. `
+            + 'El servicio de impresión de Nestor lo instala el componente de impresión y su nombre empieza por "Nestor".';
+    }
+    return '';
+}
+
+/**
  * El esquema es la única fuente de verdad: de aquí salen los valores de fábrica, el
  * saneado, la precedencia del entorno y la comprobación de que el asistente no se dejó
  * ningún campo fuera. Agregar un ajuste es agregar un renglón AQUÍ y su control en
@@ -239,17 +284,24 @@ function resolve(dir) {
     const fuentes = {};
     for (const k of CLAVES) fuentes[k] = 'fábrica';
 
+    const vetados = [];
     const archivo = leeArchivo(dir);
     for (const [k, v] of Object.entries(archivo.valores)) {
         if (!ESQUEMA[k]) continue;
         const limpio = sanea(k, v);
         if (limpio === null) continue;
+        // El archivo pudo escribirse con una versión anterior —la que dejaba elegir el
+        // Spooler— o a mano. Se ignora el valor y se sigue con el de fábrica.
+        const veto = motivoProhibido(k, limpio);
+        if (veto) { vetados.push({ clave: k, valor: limpio, motivo: veto }); continue; }
         valores[k] = limpio;
         fuentes[k] = 'archivo';
     }
 
     const env = envOverrides();
     for (const [k, o] of Object.entries(env)) {
+        const veto = motivoProhibido(k, o.valor);
+        if (veto) { vetados.push({ clave: k, valor: o.valor, motivo: veto }); continue; }
         valores[k] = o.valor;
         fuentes[k] = 'entorno';
     }
@@ -260,6 +312,10 @@ function resolve(dir) {
         env,
         archivo: rutaArchivo(dir),
         existe: !!archivo.valores && Object.keys(archivo.valores).length > 0,
+        // Valores que estaban guardados y NO se están aplicando. El daemon los registra
+        // en la bitácora y el asistente los enseña: un ajuste que se ignora en silencio
+        // es cómo se pierde media mañana.
+        vetados,
         error: archivo.error
     };
 }
@@ -286,12 +342,19 @@ function save(dir, parcial) {
     }
 
     const ignoradas = [];
+    const rechazadas = [];
     const aplicadas = [];
     for (const [k, v] of Object.entries(parcial || {})) {
         if (!ESQUEMA[k]) continue;
         if (env[k]) { ignoradas.push({ clave: k, variable: env[k].variable }); continue; }
         const limpio = sanea(k, v);
         if (limpio === null) continue;
+
+        // Guardar esto sería armar la trampa para dentro de una semana, cuando el
+        // printer falle por primera vez y el rescate tumbe un servicio del sistema.
+        const veto = motivoProhibido(k, limpio);
+        if (veto) { rechazadas.push({ clave: k, valor: limpio, motivo: veto }); continue; }
+
         guardado[k] = limpio;
         aplicadas.push(k);
     }
@@ -307,7 +370,7 @@ function save(dir, parcial) {
         return { ok: false, error: e && e.message ? e.message : String(e) };
     }
 
-    return { ok: true, aplicadas, ignoradas, config: resolve(dir) };
+    return { ok: true, aplicadas, ignoradas, rechazadas, config: resolve(dir) };
 }
 
 /** Borra el archivo: la caja vuelve a fábrica (más lo que fije el entorno). */
@@ -322,4 +385,7 @@ function reset(dir) {
     return { ok: true, config: resolve(dir) };
 }
 
-module.exports = { ESQUEMA, CLAVES, defaults, sanea, envOverrides, resolve, save, reset, leeArchivo, rutaArchivo };
+module.exports = {
+    ESQUEMA, CLAVES, SERVICIOS_PROTEGIDOS, defaults, sanea, motivoProhibido,
+    envOverrides, resolve, save, reset, leeArchivo, rutaArchivo
+};
