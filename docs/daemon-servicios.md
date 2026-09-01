@@ -20,10 +20,35 @@ cuando cambia.
 
 ## Qué hace, exactamente
 
-Cada 15 segundos sondea los dos puertos. Tras **3 fallos seguidos** ejecuta la escalera
+Cada 3 segundos sondea los dos puertos. Tras **3 fallos seguidos** ejecuta la escalera
 de rescate del servicio, con espera creciente entre intentos (10 s, 30 s, 2 min, 5 min)
 y un tope de **5 rescates por hora**; pasado el tope se declara `rendido` y sube una
 incidencia.
+
+Son dos consultas HTTP a localhost que no tocan la impresora ni la terminal —el
+indicador del POS ya pregunta al EMV a este mismo ritmo—, así que una caída silenciosa
+se confirma en unos **6 segundos**. Cuando es la ventana la que se estrella contra el
+servicio, antes: ver *La ventana también avisa*.
+
+### La ventana también avisa
+
+El daemon no es el único que sabe si el servicio contesta: la ventana se estrella contra
+él en cuanto el cajero pulsa «imprimir». `onErrorOccurred` recoge ese fallo, y si es de
+**conexión** (`ERR_CONNECTION_REFUSED` y compañía, nunca un `ERR_ABORTED`, que es la
+ventana cancelando) cuenta como confirmación: se da la caída por buena sin esperar los
+sondeos que falten, y se comprueba en el acto en vez de esperar a la siguiente ronda.
+
+Medido contra un servicio de mentira que se tira a propósito:
+
+| Situación | Se detecta en |
+|---|---|
+| Se cae y nadie lo está usando | ~6 s (3 sondeos) |
+| El cajero pulsa imprimir y falla | ~0,1 s |
+| El cajero reintenta cada 2 s | ~2 s (antes: **nunca**) |
+
+Después viene el rescate en sí, y ahí manda lo que tarde el servicio en arrancar:
+`settle_printer_ms` (20 s) y `settle_emv_ms` (60 s) son el tope de espera, pero en
+cuanto contesta se sale — se comprueba cada segundo.
 
 ### Estados
 
@@ -57,16 +82,28 @@ dispara rescate.
 
 **3. Nunca se rescata con trabajo en vuelo.** Lanzar el EMV mata la instancia previa
 (`Program.cs` → `KillPreviousInstances`), así que un rescate a media lectura de tarjeta
-**mata el cobro**. Dos compuertas:
+**mata el cobro**. Tres compuertas, y la primera es la que de verdad protege:
 
-- **Automática**: el proceso principal observa las peticiones de la ventana hacia :8331
-  y :5000 (`webRequest`). Si hubo tráfico hace menos de 90 s, la ronda se salta.
-  Los **latidos no cuentan** — el indicador de la barra sondea `/api/health` cada 3 s, y
-  si eso contara como uso la compuerta jamás se abriría y el rescate quedaría muerto sin
-  un solo error en la bitácora. Lo cubre `scripts/check-services-watchdog.js`.
-- **Explícita**: el POS toma un `holdScope` alrededor del cobro con tarjeta, que una
-  venta EMV bloquea hasta 75 s en silencio y ese silencio es indistinguible de un
-  servicio muerto.
+- **Petición en curso**: mientras una petición de la ventana hacia el servicio no haya
+  terminado, no se toca — dure lo que dure, y una venta EMV bloquea hasta 75 s. Se lleva
+  por id de petición y no como un contador, porque un contador que no vuelve a cero (la
+  ventana se recarga a media impresión) blindaría el servicio para siempre.
+- **Silencio tras un uso que salió BIEN**: 20 s. Cubre el hueco entre dos operaciones
+  seguidas, no la operación en sí.
+- **Explícita**: el POS toma un `holdScope` alrededor del cobro con tarjeta.
+
+Los **latidos no cuentan** ni como uso ni como trabajo en vuelo — el indicador de la
+barra sondea `/api/health` cada 3 s, y si eso contara la compuerta jamás se abriría y el
+rescate quedaría muerto sin un solo error en la bitácora. Lo cubre
+`scripts/check-services-watchdog.js`.
+
+**Lo que terminó BIEN, no lo que salió.** Aquí hubo un fallo que hacía que el rescate
+llegara tardísimo o nunca: el uso se anotaba en `onBeforeRequest`, o sea al SALIR la
+petición, sin mirar cómo terminaba. Con el servicio caído, cada intento de imprimir del
+cajero contaba como "se está usando" y empujaba la espera otros 90 s — de modo que
+**cuanto más intentaba imprimir, más se retrasaba el arreglo**, y con reintentos
+seguidos no llegaba nunca. Una petición que se estrella contra un puerto cerrado no es
+uso: es la prueba de la caída.
 
 **4. Se rinde.** Con backoff, tope por hora y un estado final que sube incidencia. Sin
 eso, una caja con la DLL en cuarentena se convierte en un bucle de reinicios que además
@@ -184,10 +221,10 @@ el cliente ni la caja.
 | `emv_task` | `NestorSantanderEMV` | `NESTOR_EMV_TASK` | Única vía de rescate del EMV |
 | `emv_exe` | `NestorSantanderEmvService.exe` | `NESTOR_EMV_EXE` | Para ver si vive y terminarlo |
 | `emv_port` | `5000` | `NESTOR_EMV_PORT` | Puerto del EMV |
-| `watch_ms` | `15000` | `NESTOR_SERVICES_WATCH_MS` | Cada cuánto se sondea (mínimo 5 s) |
-| `probe_ms` | `2500` | `NESTOR_SERVICES_PROBE_MS` | Paciencia de cada sondeo |
+| `watch_ms` | `3000` | `NESTOR_SERVICES_WATCH_MS` | Cada cuánto se sondea (mínimo 1 s) |
+| `probe_ms` | `2000` | `NESTOR_SERVICES_PROBE_MS` | Paciencia de cada sondeo |
 | `strikes` | `3` | `NESTOR_SERVICES_STRIKES` | Fallos seguidos antes de actuar |
-| `quiet_ms` | `90000` | `NESTOR_SERVICES_QUIET_MS` | Silencio exigido antes de rescatar |
+| `quiet_ms` | `20000` | `NESTOR_SERVICES_QUIET_MS` | Silencio tras un uso que salió bien |
 | `max_per_hour` | `5` | `NESTOR_SERVICES_MAX_HOUR` | Rescates por hora antes de rendirse |
 | `settle_printer_ms` | `20000` | `NESTOR_SERVICES_SETTLE_PRINTER_MS` | Espera a que el printer conteste |
 | `settle_emv_ms` | `60000` | `NESTOR_SERVICES_SETTLE_EMV_MS` | Espera a que el EMV conteste |

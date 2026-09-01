@@ -84,8 +84,9 @@ let PROBE_TIMEOUT_MS = cfg.valores.probe_ms;
 // renderiza PDFs en el mismo hilo y el EMV bloquea hasta 60 s esperando la tarjeta.
 let STRIKES = cfg.valores.strikes;
 
-// Silencio exigido antes de rescatar: si hubo tráfico hacia ese puerto hace menos que
-// esto, se salta la ronda. 90 s cubre una venta con tarjeta completa.
+// Silencio exigido tras un uso que TERMINÓ BIEN. La operación en curso ya protege sola
+// mientras dura (ver `enVuelo`), así que esto sólo cubre el hueco entre dos operaciones
+// seguidas — no hace falta que dure lo que la más larga.
 let QUIET_MS = cfg.valores.quiet_ms;
 
 // Espera entre intentos del MISMO episodio. Después del último valor se repite.
@@ -112,6 +113,15 @@ let EMV_TASK = cfg.valores.emv_task;
 let EMV_EXE_NAME = cfg.valores.emv_exe;
 
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
+
+// Cuánto puede durar una petición antes de dejar de contarla como "en curso". Cubre de
+// sobra la más larga que existe —una venta EMV bloquea hasta 75 s esperando la
+// tarjeta— y evita que una petición que nunca notifique su final blinde el servicio.
+const EN_VUELO_MAX_MS = 150000;
+
+// Cuánto vale una petición fallida vista por la ventana como prueba de que el servicio
+// está caído. Pasado esto vuelve a mandar sólo lo que digan las sondas.
+const EVIDENCIA_MS = 15000;
 
 let dir = '';
 let initError = '';
@@ -159,7 +169,17 @@ function nuevoEstado(id, label) {
         rescuesTotal: 0,
         // Compuertas
         holdUntil: 0,
+        // Última petición que TERMINÓ BIEN. No "la última que salió": ver noteTraffic.
         lastTrafficAt: 0,
+        // Peticiones en curso ahora mismo (id → cuándo empezó). Mientras haya una, el
+        // servicio se está usando de verdad y no se toca.
+        enVuelo: new Map(),
+        // Última vez que la VENTANA se estrelló contra este servicio (conexión
+        // rechazada). Es evidencia de primera mano de que está caído: la sonda del
+        // daemon pregunta cada pocos segundos, pero el cajero que pulsa "imprimir" lo
+        // descubre en el acto.
+        lastFailAt: 0,
+        lastFailError: '',
         // Se reportó ya la rendición de este episodio (una sola incidencia por caída,
         // no una por ronda).
         reported: false
@@ -512,7 +532,7 @@ async function taskExists(nombre) {
  *
  * Se pregunta a /api/v1/health, que NO toca la DLL. Antes la única "cara" del
  * servicio era GET /api/v1, que calcula el HWID en cada llamada entrando al hardware:
- * como latido cada 15 s eso es martillar la máquina, y puede colgarse justo por lo
+ * como latido cada 3 s eso es martillar la máquina, y puede colgarse justo por lo
  * mismo que se intenta detectar. Con un printer viejo (sin /health) esa ruta contesta
  * 404 y el sondeo se conforma con que el puerto conteste — que es la pregunta que de
  * verdad importa para decidir el rescate.
@@ -750,7 +770,13 @@ function payloadDe(st) {
         // indistinguible de "el daemon está roto", y la respuesta suele ser la primera:
         // no se toca un servicio que se está usando.
         lastTrafficAt: st.lastTrafficAt,
-        holdUntil: st.holdUntil
+        enVuelo: st.enVuelo.size,
+        lastFailAt: st.lastFailAt,
+        holdUntil: st.holdUntil,
+        // Por qué no se tocaría este servicio AHORA MISMO, en una frase. Casi siempre
+        // la respuesta es "porque se está usando", y tenerla escrita convierte media
+        // hora de investigación en un renglón.
+        esperaPor: motivoParaEsperar(st, Date.now())
     };
 }
 
@@ -784,8 +810,9 @@ function broadcast() {
     try { onChange(status()); } catch { }
 }
 
-// Firma de lo que se ve desde afuera. Difundir en cada ronda sería un evento cada 15 s
-// por caja; sólo interesa el cambio (mismo criterio que setLocalServerState en main.js).
+// Firma de lo que se ve desde afuera. Difundir en cada ronda sería un evento cada 3 s
+// por caja —20 por minuto, y ninguno diría nada nuevo—; sólo interesa el cambio (mismo
+// criterio que setLocalServerState en main.js).
 function firma() {
     return Object.values(servicios)
         .map((s) => `${s.id}:${s.supervised ? 1 : 0}:${s.state}:${s.warn ? 1 : 0}`)
@@ -808,13 +835,47 @@ function motivoParaEsperar(st, ahora) {
     if (st.holdUntil > ahora) {
         return `el POS pidió esperar (${Math.round((st.holdUntil - ahora) / 1000)} s)`;
     }
-    if (QUIET_MS && st.lastTrafficAt && (ahora - st.lastTrafficAt) < QUIET_MS) {
-        return `hubo tráfico hacia el servicio hace ${Math.round((ahora - st.lastTrafficAt) / 1000)} s`;
+
+    // Trabajo AHORA MISMO. Esta es la compuerta que de verdad protege una impresión o
+    // un cobro a medias: mientras la petición no haya terminado, el servicio se está
+    // usando, dure lo que dure (una venta EMV bloquea hasta 75 s esperando la tarjeta).
+    const vuelo = purgarEnVuelo(st, ahora);
+    if (vuelo > 0) {
+        return `hay ${vuelo} petición(es) en curso hacia el servicio`;
     }
+
+    // Silencio tras un uso que SALIÓ BIEN.
+    //
+    // Aquí estaba el fallo que hacía que el rescate llegara tardísimo, o nunca: se
+    // anotaba el tráfico al SALIR la petición, sin mirar cómo terminaba. Con el
+    // servicio caído, cada intento de imprimir del cajero contaba como "se está
+    // usando" y empujaba la espera otros 90 s — de modo que cuanto más intentaba
+    // imprimir, más se retrasaba el arreglo. Una petición que se estrella contra un
+    // puerto cerrado no es uso: es la prueba de la caída.
+    if (QUIET_MS && st.lastTrafficAt && (ahora - st.lastTrafficAt) < QUIET_MS) {
+        return `se usó con éxito hace ${Math.round((ahora - st.lastTrafficAt) / 1000)} s`;
+    }
+
     if (st.nextAttemptAt > ahora) {
         return `espera entre intentos (${Math.round((st.nextAttemptAt - ahora) / 1000)} s)`;
     }
     return '';
+}
+
+/**
+ * Peticiones realmente en curso, descartando las que se quedaron colgadas.
+ *
+ * El contador se lleva por id de petición y no como un número suelto: si una petición
+ * no llegara a notificar su final (la ventana se recarga a media impresión), un
+ * contador nunca volvería a cero y el servicio quedaría blindado PARA SIEMPRE — vigilado
+ * y nunca rescatado, que es el peor de los mundos porque se ve como si funcionara.
+ */
+function purgarEnVuelo(st, ahora) {
+    const limite = (ahora || Date.now()) - EN_VUELO_MAX_MS;
+    for (const [id, ts] of st.enVuelo) {
+        if (ts < limite) st.enVuelo.delete(id);
+    }
+    return st.enVuelo.size;
 }
 
 /**
@@ -894,6 +955,8 @@ async function ronda(st) {
         st.attempts = 0;
         st.nextAttemptAt = 0;
         st.reported = false;
+        st.lastFailAt = 0;
+        st.lastFailError = '';
         return;
     }
 
@@ -903,6 +966,15 @@ async function ronda(st) {
     // ("sin respuesta 7/3" no significa nada). Lo que cuenta a partir de ahí son los
     // intentos de rescate.
     st.strikes = Math.min(st.strikes + 1, STRIKES);
+
+    // Dos fuentes independientes diciendo lo mismo valen más que tres sondeos seguidos
+    // de una sola. Si la VENTANA acaba de estrellarse contra el puerto —el cajero pulsó
+    // imprimir y no pasó nada— la caída ya está confirmada: esperar los fallos que
+    // faltan sólo alarga el rato que la caja pasa sin imprimir.
+    if (st.strikes < STRIKES && st.lastFailAt && (ahora - st.lastFailAt) < EVIDENCIA_MS) {
+        log(`[${st.id}] la ventana también falló contra el servicio (${st.lastFailError}); no se esperan más sondeos`);
+        st.strikes = STRIKES;
+    }
 
     if (st.strikes < STRIKES) {
         st.state = 'sospechoso';
@@ -981,7 +1053,9 @@ async function ronda(st) {
     // que está arrancando — y en el EMV eso mata el proceso que acaba de nacer.
     const limite = Date.now() + SETTLE_MS[st.id];
     while (Date.now() < limite) {
-        await sleep(2000);
+        // Cada segundo, no cada dos: esto corre mientras la caja está sin imprimir, y
+        // es tiempo que el cajero pasa mirando la pantalla.
+        await sleep(1000);
         let s;
         try { s = await SONDAS[st.id](); } catch { s = { alive: false }; }
         if (s.alive) {
@@ -1473,7 +1547,7 @@ function esLatido(pathname) {
  * calladas mucho rato —una venta EMV bloquea hasta 75 s— el POS toma además un `hold`
  * explícito.
  */
-function noteTraffic(url) {
+function servicioDeUrl(url) {
     const u = String(url || '');
 
     let pathname = u;
@@ -1484,7 +1558,7 @@ function noteTraffic(url) {
         puerto = parsed.port;
     } catch { /* una URL rara cae al camino de abajo con el texto entero */ }
 
-    if (esLatido(pathname)) return;
+    if (esLatido(pathname)) return null;
 
     // Por el puerto CONFIGURADO, no por uno quemado: si esta caja corre su printer en
     // otro puerto (una instancia adicional), buscar ":8331" no encontraría nunca su
@@ -1494,13 +1568,59 @@ function noteTraffic(url) {
     // Y por el puerto de la URL parseada, no por `includes`: ":5000" aparece también
     // en el cuerpo de un query string, y eso contaría como uso de la terminal.
     if (puerto) {
-        if (Number(puerto) === Number(PUERTOS.printer)) servicios.printer.lastTrafficAt = Date.now();
-        else if (Number(puerto) === Number(PUERTOS.emv)) servicios.emv.lastTrafficAt = Date.now();
+        if (Number(puerto) === Number(PUERTOS.printer)) return servicios.printer;
+        if (Number(puerto) === Number(PUERTOS.emv)) return servicios.emv;
+        return null;
+    }
+
+    if (u.includes(`:${PUERTOS.printer}`)) return servicios.printer;
+    if (u.includes(`:${PUERTOS.emv}`)) return servicios.emv;
+    return null;
+}
+
+/** Empieza una petición hacia uno de los microservicios. */
+function noteTraffic(url, id) {
+    const st = servicioDeUrl(url);
+    if (!st) return;
+    st.enVuelo.set(id === undefined ? `sin-id:${Date.now()}:${Math.random()}` : id, Date.now());
+}
+
+/**
+ * Termina una petición. `ok` es lo que lo cambia todo.
+ *
+ * - Terminó bien  → ESO es uso: abre la ventana de silencio que protege al servicio.
+ * - Terminó mal   → es evidencia de que está caído, vista por quien lo estaba usando.
+ *   No protege nada; al contrario, adelanta el rescate (ver `lastFailAt` en ronda()).
+ *
+ * Antes se anotaba el uso al SALIR la petición, sin mirar el final: con el servicio
+ * caído, cada intento del cajero contaba como "se está usando" y empujaba la espera
+ * otros 90 segundos. Cuanto más intentaba imprimir, más tardaba el rescate.
+ */
+function noteTrafficDone(url, id, ok, error) {
+    const st = servicioDeUrl(url);
+    if (!st) return;
+
+    if (id !== undefined) st.enVuelo.delete(id);
+    else st.enVuelo.clear();
+
+    const ahora = Date.now();
+    if (ok) {
+        st.lastTrafficAt = ahora;
         return;
     }
 
-    if (u.includes(`:${PUERTOS.printer}`)) servicios.printer.lastTrafficAt = Date.now();
-    else if (u.includes(`:${PUERTOS.emv}`)) servicios.emv.lastTrafficAt = Date.now();
+    // Falló, pero no toda petición fallida delata al servicio: un ERR_ABORTED es la
+    // ventana cancelando (una recarga, un diálogo que se cierra). Quien llama decide, y
+    // manda `error` sólo cuando es un fallo de conexión de verdad. Sin `error` esto se
+    // queda en soltar la petición: ni protege ni acusa.
+    if (!error) return;
+
+    st.lastFailAt = ahora;
+    st.lastFailError = String(error);
+
+    // Que lo compruebe YA. El cajero acaba de pulsar imprimir y no ha pasado nada: no
+    // tiene sentido esperar a la siguiente ronda para empezar a enterarse.
+    if (ENABLED && !initError) tick('petición fallida').catch(() => { });
 }
 
 function init(userDataDir, options) {
@@ -1574,6 +1694,7 @@ module.exports = {
     hold,
     unhold,
     noteTraffic,
+    noteTrafficDone,
     // Los puertos vigentes. Los necesita main.js para filtrar las peticiones que
     // observa: si el filtro se quedara con los de fábrica, la compuerta de trabajo en
     // vuelo no vería nada en una caja con puertos propios.

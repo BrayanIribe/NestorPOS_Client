@@ -42,6 +42,19 @@ function traffic(id) {
     return s ? s.lastTrafficAt : -1;
 }
 
+function enVuelo(id) {
+    const s = svc.status().services.find((x) => x.id === id);
+    return s ? s.enVuelo : -1;
+}
+
+let seq = 0;
+/** Una petición completa de la ventana: sale y termina. */
+function peticion(url, ok, error) {
+    const rid = ++seq;
+    svc.noteTraffic(url, rid);
+    svc.noteTrafficDone(url, rid, ok, error === undefined ? (ok ? '' : 'net::ERR_CONNECTION_REFUSED') : error);
+}
+
 // Dos noteTraffic en el mismo milisegundo son indistinguibles: se separan las medidas.
 function esperarOtroMs() {
     const t = Date.now();
@@ -55,13 +68,55 @@ for (const [url, id, deberiaContar, que] of CASOS) {
         continue;
     }
     esperarOtroMs();
-    svc.noteTraffic(url);
+    peticion(url, true);
     const conto = traffic(id) !== antes;
     if (conto !== deberiaContar) {
         fallas.push(deberiaContar
             ? `${que} NO cuenta como uso (${url}); el daemon podría reiniciar el servicio a media operación`
             : `${que} SÍ cuenta como uso (${url}); la compuerta nunca se abriría y el rescate quedaría muerto`);
     }
+}
+
+// ── Una petición que FALLA no es uso ────────────────────────────────────────────
+//
+// Aquí estaba el fallo que hacía que el rescate llegara tardísimo o nunca: el uso se
+// anotaba al SALIR la petición, sin mirar cómo terminaba. Con el servicio caído, cada
+// intento del cajero contaba como "se está usando" y empujaba la espera otros 90 s —
+// de modo que cuanto más intentaba imprimir, más se retrasaba el arreglo. Justo al
+// revés de lo que hace falta.
+{
+    const antes = traffic('printer');
+    esperarOtroMs();
+    peticion('http://127.0.0.1:8331/api/v1/print', false);
+    if (traffic('printer') !== antes) {
+        fallas.push('una impresión que NO llegó al servicio cuenta como uso: cada reintento del cajero retrasaría el rescate');
+    }
+}
+
+// ── Una petición en curso sí protege, y se suelta al terminar ───────────────────
+// Es lo que impide reiniciar el servicio a media impresión o a media venta con
+// tarjeta, dure lo que dure la operación.
+{
+    const rid = ++seq;
+    svc.noteTraffic('http://127.0.0.1:5000/api/emv/venta', rid);
+    if (enVuelo('emv') < 1) {
+        fallas.push('una venta con tarjeta en curso no queda registrada como trabajo en vuelo: el daemon podría matar el cobro');
+    }
+    svc.noteTrafficDone('http://127.0.0.1:5000/api/emv/venta', rid, true);
+    if (enVuelo('emv') !== 0) {
+        fallas.push('la venta terminó y sigue contando como en vuelo: el servicio quedaría blindado y no se rescataría nunca');
+    }
+}
+
+// Un latido no es ni uso ni trabajo en vuelo. El indicador del POS pregunta cada 3 s:
+// si contara, la compuerta no se abriría jamás.
+{
+    const rid = ++seq;
+    const antes = traffic('emv');
+    svc.noteTraffic('http://127.0.0.1:5000/api/health', rid);
+    if (enVuelo('emv') !== 0) fallas.push('un latido cuenta como trabajo en vuelo: el rescate quedaría bloqueado para siempre');
+    svc.noteTrafficDone('http://127.0.0.1:5000/api/health', rid, true);
+    if (traffic('emv') !== antes) fallas.push('un latido cuenta como uso: la compuerta de silencio no se abriría nunca');
 }
 
 // El vocabulario de `state` lo pinta el frontend (services/client.services.js →
@@ -106,7 +161,7 @@ try {
         for (const [url, id, deberiaContar, que] of CASOS_PUERTO) {
             const antes = traffic(id);
             esperarOtroMs();
-            svc.noteTraffic(url);
+            peticion(url, true);
             const conto = traffic(id) !== antes;
             if (conto !== deberiaContar) {
                 fallas.push(deberiaContar

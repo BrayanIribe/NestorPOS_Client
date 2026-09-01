@@ -816,18 +816,38 @@ function broadcastServices(payload) {
 function watchServiceTraffic() {
     try {
         const p = services.puertos();
-        session.defaultSession.webRequest.onBeforeRequest(
-            {
-                urls: [
-                    `http://127.0.0.1:${p.printer}/*`, `http://localhost:${p.printer}/*`,
-                    `http://127.0.0.1:${p.emv}/*`, `http://localhost:${p.emv}/*`
-                ]
-            },
-            (details, callback) => {
-                try { services.noteTraffic(details.url); } catch { }
-                callback({});
-            }
-        );
+        const filtro = {
+            urls: [
+                `http://127.0.0.1:${p.printer}/*`, `http://localhost:${p.printer}/*`,
+                `http://127.0.0.1:${p.emv}/*`, `http://localhost:${p.emv}/*`
+            ]
+        };
+        const wr = session.defaultSession.webRequest;
+
+        // Empieza una petición: a partir de aquí el servicio está EN USO, y no se toca
+        // por larga que sea (una venta EMV bloquea hasta 75 s esperando la tarjeta).
+        wr.onBeforeRequest(filtro, (details, callback) => {
+            try { services.noteTraffic(details.url, details.id); } catch { }
+            callback({});
+        });
+
+        // Terminó bien: ESO es uso, y es lo que abre la ventana de silencio. Antes se
+        // anotaba al salir la petición, sin mirar el final — con el servicio caído,
+        // cada intento del cajero contaba como uso y empujaba el rescate 90 s más
+        // lejos.
+        wr.onCompleted(filtro, (details) => {
+            try { services.noteTrafficDone(details.url, details.id, true); } catch { }
+        });
+
+        // Terminó mal. Sólo cuentan los fallos de CONEXIÓN: un ERR_ABORTED es la
+        // ventana cancelando (una recarga, un usuario que cierra el diálogo) y no dice
+        // nada sobre la salud del servicio; tratarlo como caída provocaría rescates a
+        // partir de la operación normal.
+        const CAIDA = /ERR_(CONNECTION_REFUSED|CONNECTION_RESET|CONNECTION_CLOSED|CONNECTION_FAILED|EMPTY_RESPONSE|ADDRESS_UNREACHABLE|SOCKET_NOT_CONNECTED)/i;
+        wr.onErrorOccurred(filtro, (details) => {
+            const err = String(details.error || '');
+            try { services.noteTrafficDone(details.url, details.id, false, CAIDA.test(err) ? err : ''); } catch { }
+        });
     } catch (e) {
         console.warn('[servicios] no se pudo observar el tráfico local:', e && e.message ? e.message : e);
     }

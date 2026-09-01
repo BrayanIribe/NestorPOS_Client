@@ -154,14 +154,14 @@ const ESQUEMA = {
 
     // ── Paso 4: comportamiento ─────────────────────────────────────────────────
     watch_ms: {
-        tipo: 'int', def: 15000, min: 5000, max: 600000, paso: 4, env: 'NESTOR_SERVICES_WATCH_MS',
+        tipo: 'int', def: 3000, min: 1000, max: 600000, paso: 4, env: 'NESTOR_SERVICES_WATCH_MS',
         label: 'Cada cuánto se sondea (ms)',
-        ayuda: 'Dos consultas HTTP a localhost. Bajarlo no hace daño; subirlo retrasa la detección.'
+        ayuda: 'Dos consultas HTTP a localhost que no tocan la impresora ni la terminal; el indicador del POS ya pregunta al EMV a este mismo ritmo. Con 3 s y 3 fallos, una caída se confirma en unos 9 s.'
     },
     probe_ms: {
-        tipo: 'int', def: 2500, min: 800, max: 30000, paso: 4, env: 'NESTOR_SERVICES_PROBE_MS',
+        tipo: 'int', def: 2000, min: 800, max: 30000, paso: 4, env: 'NESTOR_SERVICES_PROBE_MS',
         label: 'Paciencia de cada sondeo (ms)',
-        ayuda: 'Cuánto se espera una respuesta antes de contar el sondeo como fallido.'
+        ayuda: 'Cuánto se espera una respuesta antes de contar el sondeo como fallido. Debe caber dentro del intervalo de sondeo.'
     },
     strikes: {
         tipo: 'int', def: 3, min: 1, max: 20, paso: 4, env: 'NESTOR_SERVICES_STRIKES',
@@ -169,9 +169,9 @@ const ESQUEMA = {
         ayuda: 'Un timeout suelto es normal: el printer renderiza PDFs en el mismo hilo. En 1 se actuaría ante cualquier hipo.'
     },
     quiet_ms: {
-        tipo: 'int', def: 90000, min: 0, max: 900000, paso: 4, env: 'NESTOR_SERVICES_QUIET_MS',
+        tipo: 'int', def: 20000, min: 0, max: 900000, paso: 4, env: 'NESTOR_SERVICES_QUIET_MS',
         label: 'Silencio exigido antes de rescatar (ms)',
-        ayuda: 'Si hubo trabajo hacia ese puerto hace menos que esto, no se toca. 90 s cubre una venta con tarjeta completa. En 0 se rescata sobre una venta en curso: no lo pongas en 0.'
+        ayuda: 'Cuánto se espera tras un uso que TERMINÓ BIEN. Una operación en curso ya protege sola mientras dura, y el POS toma además un candado explícito en el cobro con tarjeta: esto sólo cubre el hueco entre dos operaciones seguidas.'
     },
     max_per_hour: {
         tipo: 'int', def: 5, min: 1, max: 50, paso: 4, env: 'NESTOR_SERVICES_MAX_HOUR',
