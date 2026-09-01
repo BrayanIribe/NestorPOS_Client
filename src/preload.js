@@ -276,8 +276,13 @@ contextBridge.exposeInMainWorld('NestorClient', {
     // frontend nuevo sobre un cliente viejo es lo normal, y un canal inexistente hace
     // que `invoke` RECHACE en vez de devolver un error manejable.
     services: {
-        version: 1,
-        capabilities: ['status', 'ensure', 'release', 'repair', 'hold', 'unhold', 'openFolder', 'onChange'],
+        // v2: configuración del daemon desde la ventana de Configuración
+        // (config/configSave/configReset/discover/probe/pickFile).
+        version: 2,
+        capabilities: [
+            'status', 'ensure', 'release', 'repair', 'hold', 'unhold', 'openFolder', 'onChange',
+            'config', 'configSave', 'configReset', 'discover', 'probe', 'pickFile'
+        ],
 
         // { ok, enabled, rescue, mode, services: [{ id, state, detail, warn, ... }] }
         status: () => invoke('nestor:services:status'),
@@ -292,6 +297,24 @@ contextBridge.exposeInMainWorld('NestorClient', {
         hold: (id, ms) => invoke('nestor:services:hold', { id, ms }),
         unhold: (id) => invoke('nestor:services:unhold', { id }),
         openFolder: () => invoke('nestor:services:open-folder'),
+
+        // ── Asistente de configuración ──────────────────────────────────────
+        // Lo usa la página de Configuración del propio cliente, no el frontend del
+        // POS; se expone por el mismo puente porque es la misma ventana y el mismo
+        // preload. Ver src/pages/services.wizard.html.
+        //
+        // { ok, esquema, valores, fuentes, env, archivo, modo }. `fuentes` dice de
+        // dónde salió cada valor (fábrica/archivo/entorno) y `env` qué campos fija una
+        // variable de entorno: esos NO se pueden guardar, y el asistente los bloquea.
+        config: () => invoke('nestor:services:config'),
+        // Guarda un cambio PARCIAL y lo aplica en caliente, sin reiniciar el cliente.
+        configSave: (valores) => invoke('nestor:services:config-save', { valores: valores || {} }),
+        configReset: () => invoke('nestor:services:config-reset'),
+        // Servicios de Windows, tareas programadas e instance.json de ESTA máquina.
+        discover: () => invoke('nestor:services:discover'),
+        // Probar un destino candidato sin guardarlo.
+        probe: (arg) => invoke('nestor:services:probe', arg || {}),
+        pickFile: (arg) => invoke('nestor:services:pick-file', arg || {}),
         // Cambios de estado (se cayó / se está rescatando / volvió). Devuelve la
         // función para darse de baja.
         onChange: (cb) => subscribe('nestor:services', cb)

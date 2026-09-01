@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Nestor POS - Servicios de la caja</title>
+  <!--
+    Asistente de configuración del daemon de servicios (src/services.watchdog.js).
+
+    Por qué es un ARCHIVO y no un template literal como la página de Configuración:
+    aquel se emite desde configHtml() en proxy.js, donde todo escape va doble y no se
+    pueden usar backticks — un `\n` simple no rompe una línea, rompe el script COMPLETO
+    y deja la ventana muda. Para 30 líneas se aguanta; para un asistente con listas,
+    sondeos y un formulario, no. Aquí el JavaScript es JavaScript.
+
+    Los controles se declaran con data-clave="<clave del esquema>" y el motor de abajo
+    los llena, los bloquea si una variable de entorno los fija y los recoge al guardar.
+    Esa marca es también lo que comprueba scripts/check-services-wizard.js: si alguien
+    agrega un ajuste al esquema y no lo pone aquí, el check falla en vez de que el campo
+    quede invisible para siempre.
+  -->
+  <style>
+    :root { --linea: #e3e3e3; --tenue: #666; --ok: #1e874b; --mal: #c0392b; --ambar: #b06d00; }
+    * { box-sizing: border-box; }
+    /* La ventana es de alto fijo y cada paso puede pasarse: el contenido vive en un
+       área con scroll PROPIO entre la barra y el pie, y no en el scroll del documento.
+       En una caja táctil sin rueda, un pie con position:fixed sobre un documento que
+       se desplaza tapa justo lo que hace falta tocar. */
+    html, body { height: 100%; }
+    body { font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif; margin: 0; background: #fff; color: #1c1c1c; font-size: 14px; display: flex; flex-direction: column; overflow: hidden; }
+
+    .topbar { flex: 0 0 auto; height: 44px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; gap: 10px; background: rgba(255,255,255,0.96); border-bottom: 1px solid var(--linea); user-select: none; -webkit-app-region: drag; }
+    .topbar .title { font-size: 13px; font-weight: 600; }
+    .close-x { -webkit-app-region: no-drag; width: 22px; height: 22px; padding: 0; border-radius: 999px; border: 1px solid rgba(0,0,0,0.18); background: #ff5f57; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+    .close-x:hover { background: #ff4b42; }
+
+    .pasos { flex: 0 0 auto; display: flex; gap: 6px; padding: 12px 18px 0; }
+    .paso-chip { flex: 1; font-size: 11px; text-align: center; color: var(--tenue); padding-bottom: 6px; border-bottom: 3px solid var(--linea); cursor: pointer; }
+    .paso-chip.activo { color: #111; font-weight: 600; border-bottom-color: #222; }
+    .paso-chip.hecho { border-bottom-color: #9fbfa8; }
+
+    main { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; padding: 16px 18px 24px; }
+    /* Estilizada = siempre visible en Chromium; si no, "no se puede dar scroll" y "no
+       hay nada más abajo" se ven igual. */
+    main::-webkit-scrollbar { width: 12px; }
+    main::-webkit-scrollbar-thumb { background: #c3c3c3; border-radius: 8px; border: 3px solid #fff; }
+    main::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
+    main::-webkit-scrollbar-track { background: transparent; }
+    h2 { font-size: 17px; margin: 4px 0 4px; }
+    .lead { color: var(--tenue); line-height: 1.45; margin: 0 0 14px; }
+
+    .campo { display: block; margin-bottom: 14px; }
+    .campo .etiqueta { display: block; font-weight: 600; margin-bottom: 4px; }
+    .campo .ayuda { display: block; color: var(--tenue); font-size: 12px; line-height: 1.4; margin-top: 4px; }
+    .campo .fijado { display: block; font-size: 12px; color: var(--ambar); margin-top: 4px; }
+    input[type=text], input[type=number], select { width: 100%; padding: 8px 10px; border: 1px solid #bbb; border-radius: 8px; font-size: 14px; background: #fff; }
+    input:disabled, select:disabled { background: #f4f4f4; color: #888; }
+    .fila { display: flex; gap: 8px; align-items: center; }
+    .fila > * { flex: 1; }
+    .fila .angosto { flex: 0 0 auto; }
+
+    .opciones { display: flex; flex-direction: column; gap: 6px; }
+    .opcion { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--linea); border-radius: 8px; cursor: pointer; }
+    .opcion input { margin-top: 2px; }
+    .opcion b { font-weight: 600; }
+    .opcion small { display: block; color: var(--tenue); line-height: 1.35; }
+    .opcion:has(input:checked) { border-color: #222; background: #fafafa; }
+
+    button { padding: 8px 12px; border-radius: 8px; border: 1px solid #222; background: #222; color: #fff; cursor: pointer; font-size: 13px; }
+    button.secundario { background: #fff; color: #222; }
+    button.peligro { border-color: var(--mal); background: #fff; color: var(--mal); }
+    button:disabled { opacity: 0.5; cursor: default; }
+
+    .tarjeta { border: 1px solid var(--linea); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+    .tarjeta h3 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: 0.05em; color: #444; }
+    .estado-linea { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; }
+    .pastilla { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+    .pastilla.ok { background: #e6f4ec; color: var(--ok); }
+    .pastilla.mal { background: #fbeae8; color: var(--mal); }
+    .pastilla.aviso { background: #fdf3e3; color: var(--ambar); }
+    .pastilla.gris { background: #eee; color: #555; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: #555; word-break: break-all; }
+    .detalle { color: var(--tenue); font-size: 12px; line-height: 1.4; }
+
+    .resultado { margin-top: 8px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+    .resultado .paso-ok::before { content: "✓ "; color: var(--ok); }
+    .resultado .paso-mal::before { content: "✕ "; color: var(--mal); }
+
+    /* El pie es parte del flex, no `fixed`: así nunca tapa el último campo. */
+    .pie { flex: 0 0 auto; display: flex; gap: 8px; align-items: center; padding: 12px 18px; background: #fff; border-top: 1px solid var(--linea); }
+    .pie .relleno { flex: 1; }
+    .aviso-global { padding: 10px 12px; border-radius: 8px; background: #fdf3e3; color: #6b4600; font-size: 13px; line-height: 1.45; margin-bottom: 14px; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <span class="title">Servicios de la caja</span>
+    <button id="close-x" class="close-x" title="Cerrar (Esc)" aria-label="Cerrar">
+      <svg viewBox="0 0 12 12" width="12" height="12"><path d="M3 3l6 6M9 3L3 9" stroke="rgba(0,0,0,0.65)" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+
+  <div class="pasos" id="pasos"></div>
+
+  <main>
+    <div id="sin-puente" class="aviso-global" hidden>
+      Esta página necesita el cliente de Nestor POS: fuera de él no hay acceso a los servicios de la caja.
+    </div>
+
+    <!-- ── Paso 1 ─────────────────────────────────────────────────────────── -->
+    <section class="paso" data-paso="1" hidden>
+      <h2>Estado actual</h2>
+      <p class="lead">Esto es lo que el cliente ve ahora mismo. Si algo está en rojo, el asistente sirve para apuntarlo bien; si todo está en verde, sólo vas a tocar el comportamiento.</p>
+
+      <div class="tarjeta">
+        <h3>Ahora mismo</h3>
+        <div id="estado-vivo" class="detalle">Consultando…</div>
+      </div>
+
+      <label class="campo">
+        <span class="etiqueta">Vigilar los servicios de esta caja</span>
+        <div class="opciones">
+          <label class="opcion"><input type="radio" name="enabled" data-clave="enabled" value="true" /><span><b>Sí, vigilar</b><small>Sondea cada pocos segundos y avisa al POS.</small></span></label>
+          <label class="opcion"><input type="radio" name="enabled" data-clave="enabled" value="false" /><span><b>No</b><small>El daemon no hace nada. La caja queda como antes: si un servicio se cae, alguien tiene que ir.</small></span></label>
+        </div>
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+      </label>
+
+      <label class="campo">
+        <span class="etiqueta">Qué hacer cuando un servicio no contesta</span>
+        <div class="opciones">
+          <label class="opcion"><input type="radio" name="rescue" data-clave="rescue" value="true" /><span><b>Rescatarlo automáticamente</b><small>Lo levanta sin que nadie entre a la caja. Nunca durante una venta en curso.</small></span></label>
+          <label class="opcion"><input type="radio" name="rescue" data-clave="rescue" value="false" /><span><b>Sólo observar y reportar</b><small>Registra y sube la incidencia, pero no toca nada. Es el modo con el que conviene estrenar una caja.</small></span></label>
+        </div>
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+      </label>
+    </section>
+
+    <!-- ── Paso 2 ─────────────────────────────────────────────────────────── -->
+    <section class="paso" data-paso="2" hidden>
+      <h2>Servicio de impresión</h2>
+      <p class="lead">El servicio de Windows que imprime los tickets, normalmente en el puerto 8331. El nombre no es el mismo en todas las cajas: lo escribe el instalador, y una instancia adicional comparte el de la principal.</p>
+
+      <label class="campo">
+        <span class="etiqueta">¿Vigilar la impresión en esta caja?</span>
+        <div class="opciones">
+          <label class="opcion"><input type="radio" name="printer_watch" data-clave="printer_watch" value="siempre" /><span><b>Sí, siempre</b><small>Lo normal: toda caja con cliente tiene su servicio de impresión.</small></span></label>
+          <label class="opcion"><input type="radio" name="printer_watch" data-clave="printer_watch" value="nunca" /><span><b>No vigilar</b><small>Para una caja que no imprime aquí.</small></span></label>
+        </div>
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+      </label>
+
+      <label class="campo">
+        <span class="etiqueta">Servicio de Windows</span>
+        <div class="fila">
+          <select id="sel-printer-service"><option value="">(descubrirlo del instance.json)</option></select>
+          <button type="button" class="secundario angosto" id="btn-refrescar-2">Actualizar lista</button>
+        </div>
+        <input type="text" data-clave="printer_service" id="txt-printer-service" placeholder="NestorPrinter" hidden />
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+        <span id="printer-resuelto" class="detalle"></span>
+      </label>
+
+      <label class="campo">
+        <span class="etiqueta">Archivo instance.json</span>
+        <div class="fila">
+          <input type="text" data-clave="printer_instance_file" placeholder="(los dos sitios de siempre)" />
+          <button type="button" class="secundario angosto" id="btn-examinar">Examinar…</button>
+        </div>
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+        <span id="instancias" class="detalle"></span>
+      </label>
+
+      <label class="campo">
+        <span class="etiqueta">Puerto</span>
+        <input type="number" data-clave="printer_port" min="1" max="65535" />
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+      </label>
+
+      <label class="campo">
+        <span class="etiqueta">Tarea de respaldo</span>
+        <div class="fila">
+          <select id="sel-printer-task"></select>
+          <button type="button" class="secundario angosto" id="btn-probar-2">Probar</button>
+        </div>
+        <input type="text" data-clave="printer_rescue_task" id="txt-printer-task" hidden />
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+      </label>
+
+      <div id="prueba-printer" class="resultado"></div>
+    </section>
+
+    <!-- ── Paso 3 ─────────────────────────────────────────────────────────── -->
+    <section class="paso" data-paso="3" hidden>
+      <h2>Terminal Santander EMV</h2>
+      <p class="lead">El microservicio que habla con el PIN pad, en el puerto 5000. Sólo se puede rescatar por su tarea programada: el ejecutable pide permisos de administrador y el cliente no corre elevado.</p>
+
+      <label class="campo">
+        <span class="etiqueta">¿Vigilar la terminal en esta caja?</span>
+        <div class="opciones">
+          <label class="opcion"><input type="radio" name="emv_watch" data-clave="emv_watch" value="auto" /><span><b>Automático (recomendado)</b><small>La enciende el POS cuando el paquete dice que este negocio tiene terminal.</small></span></label>
+          <label class="opcion"><input type="radio" name="emv_watch" data-clave="emv_watch" value="siempre" /><span><b>Siempre</b><small>Se vigila desde que arranca el cliente, sin esperar a que alguien entre al punto de venta.</small></span></label>
+          <label class="opcion"><input type="radio" name="emv_watch" data-clave="emv_watch" value="nunca" /><span><b>Nunca</b><small>Esta caja no tiene PIN pad. Se ignora incluso si el POS la pide, para que no intente lanzar un microservicio que no le toca.</small></span></label>
+        </div>
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+      </label>
+
+      <label class="campo">
+        <span class="etiqueta">Tarea programada</span>
+        <div class="fila">
+          <select id="sel-emv-task"></select>
+          <button type="button" class="secundario angosto" id="btn-refrescar-3">Actualizar lista</button>
+        </div>
+        <input type="text" data-clave="emv_task" id="txt-emv-task" hidden />
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+      </label>
+
+      <label class="campo">
+        <span class="etiqueta">Proceso</span>
+        <input type="text" data-clave="emv_exe" />
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+      </label>
+
+      <label class="campo">
+        <span class="etiqueta">Puerto</span>
+        <div class="fila">
+          <input type="number" data-clave="emv_port" min="1" max="65535" />
+          <button type="button" class="secundario angosto" id="btn-probar-3">Probar</button>
+        </div>
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+      </label>
+
+      <div id="prueba-emv" class="resultado"></div>
+    </section>
+
+    <!-- ── Paso 4 ─────────────────────────────────────────────────────────── -->
+    <section class="paso" data-paso="4" hidden>
+      <h2>Comportamiento</h2>
+      <p class="lead">Los valores de fábrica están medidos contra cajas reales. Cámbialos sólo si sabes qué estás persiguiendo — y en particular, no bajes el silencio exigido: es lo que impide reiniciar la terminal a media venta.</p>
+      <div id="campos-comportamiento"></div>
+      <div class="tarjeta">
+        <h3>Volver a empezar</h3>
+        <div class="detalle">Borra la configuración de esta caja y vuelve a los valores de fábrica (más lo que fijen las variables de entorno).</div>
+        <div style="margin-top:8px;"><button type="button" class="peligro" id="btn-reset">Restablecer valores de fábrica</button></div>
+      </div>
+    </section>
+
+    <!-- ── Paso 5 ─────────────────────────────────────────────────────────── -->
+    <section class="paso" data-paso="5" hidden>
+      <h2>Resumen</h2>
+      <p class="lead">Esto es lo que va a cambiar. Se aplica en el acto: no hace falta reiniciar el cliente ni la caja.</p>
+      <div class="tarjeta">
+        <h3>Cambios</h3>
+        <div id="diff" class="detalle">—</div>
+      </div>
+      <div class="tarjeta">
+        <h3>Dónde se guarda</h3>
+        <div id="ruta-config" class="mono"></div>
+        <div class="detalle" style="margin-top:6px;">Vive junto a la bitácora, así que el botón «Eliminar datos y caché» de la ventana de Configuración no se lo lleva.</div>
+      </div>
+      <div id="guardado" class="resultado"></div>
+    </section>
+  </main>
+
+  <div class="pie">
+    <button type="button" class="secundario" id="btn-volver">Volver a Configuración</button>
+    <span class="relleno"></span>
+    <button type="button" class="secundario" id="btn-atras">Atrás</button>
+    <button type="button" id="btn-siguiente">Siguiente</button>
+    <button type="button" id="btn-guardar" hidden>Guardar y aplicar</button>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  const TITULOS = ['Estado', 'Impresión', 'Terminal', 'Comportamiento', 'Resumen'];
+  const IS_MODAL = new URLSearchParams(location.search).get('modal') === '1';
+
+  const puente = window.NestorClient && window.NestorClient.services;
+  // Un cliente viejo sirviendo una página nueva es lo normal aquí (el frontend se
+  // actualiza solo, el cliente no siempre): sin esta comprobación, `invoke` sobre un
+  // canal inexistente RECHAZA y la página se queda muda.
+  const capaz = !!(puente && puente.capabilities && puente.capabilities.indexOf('config') >= 0);
+
+  let paso = 1;
+  let esquema = {};
+  let valores = {};       // lo guardado/efectivo
+  let borrador = {};      // lo que el operador está editando
+  let env = {};           // claves fijadas por variable de entorno
+  let descubierto = { servicios: [], tareas: [], instancias: [], servicioResuelto: '', esWindows: false };
+
+  const $ = (id) => document.getElementById(id);
+
+  // ── Cerrar y volver ───────────────────────────────────────────────────────
+  // Igual que en la página de Configuración: la ventana no tiene marco, así que el
+  // cierre se dibuja SIEMPRE y antes que nada.
+  function cerrar() {
+    try { window.NestorClient.close(); } catch (e) { try { window.close(); } catch (e2) {} }
+  }
+  $('close-x').addEventListener('click', cerrar);
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') { ev.preventDefault(); if (IS_MODAL) cerrar(); }
+  });
+  $('btn-volver').addEventListener('click', () => {
+    location.href = '/__client/config' + (IS_MODAL ? '?modal=1' : '');
+  });
+
+  if (!capaz) {
+    $('sin-puente').hidden = false;
+    $('sin-puente').textContent = puente
+      ? 'Esta versión del cliente todavía no trae el asistente de servicios. Actualiza el cliente para configurarlos desde aquí; mientras tanto siguen valiendo las variables de entorno.'
+      : 'Esta página necesita el cliente de Nestor POS: fuera de él no hay acceso a los servicios de la caja.';
+    ['btn-atras', 'btn-siguiente', 'btn-guardar'].forEach((id) => { $(id).disabled = true; });
+    mostrarPaso(1);
+    return;
+  }
+
+  // ── Motor de campos ───────────────────────────────────────────────────────
+  // Todo control lleva data-clave="<clave del esquema>". Así el formulario no tiene
+  // que enumerarse dos veces, y el check puede comprobar que no falte ninguno.
+  function controles(clave) {
+    return Array.from(document.querySelectorAll('[data-clave="' + clave + '"]'));
+  }
+
+  function leeControl(clave) {
+    const els = controles(clave);
+    if (!els.length) return undefined;
+    if (els[0].type === 'radio') {
+      // El ÚLTIMO marcado, no el primero: si por lo que sea el grupo perdiera su
+      // `name`, el último en marcarse es el que acaba de tocar el operador.
+      const marcados = els.filter((e) => e.checked);
+      return marcados.length ? marcados[marcados.length - 1].value : undefined;
+    }
+    return els[0].value;
+  }
+
+  function escribeControl(clave, valor) {
+    const els = controles(clave);
+    if (!els.length) return;
+    if (els[0].type === 'radio') {
+      els.forEach((e) => { e.checked = String(e.value) === String(valor); });
+      return;
+    }
+    els[0].value = valor == null ? '' : String(valor);
+  }
+
+  /** Rellena ayuda, bloqueo por entorno y valor de cada campo declarado. */
+  function pintarCampos() {
+    Object.keys(esquema).forEach((clave) => {
+      const def = esquema[clave];
+      const els = controles(clave);
+      if (!els.length) return;
+
+      // Los radios necesitan `name` para EXCLUIRSE entre sí. Sin él quedan dos
+      // marcados a la vez y leeControl devuelve el primero: el operador elige una
+      // opción, la ve marcada, y se guarda la otra. Va aquí además de en el HTML
+      // porque los campos del paso 4 se generan desde el esquema.
+      els.forEach((e) => { if (e.type === 'radio' && !e.name) e.name = clave; });
+
+      escribeControl(clave, borrador[clave]);
+
+      const campo = els[0].closest('.campo');
+      if (campo) {
+        const ayuda = campo.querySelector('.ayuda');
+        if (ayuda && def.ayuda) ayuda.textContent = def.ayuda;
+
+        const fijado = campo.querySelector('.fijado');
+        if (fijado) {
+          if (env[clave]) {
+            // Lo importante no es bloquearlo: es DECIRLO. Un campo que se deja
+            // escribir y luego se ignora es peor que uno que no se puede tocar.
+            fijado.hidden = false;
+            fijado.textContent = 'Fijado por la variable de entorno ' + env[clave].variable
+              + ' (' + env[clave].valor + '). El entorno gana siempre; para editarlo aquí, quítala y reinicia el cliente.';
+          } else {
+            fijado.hidden = true;
+          }
+        }
+      }
+
+      els.forEach((e) => { e.disabled = !!env[clave]; });
+    });
+
+    // Los combinados lista/texto se sincronizan aparte.
+    sincronizaCombo('sel-printer-service', 'txt-printer-service', 'printer_service');
+    sincronizaCombo('sel-printer-task', 'txt-printer-task', 'printer_rescue_task');
+    sincronizaCombo('sel-emv-task', 'txt-emv-task', 'emv_task');
+  }
+
+  document.addEventListener('change', (ev) => {
+    const el = ev.target;
+    if (!el || !el.dataset || !el.dataset.clave) return;
+    const clave = el.dataset.clave;
+    if (env[clave]) return;
+    borrador[clave] = leeControl(clave);
+  });
+  document.addEventListener('input', (ev) => {
+    const el = ev.target;
+    if (!el || !el.dataset || !el.dataset.clave) return;
+    const clave = el.dataset.clave;
+    if (env[clave]) return;
+    borrador[clave] = leeControl(clave);
+  });
+
+  // ── Listas descubiertas ───────────────────────────────────────────────────
+  // Un campo de texto vacío junto a "NestorPrinter" de memoria es la forma más común
+  // de configurar mal esto. Se ofrece lo que la máquina TIENE.
+  function opcionesLista(sel, items, vacioLabel) {
+    sel.innerHTML = '';
+    if (vacioLabel) sel.appendChild(new Option(vacioLabel, ''));
+
+    const sugeridos = items.filter((x) => x.sugerido);
+    const resto = items.filter((x) => !x.sugerido);
+    const agrega = (grupo, lista) => {
+      if (!lista.length) return;
+      const g = document.createElement('optgroup');
+      g.label = grupo;
+      lista.forEach((x) => {
+        const etiqueta = x.display ? (x.name + ' — ' + x.display) : x.name;
+        g.appendChild(new Option(etiqueta, x.name));
+      });
+      sel.appendChild(g);
+    };
+    agrega('De Nestor', sugeridos);
+    agrega('Los demás', resto);
+
+    sel.appendChild(new Option('Otro (escribirlo)…', '__manual'));
+    // Qué queda seleccionado lo decide sincronizaCombo, que mira el borrador. Elegirlo
+    // aquí obligaría a acordarse de hacerlo también cada vez que se repinta.
+  }
+
+  /**
+   * Refleja el borrador en el par lista/texto.
+   *
+   * Sólo LEE del borrador: no escribe. Escribir aquí (que es lo que parecía natural)
+   * hace que la primera pintada —con las listas todavía vacías, porque descubrirlas
+   * tarda— machaque con "" el nombre que la caja tenía guardado, y el operador vea
+   * "(descubrirlo del instance.json)" donde decía NestorPrinter. El borrador sólo lo
+   * cambia el operador, por el `change` de enlazaCombo o tecleando.
+   */
+
+  function sincronizaCombo(idSel, idTxt, clave) {
+    const sel = $(idSel);
+    const txt = $(idTxt);
+    if (!sel || !txt) return;
+
+    const valor = borrador[clave] == null ? '' : String(borrador[clave]);
+    const enLista = Array.from(sel.options).some((o) => o.value === valor && o.value !== '__manual');
+
+    sel.value = enLista ? valor : (valor ? '__manual' : '');
+    txt.value = valor;
+    txt.hidden = sel.value !== '__manual';
+    sel.disabled = !!env[clave];
+    txt.disabled = !!env[clave];
+  }
+
+  function enlazaCombo(idSel, idTxt, clave) {
+    const sel = $(idSel);
+    sel.addEventListener('change', () => {
+      if (env[clave]) return;
+      if (sel.value === '__manual') {
+        $(idTxt).hidden = false;
+        $(idTxt).focus();
+      } else {
+        borrador[clave] = sel.value;
+        $(idTxt).value = sel.value;
+        $(idTxt).hidden = true;
+      }
+    });
+  }
+  enlazaCombo('sel-printer-service', 'txt-printer-service', 'printer_service');
+  enlazaCombo('sel-printer-task', 'txt-printer-task', 'printer_rescue_task');
+  enlazaCombo('sel-emv-task', 'txt-emv-task', 'emv_task');
+
+  async function refrescarListas() {
+    const d = await puente.discover();
+    if (!d || d.ok === false) return;
+    descubierto = d;
+
+    opcionesLista($('sel-printer-service'), d.servicios || [], '(descubrirlo del instance.json)');
+    opcionesLista($('sel-printer-task'), d.tareas || [], '');
+    opcionesLista($('sel-emv-task'), d.tareas || [], '');
+
+    $('printer-resuelto').textContent = d.esWindows
+      ? ('Ahora mismo se está usando: ' + (d.servicioResuelto || '(ninguno)'))
+      : 'En este sistema no hay servicios ni tareas de Windows: el daemon corre en observación y estas listas van vacías.';
+
+    $('instancias').innerHTML = (d.instancias || []).map((i) => {
+      const que = i.existe
+        ? (i.printer_service ? ('dice <b>' + escapa(i.printer_service) + '</b>') : 'existe, con el servicio vacío (comparte el de la instancia principal)')
+        : 'no existe';
+      return '<div class="mono">' + escapa(i.ruta) + ' — ' + que + '</div>';
+    }).join('') || '';
+
+    pintarCampos();
+  }
+
+  function escapa(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+
+  // ── Paso 1: estado en vivo ────────────────────────────────────────────────
+  const CLASE_ESTADO = {
+    ok: 'ok', desconocido: 'gris', sospechoso: 'aviso',
+    rescatando: 'aviso', caido: 'mal', rendido: 'mal'
+  };
+
+  async function refrescarEstado() {
+    const el = $('estado-vivo');
+    try {
+      const st = await puente.status();
+      if (!st || st.ok === false) {
+        el.textContent = 'El daemon no está activo' + (st && st.error ? (': ' + st.error) : '.');
+        return;
+      }
+      const filas = (st.services || []).map((s) => {
+        const clase = CLASE_ESTADO[s.state] || 'gris';
+        const etiqueta = !s.supervised ? 'SIN VIGILAR' : String(s.state).toUpperCase();
+        const pastilla = '<span class="pastilla ' + (s.supervised ? clase : 'gris') + '">' + etiqueta + '</span>';
+        const detalle = s.warn || s.detail || '';
+        return '<div class="estado-linea"><span>' + escapa(s.label) + '<br /><span class="detalle">'
+          + escapa(detalle) + '</span></span>' + pastilla + '</div>';
+      }).join('');
+      el.innerHTML = filas + '<div class="detalle" style="margin-top:8px;">Modo: <b>' + escapa(st.mode)
+        + '</b> · ronda cada ' + Math.round((st.watchMs || 0) / 1000) + ' s</div>';
+    } catch (e) {
+      el.textContent = 'ERROR al consultar: ' + (e && e.message ? e.message : String(e));
+    }
+  }
+
+  // ── Paso 4: campos de comportamiento, generados del esquema ───────────────
+  // Se generan y no se escriben a mano porque son ocho enteros con el mismo control:
+  // la única diferencia entre ellos es el texto, y ese ya vive en el esquema.
+  function pintarComportamiento() {
+    const cont = $('campos-comportamiento');
+    if (cont.dataset.listo) return;
+    cont.dataset.listo = '1';
+
+    Object.keys(esquema).filter((k) => esquema[k].paso === 4).forEach((clave) => {
+      const def = esquema[clave];
+      const campo = document.createElement('label');
+      campo.className = 'campo';
+      campo.innerHTML = '<span class="etiqueta"></span>'
+        + '<input type="number" data-clave="' + clave + '" min="' + def.min + '" max="' + def.max + '" />'
+        + '<span class="ayuda"></span><span class="fijado" hidden></span>';
+      campo.querySelector('.etiqueta').textContent = def.label + ' — de fábrica: ' + def.def;
+      cont.appendChild(campo);
+    });
+  }
+
+  // ── Paso 5: resumen ───────────────────────────────────────────────────────
+  function pintarResumen() {
+    const cambios = Object.keys(esquema).filter((k) => String(borrador[k]) !== String(valores[k]));
+    $('diff').innerHTML = cambios.length
+      ? cambios.map((k) => '<div>' + escapa(esquema[k].label) + ': <b>' + escapa(String(valores[k]))
+          + '</b> → <b>' + escapa(String(borrador[k])) + '</b></div>').join('')
+      : 'Nada. La configuración se queda como está.';
+    $('btn-guardar').disabled = cambios.length === 0;
+  }
+
+  // ── Navegación ────────────────────────────────────────────────────────────
+  function pintarChips() {
+    $('pasos').innerHTML = TITULOS.map((t, i) =>
+      '<div class="paso-chip' + (i + 1 === paso ? ' activo' : (i + 1 < paso ? ' hecho' : ''))
+      + '" data-ir="' + (i + 1) + '">' + (i + 1) + '. ' + t + '</div>').join('');
+  }
+
+  function mostrarPaso(n) {
+    paso = Math.max(1, Math.min(TITULOS.length, n));
+    Array.from(document.querySelectorAll('.paso')).forEach((s) => {
+      s.hidden = Number(s.dataset.paso) !== paso;
+    });
+    pintarChips();
+    $('btn-atras').disabled = paso === 1;
+    $('btn-siguiente').hidden = paso === TITULOS.length;
+    $('btn-guardar').hidden = paso !== TITULOS.length;
+    // El scroll vive en <main>, no en el documento: window.scrollTo no movería nada y
+    // el paso siguiente se abriría a media altura del anterior.
+    const cuerpo = document.querySelector('main');
+    if (cuerpo) cuerpo.scrollTop = 0;
+
+    if (!capaz) return;
+    if (paso === 1) refrescarEstado();
+    if (paso === 2 || paso === 3) { if (!descubierto.servicios.length && !descubierto.tareas.length) refrescarListas(); }
+    if (paso === 4) { pintarComportamiento(); pintarCampos(); }
+    if (paso === 5) pintarResumen();
+  }
+
+  $('pasos').addEventListener('click', (ev) => {
+    const ir = ev.target && ev.target.dataset ? ev.target.dataset.ir : null;
+    if (ir) mostrarPaso(Number(ir));
+  });
+  $('btn-atras').addEventListener('click', () => mostrarPaso(paso - 1));
+  $('btn-siguiente').addEventListener('click', () => mostrarPaso(paso + 1));
+  $('btn-refrescar-2').addEventListener('click', refrescarListas);
+  $('btn-refrescar-3').addEventListener('click', refrescarListas);
+
+  $('btn-examinar').addEventListener('click', async () => {
+    const r = await puente.pickFile({ title: 'Selecciona instance.json', defaultPath: borrador.printer_instance_file || '' });
+    if (r && r.ok && r.ruta) {
+      borrador.printer_instance_file = r.ruta;
+      escribeControl('printer_instance_file', r.ruta);
+      refrescarListas();
+    }
+  });
+
+  // ── Probar ────────────────────────────────────────────────────────────────
+  // Contestar "sí, ahí está" ANTES de guardar. Sin esto habría que guardar, esperar la
+  // siguiente ronda y deducirlo del color de una pastilla.
+  async function probar(id, destino) {
+    const el = $(destino);
+    el.textContent = 'Probando…';
+    try {
+      const r = await puente.probe({
+        id,
+        port: id === 'printer' ? borrador.printer_port : borrador.emv_port,
+        service: borrador.printer_service,
+        rescueTask: borrador.printer_rescue_task,
+        task: borrador.emv_task
+      });
+      if (!r || r.ok === false) { el.textContent = 'ERROR: ' + ((r && r.error) || 'no se pudo probar'); return; }
+
+      const lineas = [];
+      lineas.push('<div class="' + (r.contesta ? 'paso-ok' : 'paso-mal') + '">127.0.0.1:' + r.puerto + ' — '
+        + escapa(r.contesta ? 'contesta' : (r.error || 'no contesta')) + '</div>');
+      if (r.aviso) lineas.push('<div class="detalle">Aviso: ' + escapa(r.aviso) + '</div>');
+      (r.pasos || []).forEach((p) => {
+        lineas.push('<div class="' + (p.ok ? 'paso-ok' : 'paso-mal') + '">' + escapa(p.paso) + ' — ' + escapa(p.detalle) + '</div>');
+      });
+      el.innerHTML = lineas.join('');
+    } catch (e) {
+      el.textContent = 'ERROR: ' + (e && e.message ? e.message : String(e));
+    }
+  }
+  $('btn-probar-2').addEventListener('click', () => probar('printer', 'prueba-printer'));
+  $('btn-probar-3').addEventListener('click', () => probar('emv', 'prueba-emv'));
+
+  // ── Guardar / restablecer ─────────────────────────────────────────────────
+  $('btn-guardar').addEventListener('click', async () => {
+    const el = $('guardado');
+    el.textContent = 'Guardando…';
+    const cambios = {};
+    Object.keys(esquema).forEach((k) => {
+      if (env[k]) return;
+      if (String(borrador[k]) !== String(valores[k])) cambios[k] = borrador[k];
+    });
+
+    try {
+      const r = await puente.configSave(cambios);
+      if (!r || r.ok === false) { el.textContent = 'ERROR: ' + ((r && r.error) || 'no se pudo guardar'); return; }
+      const pedidas = Object.keys(cambios);
+      const aplicadas = r.aplicadas || [];
+      adopta(r.config);
+
+      let txt = aplicadas.length ? ('Guardado y aplicado: ' + aplicadas.join(', ') + '.') : 'No cambió nada.';
+      if (r.ignoradas && r.ignoradas.length) {
+        txt += '\nNo se guardaron (las fija el entorno): '
+          + r.ignoradas.map((i) => i.clave + ' → ' + i.variable).join(', ') + '.';
+      }
+      // Un valor que el daemon descarta por inválido (un campo que quedó vacío, por
+      // ejemplo) desaparecería sin más: el resumen se vaciaría y parecería guardado.
+      const ignoradasClaves = (r.ignoradas || []).map((i) => i.clave);
+      const descartadas = pedidas.filter((k) => aplicadas.indexOf(k) < 0 && ignoradasClaves.indexOf(k) < 0);
+      if (descartadas.length) {
+        txt += '\nSe descartaron por no ser un valor válido: '
+          + descartadas.map((k) => esquema[k].label).join(', ') + '. Quedaron como estaban.';
+      }
+      el.textContent = txt;
+      pintarResumen();
+      refrescarEstado();
+    } catch (e) {
+      el.textContent = 'ERROR: ' + (e && e.message ? e.message : String(e));
+    }
+  });
+
+  $('btn-reset').addEventListener('click', async () => {
+    if (!confirm('¿Restablecer los valores de fábrica de los servicios de esta caja?')) return;
+    try {
+      const r = await puente.configReset();
+      if (!r || r.ok === false) { alert('ERROR: ' + ((r && r.error) || 'no se pudo restablecer')); return; }
+      adopta(r.config);
+      pintarComportamiento();
+      pintarCampos();
+      refrescarListas();
+      alert('Listo: la caja volvió a los valores de fábrica.');
+    } catch (e) {
+      alert('ERROR: ' + (e && e.message ? e.message : String(e)));
+    }
+  });
+
+  // ── Arranque ──────────────────────────────────────────────────────────────
+  function adopta(c) {
+    esquema = c.esquema || {};
+    valores = Object.assign({}, c.valores);
+    borrador = Object.assign({}, c.valores);
+    env = c.env || {};
+    $('ruta-config').textContent = c.archivo || '(sin archivo: no hay dónde escribir)';
+  }
+
+  (async function () {
+    try {
+      const c = await puente.config();
+      if (!c || c.ok === false) throw new Error((c && c.error) || 'no se pudo leer la configuración');
+      adopta(c);
+      pintarCampos();
+      mostrarPaso(1);
+      setInterval(() => { if (paso === 1) refrescarEstado(); }, 4000);
+    } catch (e) {
+      $('sin-puente').hidden = false;
+      $('sin-puente').textContent = 'No se pudo leer la configuración: ' + (e && e.message ? e.message : String(e));
+      mostrarPaso(1);
+    }
+  })();
+})();
+</script>
+</body>
+</html>

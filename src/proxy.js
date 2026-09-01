@@ -38,6 +38,29 @@ function isJsonContentType(ct) {
     return ct.includes('application/json') || ct.includes('+json');
 }
 
+/**
+ * El asistente de servicios de la caja, servido desde src/pages/services.wizard.html.
+ *
+ * Es un ARCHIVO y no un template literal como configHtml() a propósito: ahí dentro
+ * todo escape va doble y no caben backticks —un `\n` simple no rompe una línea, rompe
+ * el script COMPLETO y deja la ventana muda—, y el asistente trae formulario, listas y
+ * sondeos. En el paquete la ruta cae dentro del asar, que readFileSync sabe leer.
+ *
+ * Se lee en CADA petición y no una vez al arrancar: la ventana de Configuración se
+ * abre pocas veces, y a cambio editar el archivo y recargar (Ctrl+R) es todo el ciclo
+ * de desarrollo.
+ */
+function servicesWizardHtml() {
+    try {
+        return fs.readFileSync(path.join(__dirname, 'pages', 'services.wizard.html'), 'utf8');
+    } catch (e) {
+        const msg = e && e.message ? e.message : String(e);
+        return '<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;padding:24px">'
+            + '<h2>No se pudo cargar el asistente</h2><p>' + msg.replace(/[<>&]/g, '') + '</p>'
+            + '<p><a href="/__client/config?modal=1">Volver a Configuración</a></p></body>';
+    }
+}
+
 function configHtml() {
     return `<!doctype html>
 <html>
@@ -46,14 +69,27 @@ function configHtml() {
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Nestor POS - Configuración</title>
   <style>
-    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif; margin: 0; padding: 0 20px 20px; background-color:white; }
-    .topbar { position: sticky; top: 0; z-index: 10; margin: 0 -20px 16px; height: 44px; padding: 0 14px; display:flex; align-items:center; justify-content:space-between; gap: 10px; background: rgba(255,255,255,0.94); border-bottom: 1px solid rgba(0,0,0,0.08); user-select:none; -webkit-app-region: drag; }
+    /* La ventana es de alto fijo y el contenido creció: si la página dependiera del
+       scroll del DOCUMENTO, en una caja táctil sin rueda no habría forma de llegar al
+       final. La barra queda arriba y TODO lo demás vive en un área con scroll propio
+       y barra visible. */
+    html, body { height: 100%; }
+    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif; margin: 0; padding: 0; background-color:white; display:flex; flex-direction:column; overflow:hidden; }
+    .contenido { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; padding: 16px 20px 24px; }
+    /* Estilizada = siempre visible en Chromium. Sin esto, en Windows 11 la barra se
+       oculta hasta que algo se desplaza, y "no se puede dar scroll" y "no hay nada más
+       abajo" se ven exactamente igual. */
+    .contenido::-webkit-scrollbar { width: 12px; }
+    .contenido::-webkit-scrollbar-thumb { background: #c3c3c3; border-radius: 8px; border: 3px solid #fff; }
+    .contenido::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
+    .contenido::-webkit-scrollbar-track { background: transparent; }
+    .topbar { flex: 0 0 auto; height: 44px; padding: 0 14px; display:flex; align-items:center; justify-content:space-between; gap: 10px; background: rgba(255,255,255,0.94); border-bottom: 1px solid rgba(0,0,0,0.08); user-select:none; -webkit-app-region: drag; }
     .topbar .title { font-size: 13px; font-weight: 600; color:#333; }
     .topbar[hidden] { display:none; }
     .close-x { -webkit-app-region: no-drag; width: 22px; height: 22px; padding: 0; border-radius: 999px; border: 1px solid rgba(0,0,0,0.18); background: #ff5f57; display:inline-flex; align-items:center; justify-content:center; }
     .close-x:hover { background: #ff4b42; }
     .close-x svg { pointer-events: none; }
-    .card { max-width: 560px; margin: 0 auto; border: 1px solid #ddd; border-radius: 10px; padding: 18px; }
+    .card { max-width: 560px; margin: 0 auto 8px; border: 1px solid #ddd; border-radius: 10px; padding: 18px; }
     label { display:block; font-weight: 600; margin-bottom: 6px; }
     input { width:100%; padding: 10px; border-radius: 8px; border: 1px solid #bbb; font-size: 14px; }
     .row { margin-top: 12px; display:flex; gap: 10px; }
@@ -79,6 +115,7 @@ function configHtml() {
     </button>
   </div>
 
+  <div class="contenido">
   <div class="card">
     <h2>Servidor Nestor POS</h2>
     <div class="hint">
@@ -110,8 +147,17 @@ function configHtml() {
     </div>
 
     <hr />
+    <div class="section-label">Servicios de la caja</div>
+    <div id="svc-state" class="kv">Consultando...</div>
+    <div class="row">
+      <button id="svc-config" class="secondary">Configurar servicios...</button>
+      <button id="svc-folder" class="secondary">Abrir bitácora</button>
+    </div>
+
+    <hr />
     <div class="danger-label">Zona de peligro</div>
     <button id="clear-data" class="danger">Eliminar datos y caché</button>
+  </div>
   </div>
 
 <script>
@@ -182,7 +228,8 @@ function configHtml() {
     // en vez de morir en el primer await y dejar todo en "Consultando...".
     setStatus('Esta página necesita el cliente de Nestor POS: fuera de él no hay acceso a la configuración.');
     document.getElementById('xhr-state').textContent = 'No disponible: abre la ventana de Configuración desde el cliente.';
-    ['save', 'test', 'clear-data', 'xhr-save', 'xhr-folder'].forEach((id) => {
+    document.getElementById('svc-state').textContent = 'No disponible: abre la ventana de Configuración desde el cliente.';
+    ['save', 'test', 'clear-data', 'xhr-save', 'xhr-folder', 'svc-config', 'svc-folder'].forEach((id) => {
       const el = document.getElementById(id);
       if (el) el.disabled = true;
     });
@@ -289,6 +336,58 @@ function configHtml() {
   refreshXhr();
   setInterval(refreshXhr, 3000);
 
+  // ── Servicios de la caja ──────────────────────────────────────────────────
+  // Resumen de una línea por servicio y la puerta al asistente. El detalle vive en
+  // /__client/services (src/pages/services.wizard.html), que es la MISMA ventana con
+  // el mismo puente: se navega con un href normal.
+  const elSvc = document.getElementById('svc-state');
+  const svc = window.NestorClient.services;
+
+  const SVC_CLASE = {
+    ok: 'ok', desconocido: 'gris', sospechoso: 'aviso',
+    rescatando: 'aviso', caido: 'mal', rendido: 'mal'
+  };
+
+  async function refreshSvc() {
+    if (!svc || !svc.status) {
+      elSvc.textContent = 'No disponible en esta versión del cliente.';
+      return;
+    }
+    try {
+      const st = await svc.status();
+      if (!st || st.ok === false) {
+        elSvc.textContent = 'Daemon inactivo' + (st && st.error ? (': ' + st.error) : (st && st.mode ? (' (' + st.mode + ')') : '.'));
+        return;
+      }
+      const filas = (st.services || []).map(function (s) {
+        const etiqueta = !s.supervised ? 'sin vigilar' : String(s.state);
+        const detalle = s.warn || s.detail || '';
+        return '<div><b>' + s.label + '</b>: ' + etiqueta
+          + (detalle ? ('<br /><span style="color:#666">' + detalle + '</span>') : '') + '</div>';
+      }).join('');
+      elSvc.innerHTML = filas + '<div style="color:#666;margin-top:4px;">Modo: ' + st.mode
+        + (st.configurado ? ' — configurado en esta caja' : ' — valores de fábrica') + '</div>';
+    } catch (e) {
+      elSvc.textContent = 'ERROR ' + (e && e.message ? e.message : String(e));
+    }
+  }
+
+  document.getElementById('svc-config').addEventListener('click', function () {
+    location.href = '/__client/services' + (IS_MODAL ? '?modal=1' : '');
+  });
+
+  document.getElementById('svc-folder').addEventListener('click', async () => {
+    try {
+      const r = await svc.openFolder();
+      if (r && !r.ok) setStatus('ERROR\\n' + (r.error || 'no se pudo abrir la bitácora'));
+    } catch (e) {
+      setStatus('ERROR\\n' + (e && e.message ? e.message : String(e)));
+    }
+  });
+
+  refreshSvc();
+  setInterval(refreshSvc, 4000);
+
   // ── Zona de peligro ───────────────────────────────────────────────────────
   document.getElementById('clear-data').addEventListener('click', async () => {
     const ok = confirm('¿Eliminar todos los datos y caché del cliente POS?\\n\\nSe borrarán los archivos del frontend, el caché de respuestas y el almacenamiento local. La aplicación se reiniciará.');
@@ -321,6 +420,14 @@ function startLocalFrontendServer(currentDir, getServerOriginFn, options = {}) {
     ex.get('/__client/config', (req, res) => {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         res.end(configHtml());
+    });
+
+    // Asistente de servicios de la caja. Misma ventana y mismo preload que
+    // /__client/config: se navega de una a otra con un enlace normal.
+    ex.get('/__client/services', (req, res) => {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(servicesWizardHtml());
     });
 
     // ── ¿De quién es el puerto? ────────────────────────────────────────────────
@@ -579,4 +686,4 @@ function startLocalFrontendServer(currentDir, getServerOriginFn, options = {}) {
     });
 }
 
-module.exports = { startLocalFrontendServer, configHtml };
+module.exports = { startLocalFrontendServer, configHtml, servicesWizardHtml };

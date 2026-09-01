@@ -1,7 +1,7 @@
 // Revisa la compuerta de tráfico del daemon de servicios (src/services.watchdog.js).
 //
 // Por qué existe: el daemon no rescata un servicio que se está usando, y decide "se
-// está usando" a partir de las peticiones que ve pasar hacia :8331 y :5000. El
+// está usando" a partir de las peticiones que ve pasar hacia sus puertos. El
 // indicador de la barra de estado del POS sondea /api/health del EMV CADA 3 SEGUNDOS.
 // Si esos latidos contaran como uso, la compuerta jamás se abriría y el daemon no
 // podría rescatar nada NUNCA — y lo peor es que se vería igual que si funcionara:
@@ -80,6 +80,46 @@ const emv = svc.status().services.find((s) => s.id === 'emv');
 if (printer && printer.supervised !== true) fallas.push('el servicio de impresión debería vigilarse desde el arranque');
 if (emv && emv.supervised !== false) fallas.push('la terminal EMV NO debe vigilarse hasta que el POS lo pida (ensure)');
 
+// ── La compuerta sigue viendo el tráfico con puertos configurados ───────────────
+// Los puertos se pueden cambiar desde el asistente (una instancia adicional corre su
+// printer en otro puerto). Si la clasificación se quedara con ":8331" quemado, en esa
+// caja NADA contaría como uso: la compuerta de silencio quedaría abierta para siempre
+// y el daemon reiniciaría el servicio a media impresión o a media venta con tarjeta.
+// Es el peor fallo posible aquí y no deja rastro en la bitácora.
+const os = require('os');
+const fsp = require('fs');
+const tmp = fsp.mkdtempSync(require('path').join(os.tmpdir(), 'nestor-svc-check-'));
+process.env.NESTOR_SERVICES_DIR = tmp;
+
+try {
+    svc.init(tmp, {});
+    const r = svc.configure({ printer_port: 9911, emv_port: 5911 });
+    if (!r.ok) {
+        fallas.push(`no se pudo guardar la configuración de prueba: ${r.error}`);
+    } else {
+        const CASOS_PUERTO = [
+            ['http://127.0.0.1:9911/api/v1/print', 'printer', true, 'impresión en el puerto configurado'],
+            ['http://127.0.0.1:5911/api/emv/venta', 'emv', true, 'cobro en el puerto configurado'],
+            ['http://127.0.0.1:9911/api/v1/health', 'printer', false, 'latido en el puerto configurado'],
+            ['http://127.0.0.1:8331/api/v1/print', 'printer', false, 'el puerto de fábrica, que esta caja ya no usa']
+        ];
+        for (const [url, id, deberiaContar, que] of CASOS_PUERTO) {
+            const antes = traffic(id);
+            esperarOtroMs();
+            svc.noteTraffic(url);
+            const conto = traffic(id) !== antes;
+            if (conto !== deberiaContar) {
+                fallas.push(deberiaContar
+                    ? `con puertos configurados, ${que} NO cuenta como uso (${url}): el daemon podría reiniciar el servicio a media operación`
+                    : `con puertos configurados, ${que} SÍ cuenta como uso (${url})`);
+            }
+        }
+    }
+} finally {
+    svc.resetConfig();
+    try { fsp.rmSync(tmp, { recursive: true, force: true }); } catch { }
+}
+
 svc.shutdown();
 
 if (fallas.length) {
@@ -87,4 +127,4 @@ if (fallas.length) {
     for (const f of fallas) console.error('  - ' + f);
     process.exit(1);
 }
-console.log(`daemon de servicios: ok (${CASOS.length} rutas clasificadas, vocabulario y vigilancia inicial)`);
+console.log(`daemon de servicios: ok (${CASOS.length} rutas clasificadas, puertos configurados, vocabulario y vigilancia inicial)`);

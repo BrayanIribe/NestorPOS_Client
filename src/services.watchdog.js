@@ -50,52 +50,66 @@ const net = require('net');
 const path = require('path');
 const http = require('http');
 const { execFile } = require('child_process');
+const configStore = require('./services.config');
 
-// ── Interruptores ───────────────────────────────────────────────────────────────
+// ── Configuración ───────────────────────────────────────────────────────────────
 //
+// Se sintoniza desde la ventana de Configuración del cliente (Servicios de la caja →
+// asistente) y se guarda junto a la bitácora. Las variables de entorno siguen ganando
+// siempre: son la vía de emergencia (arrancar una caja rota con NESTOR_SERVICES=0) y
+// la de desarrollo. Ver src/services.config.js para el esquema y la precedencia.
+//
+// Son `let` y no `const` A PROPÓSITO: aplicaConfig() las reescribe cuando alguien
+// guarda desde el asistente, para que el cambio surta efecto SIN reiniciar el cliente.
+// Pedir un reinicio de la caja para mover un umbral es justo la clase de viaje que
+// este daemon existe para evitar.
+let cfg = configStore.resolve('');
+
 // NESTOR_SERVICES=0        apaga el daemon entero (ni sondea).
 // NESTOR_SERVICES_RESCUE=0 modo OBSERVACIÓN: sondea, registra y reporta, pero no
 //                          toca nada. Es el modo con el que conviene pilotear en
 //                          flota: desplegar rescate automático con un error adentro
 //                          es una caída de flota.
-const ENABLED = (process.env.NESTOR_SERVICES || '1') !== '0';
-const RESCUE_ENABLED = (process.env.NESTOR_SERVICES_RESCUE || '1') !== '0';
+let ENABLED = cfg.valores.enabled;
+let RESCUE_ENABLED = cfg.valores.rescue;
 
 // Sólo Windows tiene servicios y tareas que rescatar. En macOS/Linux (desarrollo) el
 // daemon corre igual, pero en observación: sirve para probar sondas y estados.
 const IS_WIN = process.platform === 'win32';
 
-const WATCH_MS = Math.max(5000, parseInt(process.env.NESTOR_SERVICES_WATCH_MS || '15000', 10));
-const PROBE_TIMEOUT_MS = Math.max(800, parseInt(process.env.NESTOR_SERVICES_PROBE_MS || '2500', 10));
+let WATCH_MS = cfg.valores.watch_ms;
+let PROBE_TIMEOUT_MS = cfg.valores.probe_ms;
 
 // Fallos SEGUIDOS antes de mover un dedo. Un timeout suelto es normal: el printer
 // renderiza PDFs en el mismo hilo y el EMV bloquea hasta 60 s esperando la tarjeta.
-const STRIKES = Math.max(1, parseInt(process.env.NESTOR_SERVICES_STRIKES || '3', 10));
+let STRIKES = cfg.valores.strikes;
 
 // Silencio exigido antes de rescatar: si hubo tráfico hacia ese puerto hace menos que
 // esto, se salta la ronda. 90 s cubre una venta con tarjeta completa.
-const QUIET_MS = Math.max(0, parseInt(process.env.NESTOR_SERVICES_QUIET_MS || '90000', 10));
+let QUIET_MS = cfg.valores.quiet_ms;
 
 // Espera entre intentos del MISMO episodio. Después del último valor se repite.
 const BACKOFF_MS = [10000, 30000, 120000, 300000];
 
 // Tope de rescates por hora y por servicio. Al pasarlo se declara `rendido` y se
 // sube la incidencia: ya no es algo que se arregle reiniciando.
-const MAX_RESCUES_PER_HOUR = Math.max(1, parseInt(process.env.NESTOR_SERVICES_MAX_HOUR || '5', 10));
+let MAX_RESCUES_PER_HOUR = cfg.valores.max_per_hour;
 
 // Cuánto se espera a que un servicio recién lanzado empiece a contestar. El EMV es
 // LENTO de verdad: hace login contra el host de Santander y detecta puertos COM.
-const SETTLE_MS = {
-    printer: Math.max(3000, parseInt(process.env.NESTOR_SERVICES_SETTLE_PRINTER_MS || '20000', 10)),
-    emv: Math.max(5000, parseInt(process.env.NESTOR_SERVICES_SETTLE_EMV_MS || '60000', 10))
-};
+let SETTLE_MS = { printer: cfg.valores.settle_printer_ms, emv: cfg.valores.settle_emv_ms };
 
-// Nombres por omisión. El del printer se descubre de instance.json (ver
-// resolvePrinterService); esto es el respaldo y el override manual.
-const PRINTER_SERVICE_DEFAULT = String(process.env.NESTOR_PRINTER_SERVICE || 'NestorPrinter').trim();
-const PRINTER_RESCUE_TASK = String(process.env.NESTOR_PRINTER_RESCUE_TASK || 'NestorPrinterRescue').trim();
-const EMV_TASK = String(process.env.NESTOR_EMV_TASK || 'NestorSantanderEMV').trim();
-const EMV_EXE_NAME = 'NestorSantanderEmvService.exe';
+// Puertos donde escucha cada servicio. Configurables porque una instancia adicional
+// de NestorPOS en la misma máquina corre su printer en otro puerto.
+let PUERTOS = { printer: cfg.valores.printer_port, emv: cfg.valores.emv_port };
+
+// Nombres. El del printer se descubre de instance.json (ver resolvePrinterService);
+// esto es el respaldo y el override manual.
+let PRINTER_SERVICE_DEFAULT = cfg.valores.printer_service || 'NestorPrinter';
+let PRINTER_RESCUE_TASK = cfg.valores.printer_rescue_task;
+let PRINTER_INSTANCE_FILE = cfg.valores.printer_instance_file;
+let EMV_TASK = cfg.valores.emv_task;
+let EMV_EXE_NAME = cfg.valores.emv_exe;
 
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
 
@@ -157,10 +171,25 @@ const servicios = {
     emv: nuevoEstado('emv', 'Terminal Santander EMV')
 };
 
-// El printer se vigila siempre: toda caja con cliente tiene el suyo (ver
-// NeedServerStack en el instalador — un cliente autónomo instala su propio
-// NestorPrinter).
-servicios.printer.supervised = true;
+/**
+ * Quién se vigila, según la configuración.
+ *
+ * El printer se vigila desde el arranque —toda caja con cliente tiene el suyo (ver
+ * NeedServerStack en el instalador)— salvo que el asistente lo ponga en "nunca", que
+ * es la caja que no imprime aquí.
+ *
+ * El EMV en "auto" NO se toca desde aquí: lo enciende el POS con ensure() cuando el
+ * paquete dice que esta caja tiene terminal, y apagarlo aquí en cada reaplicación de
+ * configuración le quitaría al POS lo que acaba de encender.
+ */
+function aplicaVigilancia() {
+    servicios.printer.supervised = cfg.valores.printer_watch === 'siempre';
+
+    if (cfg.valores.emv_watch === 'siempre') servicios.emv.supervised = true;
+    else if (cfg.valores.emv_watch === 'nunca') servicios.emv.supervised = false;
+}
+
+aplicaVigilancia();
 
 // ── Utilidades ──────────────────────────────────────────────────────────────────
 
@@ -337,15 +366,18 @@ let printerServiceCache = null;
 function resolvePrinterService() {
     if (printerServiceCache !== null) return printerServiceCache;
 
-    if (process.env.NESTOR_PRINTER_SERVICE) {
-        printerServiceCache = PRINTER_SERVICE_DEFAULT;
+    // Configurado a mano (asistente o variable de entorno): manda y no se descubre.
+    if (cfg.valores.printer_service) {
+        printerServiceCache = cfg.valores.printer_service;
         return printerServiceCache;
     }
 
-    const candidatos = [
-        'C:\\NestorMX\\NestorPOS\\instance.json',
-        'C:\\NestorMX\\NestorComplementos\\instance.json'
-    ];
+    const candidatos = PRINTER_INSTANCE_FILE
+        ? [PRINTER_INSTANCE_FILE]
+        : [
+            'C:\\NestorMX\\NestorPOS\\instance.json',
+            'C:\\NestorMX\\NestorComplementos\\instance.json'
+        ];
     for (const file of candidatos) {
         try {
             const raw = fs.readFileSync(file, 'utf8');
@@ -431,13 +463,14 @@ async function taskExists(nombre) {
  * 404 y el sondeo se conforma con que el puerto conteste — que es la pregunta que de
  * verdad importa para decidir el rescate.
  */
-async function probePrinter() {
-    const tcp = await tcpPing(8331, PROBE_TIMEOUT_MS);
+async function probePrinter(puerto) {
+    const port = puerto || PUERTOS.printer;
+    const tcp = await tcpPing(port, PROBE_TIMEOUT_MS);
     if (!tcp.open) {
-        return { alive: false, error: `nadie escucha en 127.0.0.1:8331 (${tcp.error})`, warn: '', info: null };
+        return { alive: false, error: `nadie escucha en 127.0.0.1:${port} (${tcp.error})`, warn: '', info: null };
     }
 
-    const r = await httpGet('http://127.0.0.1:8331/api/v1/health', PROBE_TIMEOUT_MS);
+    const r = await httpGet(`http://127.0.0.1:${port}/api/v1/health`, PROBE_TIMEOUT_MS);
     if (!r.ok) {
         // El puerto abre pero no completa una petición HTTP: es el caso "colgado", el
         // que sólo se ve desde aquí.
@@ -475,13 +508,14 @@ async function probePrinter() {
  *        tira la sesión con el host.
  *   sin respuesta → el servicio no está. Lo único que dispara rescate.
  */
-async function probeEmv() {
-    const tcp = await tcpPing(5000, PROBE_TIMEOUT_MS);
+async function probeEmv(puerto) {
+    const port = puerto || PUERTOS.emv;
+    const tcp = await tcpPing(port, PROBE_TIMEOUT_MS);
     if (!tcp.open) {
-        return { alive: false, error: `nadie escucha en 127.0.0.1:5000 (${tcp.error})`, warn: '', info: null };
+        return { alive: false, error: `nadie escucha en 127.0.0.1:${port} (${tcp.error})`, warn: '', info: null };
     }
 
-    const r = await httpGet('http://127.0.0.1:5000/api/health', PROBE_TIMEOUT_MS);
+    const r = await httpGet(`http://127.0.0.1:${port}/api/health`, PROBE_TIMEOUT_MS);
     if (!r.ok) {
         return { alive: false, error: `el puerto abre pero no contesta (${r.error})`, warn: '', info: null };
     }
@@ -629,7 +663,6 @@ async function rescueEmv(st) {
 
 const RESCATES = { printer: rescuePrinter, emv: rescueEmv };
 const SONDAS = { printer: probePrinter, emv: probeEmv };
-const PUERTOS = { printer: 8331, emv: 5000 };
 
 // ── Motor ───────────────────────────────────────────────────────────────────────
 
@@ -674,6 +707,10 @@ function status() {
         error: initError,
         dir,
         watchMs: WATCH_MS,
+        // Para que la barra del POS y el asistente puedan decir "esto está así porque
+        // alguien lo configuró" en vez de dejarlo como un misterio.
+        configurado: Object.values(cfg.fuentes).some((f) => f !== 'fábrica'),
+        configFile: cfg.archivo,
         services: Object.values(servicios).map(payloadDe)
     };
 }
@@ -928,6 +965,292 @@ function tick(motivo) {
     return busy;
 }
 
+// ── Configuración en caliente y descubrimiento ──────────────────────────────────
+//
+// Lo que sigue es lo que consume el asistente de la ventana de Configuración. Su
+// razón de ser: nombres como "NestorPrinter" o "NestorSantanderEMV" no son universales
+// —el instalador los escribe en instance.json y una instancia adicional los cambia—,
+// así que pedirle a quien configura la caja que los TECLEE de memoria es pedirle que
+// se equivoque. Se le enseña lo que la máquina realmente tiene y elige de una lista.
+
+/**
+ * Reaplica la configuración SIN reiniciar el cliente.
+ *
+ * El orden importa: primero los valores, luego la vigilancia, y el temporizador al
+ * final. Reprogramarlo antes de tener WATCH_MS nuevo dejaría el intervalo viejo hasta
+ * el siguiente guardado, y eso se ve exactamente como "la configuración no sirve".
+ */
+function aplicaConfig(nueva) {
+    cfg = nueva;
+    aplicaConfigValores();
+
+    // El nombre del servicio se cachea tras descubrirlo; si acaban de cambiarlo (o de
+    // cambiar de dónde se lee), la caché es justo la respuesta equivocada.
+    printerServiceCache = null;
+
+    aplicaVigilancia();
+
+    // Un servicio que se acaba de reapuntar arrastra los fallos del anterior. Contarlos
+    // como propios haría que el primer sondeo con la configuración nueva ya llegara al
+    // umbral y rescatara sin haber fallado una sola vez.
+    for (const st of Object.values(servicios)) {
+        st.strikes = 0;
+        st.attempts = 0;
+        st.nextAttemptAt = 0;
+        st.reported = false;
+    }
+
+    if (timer) clearInterval(timer);
+    timer = null;
+    if (ENABLED && !initError) {
+        timer = setInterval(() => { tick('ronda').catch(() => { }); }, WATCH_MS);
+        if (timer.unref) timer.unref();
+    }
+
+    broadcast();
+}
+
+/** Los valores sueltos, sin efectos. Lo comparten init() y aplicaConfig(). */
+function aplicaConfigValores() {
+    ENABLED = cfg.valores.enabled;
+    RESCUE_ENABLED = cfg.valores.rescue;
+    WATCH_MS = cfg.valores.watch_ms;
+    PROBE_TIMEOUT_MS = cfg.valores.probe_ms;
+    STRIKES = cfg.valores.strikes;
+    QUIET_MS = cfg.valores.quiet_ms;
+    MAX_RESCUES_PER_HOUR = cfg.valores.max_per_hour;
+    SETTLE_MS = { printer: cfg.valores.settle_printer_ms, emv: cfg.valores.settle_emv_ms };
+    PUERTOS = { printer: cfg.valores.printer_port, emv: cfg.valores.emv_port };
+    PRINTER_SERVICE_DEFAULT = cfg.valores.printer_service || 'NestorPrinter';
+    PRINTER_RESCUE_TASK = cfg.valores.printer_rescue_task;
+    PRINTER_INSTANCE_FILE = cfg.valores.printer_instance_file;
+    EMV_TASK = cfg.valores.emv_task;
+    EMV_EXE_NAME = cfg.valores.emv_exe;
+}
+
+/** La configuración efectiva, con la procedencia de cada valor y el esquema. */
+function config() {
+    return {
+        ok: true,
+        esquema: configStore.ESQUEMA,
+        valores: cfg.valores,
+        fuentes: cfg.fuentes,
+        // Qué está fijado por entorno y con qué variable. El asistente bloquea esos
+        // campos: configurar algo que no va a surtir efecto es peor que no poder.
+        env: cfg.env,
+        archivo: cfg.archivo,
+        error: cfg.error,
+        plataforma: process.platform,
+        esWindows: IS_WIN,
+        modo: status().mode
+    };
+}
+
+/** Guarda un cambio parcial y lo aplica en el acto. */
+function configure(parcial) {
+    if (!dir) return { ok: false, error: 'no hay dónde escribir la configuración (bitácora sin directorio)' };
+
+    const res = configStore.save(dir, parcial || {});
+    if (!res.ok) return res;
+
+    const antes = JSON.stringify(cfg.valores);
+    aplicaConfig(res.config);
+    if (JSON.stringify(cfg.valores) !== antes) {
+        log(`configuración actualizada desde el asistente: ${res.aplicadas.join(', ') || '(sin cambios efectivos)'}`);
+    }
+
+    // Un sondeo inmediato: quien acaba de configurar está mirando la pantalla y espera
+    // ver el resultado, no esperar hasta la siguiente ronda.
+    tick('configuración').catch(() => { });
+
+    return { ok: true, aplicadas: res.aplicadas, ignoradas: res.ignoradas, config: config() };
+}
+
+/** Vuelve a los valores de fábrica (borra el archivo). */
+function resetConfig() {
+    if (!dir) return { ok: false, error: 'no hay archivo de configuración' };
+    const res = configStore.reset(dir);
+    if (!res.ok) return res;
+    log('configuración devuelta a valores de fábrica');
+    aplicaConfig(res.config);
+    tick('configuración').catch(() => { });
+    return { ok: true, config: config() };
+}
+
+/**
+ * Servicios de Windows instalados en esta máquina.
+ *
+ * `sc query type= service state= all` con los espacios EXACTAMENTE así: sc.exe espera
+ * "clave= valor" (espacio DESPUÉS del igual, no antes), y escrito de cualquier otra
+ * forma devuelve la ayuda de uso en vez de la lista, en silencio.
+ */
+async function listWindowsServices() {
+    if (!IS_WIN) return [];
+    const r = await run(sysExe('sc.exe'), ['query', 'type=', 'service', 'state=', 'all'], 20000);
+    const salida = `${r.stdout}\n${r.stderr}`;
+
+    // Windows en español imprime NOMBRE_SERVICIO / NOMBRE_PARA_MOSTRAR. Los nombres de
+    // los CAMPOS sí se traducen (los del enum de estado no), así que se aceptan ambos.
+    const out = [];
+    let actual = null;
+    for (const linea of salida.split(/\r?\n/)) {
+        const m = /^\s*(SERVICE_NAME|NOMBRE_SERVICIO)\s*:\s*(.+?)\s*$/i.exec(linea);
+        if (m) {
+            actual = { name: m[2], display: '', state: '' };
+            out.push(actual);
+            continue;
+        }
+        if (!actual) continue;
+        const d = /^\s*(DISPLAY_NAME|NOMBRE_PARA_MOSTRAR)\s*:\s*(.+?)\s*$/i.exec(linea);
+        if (d) { actual.display = d[2]; continue; }
+        const e = /\b(STOPPED|RUNNING|START_PENDING|STOP_PENDING|PAUSED)\b/i.exec(linea);
+        if (e && !actual.state) actual.state = e[1].toUpperCase();
+    }
+    return out;
+}
+
+/**
+ * Tareas programadas. `/FO CSV /NH` porque la salida en tabla se trunca a lo ancho de
+ * la consola y parte los nombres largos justo por la mitad.
+ */
+async function listScheduledTasks() {
+    if (!IS_WIN) return [];
+    const r = await run(sysExe('schtasks.exe'), ['/Query', '/FO', 'CSV', '/NH'], 25000);
+    const out = [];
+    for (const linea of String(r.stdout || '').split(/\r?\n/)) {
+        const t = linea.trim();
+        if (!t || !t.startsWith('"')) continue;
+        // Primera columna del CSV. Puede traer comas dentro de las comillas.
+        const m = /^"((?:[^"]|"")*)"/.exec(t);
+        if (!m) continue;
+        const nombre = m[1].replace(/""/g, '"');
+        if (!nombre || nombre.toLowerCase() === 'tasknamex') continue;
+        // Se guarda sin la barra inicial: es como se teclea en `schtasks /Run /TN`.
+        out.push(nombre.replace(/^\\/, ''));
+    }
+    return [...new Set(out)];
+}
+
+/** Qué dice cada instance.json candidato (y el que se haya configurado a mano). */
+function readInstanceFiles() {
+    const candidatos = [];
+    if (PRINTER_INSTANCE_FILE) candidatos.push(PRINTER_INSTANCE_FILE);
+    candidatos.push('C:\\NestorMX\\NestorPOS\\instance.json');
+    candidatos.push('C:\\NestorMX\\NestorComplementos\\instance.json');
+
+    const out = [];
+    for (const ruta of [...new Set(candidatos)]) {
+        try {
+            const cfgJson = JSON.parse(fs.readFileSync(ruta, 'utf8'));
+            out.push({
+                ruta,
+                existe: true,
+                // "" no es un error: una instancia adicional lo deja vacío a propósito
+                // porque comparte el servicio de la principal.
+                printer_service: String(cfgJson.printer_service || '').trim(),
+                instancia: String(cfgJson.instance || cfgJson.name || '').trim()
+            });
+        } catch (e) {
+            out.push({ ruta, existe: false, printer_service: '', instancia: '', error: e && e.code === 'ENOENT' ? 'no existe' : String(e && e.message || e) });
+        }
+    }
+    return out;
+}
+
+/**
+ * Todo lo que el asistente necesita para ofrecer listas en vez de campos vacíos.
+ *
+ * Se marca lo que "parece" nuestro (nestor / printer / emv / santander) para poder
+ * enseñarlo arriba: en una máquina con 250 servicios, una lista alfabética es lo mismo
+ * que no tener lista.
+ */
+async function discover() {
+    const [servs, tareas] = await Promise.all([listWindowsServices(), listScheduledTasks()]);
+    const pinta = /nestor|printer|impres|emv|santander/i;
+
+    return {
+        ok: true,
+        esWindows: IS_WIN,
+        // En macOS/Linux esto viene vacío y el asistente lo dice, en vez de enseñar
+        // listas vacías que parecen un error.
+        servicios: servs.map((x) => ({ ...x, sugerido: pinta.test(`${x.name} ${x.display}`) })),
+        tareas: tareas.map((name) => ({ name, sugerido: pinta.test(name) })),
+        instancias: readInstanceFiles(),
+        servicioResuelto: IS_WIN ? resolvePrinterService() : ''
+    };
+}
+
+/**
+ * Prueba un destino CANDIDATO sin guardarlo.
+ *
+ * Es la mitad del valor del asistente: contestar "sí, ahí está" antes de guardar, en
+ * vez de guardar, esperar la siguiente ronda y deducirlo de un estado en la barra.
+ */
+async function probeTarget(arg) {
+    const a = arg || {};
+    const id = String(a.id || '');
+    if (id !== 'printer' && id !== 'emv') return { ok: false, error: `servicio desconocido: ${id}` };
+
+    const puerto = configStore.sanea(id === 'printer' ? 'printer_port' : 'emv_port', a.port);
+    const port = puerto || PUERTOS[id];
+
+    const sonda = id === 'printer' ? await probePrinter(port) : await probeEmv(port);
+    const out = {
+        ok: true,
+        id,
+        puerto: port,
+        contesta: sonda.alive,
+        error: sonda.error || '',
+        aviso: sonda.warn || '',
+        info: sonda.info || null,
+        pasos: []
+    };
+
+    if (!IS_WIN) {
+        out.pasos.push({ paso: 'servicios de Windows', ok: false, detalle: `no aplica en ${process.platform}` });
+        return out;
+    }
+
+    if (id === 'printer') {
+        const nombre = String(a.service || '').trim() || resolvePrinterService();
+        const st = await serviceState(nombre);
+        out.servicio = nombre;
+        out.pasos.push({
+            paso: `sc query ${nombre}`,
+            ok: st.state === 'running',
+            detalle: st.state === 'ausente' ? 'no está registrado en esta máquina (hay que reinstalar el componente)'
+                : st.state === 'sin-permiso' ? 'existe, pero este usuario no puede consultarlo'
+                    : st.state
+        });
+
+        const tarea = String(a.rescueTask || '').trim() || PRINTER_RESCUE_TASK;
+        const hay = await taskExists(tarea);
+        out.pasos.push({
+            paso: `tarea de respaldo ${tarea}`,
+            ok: hay,
+            detalle: hay ? 'registrada' : 'no existe: sin ella, una caja sin permisos no se puede rescatar'
+        });
+        return out;
+    }
+
+    const tarea = String(a.task || '').trim() || EMV_TASK;
+    const hay = await taskExists(tarea);
+    out.tarea = tarea;
+    out.pasos.push({
+        paso: `tarea ${tarea}`,
+        ok: hay,
+        detalle: hay ? 'registrada' : 'no existe: es la ÚNICA vía de rescate del EMV (hay que reinstalar el componente)'
+    });
+
+    const vivo = await emvProcessAlive();
+    out.pasos.push({
+        paso: `proceso ${EMV_EXE_NAME}`,
+        ok: vivo,
+        detalle: vivo ? 'corriendo' : 'no está corriendo'
+    });
+    return out;
+}
+
 // ── API pública ─────────────────────────────────────────────────────────────────
 
 /**
@@ -941,6 +1264,18 @@ async function ensure(id, options) {
     const st = servicios[String(id || '')];
     if (!st) return { ok: false, error: `servicio desconocido: ${id}` };
     if (!ENABLED) return { ok: false, error: 'daemon de servicios apagado', service: payloadDe(st) };
+
+    // "nunca" gana sobre el POS. El paquete dice si el NEGOCIO tiene terminal; esto
+    // dice si ESTA caja la tiene enchufada, y sólo lo sabe quien está delante. Sin
+    // este portillo, una caja sin PIN pad en un negocio que sí factura con tarjeta
+    // intentaría lanzar el microservicio en cada arranque, para siempre.
+    if (st.id === 'emv' && cfg.valores.emv_watch === 'nunca') {
+        return {
+            ok: false,
+            error: 'la terminal EMV está en "nunca" en la configuración de esta caja',
+            service: payloadDe(st)
+        };
+    }
 
     const yaEstaba = st.supervised;
     st.supervised = true;
@@ -1055,12 +1390,32 @@ function esLatido(pathname) {
  */
 function noteTraffic(url) {
     const u = String(url || '');
-    let pathname = '';
-    try { pathname = new URL(u).pathname; } catch { pathname = u; }
+
+    let pathname = u;
+    let puerto = '';
+    try {
+        const parsed = new URL(u);
+        pathname = parsed.pathname;
+        puerto = parsed.port;
+    } catch { /* una URL rara cae al camino de abajo con el texto entero */ }
+
     if (esLatido(pathname)) return;
 
-    if (u.includes(':8331')) servicios.printer.lastTrafficAt = Date.now();
-    else if (u.includes(':5000')) servicios.emv.lastTrafficAt = Date.now();
+    // Por el puerto CONFIGURADO, no por uno quemado: si esta caja corre su printer en
+    // otro puerto (una instancia adicional), buscar ":8331" no encontraría nunca su
+    // tráfico, la compuerta de silencio quedaría siempre abierta y el daemon podría
+    // reiniciar el servicio a media impresión o a media venta con tarjeta.
+    //
+    // Y por el puerto de la URL parseada, no por `includes`: ":5000" aparece también
+    // en el cuerpo de un query string, y eso contaría como uso de la terminal.
+    if (puerto) {
+        if (Number(puerto) === Number(PUERTOS.printer)) servicios.printer.lastTrafficAt = Date.now();
+        else if (Number(puerto) === Number(PUERTOS.emv)) servicios.emv.lastTrafficAt = Date.now();
+        return;
+    }
+
+    if (u.includes(`:${PUERTOS.printer}`)) servicios.printer.lastTrafficAt = Date.now();
+    else if (u.includes(`:${PUERTOS.emv}`)) servicios.emv.lastTrafficAt = Date.now();
 }
 
 function init(userDataDir, options) {
@@ -1068,16 +1423,28 @@ function init(userDataDir, options) {
     onChange = typeof opts.onChange === 'function' ? opts.onChange : null;
     report = typeof opts.report === 'function' ? opts.report : null;
 
-    if (!ENABLED) {
-        console.log('[servicios] daemon apagado (NESTOR_SERVICES=0)');
-        return status();
-    }
-
+    // El directorio va PRIMERO: la configuración vive junto a la bitácora, así que
+    // hasta no saber dónde escribe esta caja no se sabe si el daemon está encendido.
+    // Decidirlo antes (con el `cfg` de sólo-entorno que se armó al cargar el módulo)
+    // haría que apagarlo desde el asistente no surtiera efecto tras reiniciar, que es
+    // exactamente cuando tiene que surtir.
     dir = resolveDir(userDataDir);
     if (!dir) initError = 'no se encontró un directorio donde escribir la bitácora';
     abrirLog();
 
+    cfg = configStore.resolve(dir);
+    aplicaConfigValores();
+    aplicaVigilancia();
+    if (cfg.error) log(`la configuración no se pudo leer (${cfg.error}); se corre con los valores de fábrica`);
+
+    if (!ENABLED) {
+        log(`daemon apagado por configuración (${cfg.fuentes.enabled})`);
+        console.log('[servicios] daemon apagado');
+        return status();
+    }
+
     log(`daemon de servicios iniciado — modo ${status().mode}, ronda cada ${WATCH_MS / 1000} s`);
+    log(`configuración: ${cfg.archivo || '(sin archivo, valores de fábrica)'}`);
     if (IS_WIN) log(`servicio de impresión: ${resolvePrinterService()} · tarea EMV: ${EMV_TASK}`);
 
     // Primera vuelta diferida: el arranque del cliente ya trae bastante trabajo
@@ -1104,11 +1471,20 @@ module.exports = {
     init,
     shutdown,
     status,
+    config,
+    configure,
+    resetConfig,
+    discover,
+    probeTarget,
     ensure,
     release,
     repair,
     hold,
     unhold,
     noteTraffic,
+    // Los puertos vigentes. Los necesita main.js para filtrar las peticiones que
+    // observa: si el filtro se quedara con los de fábrica, la compuerta de trabajo en
+    // vuelo no vería nada en una caja con puertos propios.
+    puertos: () => ({ ...PUERTOS }),
     directory: () => dir
 };

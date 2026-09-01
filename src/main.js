@@ -1,4 +1,4 @@
-const { app, session, BrowserWindow, ipcMain, Menu, globalShortcut, dialog, shell } = require('electron');
+const { app, session, BrowserWindow, ipcMain, Menu, globalShortcut, dialog, shell, screen } = require('electron');
 const path = require('path');
 const fsp = require('fs/promises');
 const fs = require('fs');
@@ -806,11 +806,23 @@ function broadcastServices(payload) {
  *
  * Va sobre webRequest y no sobre la captura XHR (que engancha por CDP y se desengancha
  * cuando alguien abre DevTools): esto tiene que ver TODAS las peticiones, siempre.
+ *
+ * Se vuelve a llamar cada vez que se guarda la configuración de servicios: los puertos
+ * se pueden cambiar desde el asistente, y un filtro con los de fábrica no vería el
+ * tráfico de una caja con puertos propios — la compuerta quedaría abierta para siempre
+ * y el daemon podría reiniciar el servicio a media venta. Registrar otra vez reemplaza
+ * al listener anterior (webRequest sólo admite uno).
  */
 function watchServiceTraffic() {
     try {
+        const p = services.puertos();
         session.defaultSession.webRequest.onBeforeRequest(
-            { urls: ['http://127.0.0.1:8331/*', 'http://localhost:8331/*', 'http://127.0.0.1:5000/*', 'http://localhost:5000/*'] },
+            {
+                urls: [
+                    `http://127.0.0.1:${p.printer}/*`, `http://localhost:${p.printer}/*`,
+                    `http://127.0.0.1:${p.emv}/*`, `http://localhost:${p.emv}/*`
+                ]
+            },
             (details, callback) => {
                 try { services.noteTraffic(details.url); } catch { }
                 callback({});
@@ -1333,10 +1345,27 @@ function openConfigWindow() {
         return;
     }
 
+    // Alto contra la PANTALLA, no un número fijo: 700 px no caben en una caja de
+    // 1024x768 (con la barra de tareas quedan ~700 en total), y ahí la ventana nace
+    // recortada por abajo — justo donde están los botones.
+    //
+    // useContentSize: el alto pedido es el del CONTENIDO. Sin esto, en macOS la barra
+    // de título se come 28 px del área útil y el contenido se sale por abajo aunque las
+    // cuentas cuadren.
+    let dispo = { width: 1280, height: 800 };
+    try { dispo = screen.getPrimaryDisplay().workAreaSize; } catch { }
+
     configWindow = new BrowserWindow({
-        width: 680,
-        height: 700,
-        resizable: false,
+        width: Math.max(520, Math.min(680, dispo.width - 40)),
+        height: Math.max(420, Math.min(760, dispo.height - 60)),
+        useContentSize: true,
+        // Redimensionable: el contenido ya trae su propia área con scroll, pero en una
+        // pantalla chica poder estirar la ventana es la diferencia entre ver el
+        // formulario y adivinarlo.
+        resizable: true,
+        minWidth: 520,
+        minHeight: 420,
+        maximizable: true,
         closable: true,
         backgroundColor: '#ffffff',
         frame: isMac ? true : false,
@@ -1728,6 +1757,47 @@ function wireIpc() {
         const err = await shell.openPath(target);
         return { ok: !err, ruta: target, error: err || '' };
     });
+
+    // ── Asistente de configuración ──────────────────────────────────────────
+    // Lo que consume src/pages/services.wizard.html. Hasta aquí el daemon sólo se
+    // sintonizaba con variables de entorno y el cliente no lee ningún .env: cambiar
+    // el nombre del servicio de impresión de una caja pedía escritorio remoto. Ver
+    // src/services.config.js.
+    servicesHandle('nestor:services:config', () => services.config());
+    servicesHandle('nestor:services:config-save', (arg) => {
+        const r = services.configure(arg && arg.valores);
+        // Los puertos pueden haber cambiado: el filtro de tráfico se vuelve a armar con
+        // los nuevos o dejaría de ver el trabajo en vuelo (ver watchServiceTraffic).
+        watchServiceTraffic();
+        return r;
+    });
+    servicesHandle('nestor:services:config-reset', () => {
+        const r = services.resetConfig();
+        watchServiceTraffic();
+        return r;
+    });
+
+    // Listas reales de la máquina (servicios del SCM, tareas programadas,
+    // instance.json). Que el operador ELIJA en vez de teclear de memoria un nombre
+    // que además cambia entre instalaciones.
+    servicesHandle('nestor:services:discover', () => services.discover());
+
+    // Probar un destino candidato ANTES de guardarlo.
+    servicesHandle('nestor:services:probe', (arg) => services.probeTarget(arg));
+
+    // Elegir el instance.json con el diálogo del sistema. Teclear una ruta de Windows
+    // a mano en un campo de texto es la forma más fácil de configurar mal esto.
+    servicesHandle('nestor:services:pick-file', async (arg) => {
+        const win = configWindow && !configWindow.isDestroyed() ? configWindow : mainWindow;
+        const res = await dialog.showOpenDialog(win || undefined, {
+            title: (arg && arg.title) || 'Selecciona el archivo',
+            defaultPath: (arg && arg.defaultPath) || undefined,
+            properties: ['openFile'],
+            filters: [{ name: 'JSON', extensions: ['json'] }, { name: 'Todos', extensions: ['*'] }]
+        });
+        if (res.canceled || !res.filePaths || !res.filePaths.length) return { ok: false, canceled: true };
+        return { ok: true, ruta: res.filePaths[0] };
+    });
 }
 
 function exitFullscreenAndKiosk(win) {
@@ -2042,7 +2112,12 @@ app.whenReady().then(async () => {
         // local porque comparte su forma de trabajar (sondeo → reparación serializada)
         // y antes de la ventana porque el printer se vigila desde el arranque, no desde
         // que alguien entra al punto de venta. Ver src/services.watchdog.js.
-        watchServiceTraffic();
+        //
+        // init() ANTES que watchServiceTraffic(): los puertos se configuran desde el
+        // asistente y hasta init() el daemon no ha leído su archivo. Al revés, una caja
+        // con puertos propios armaría el filtro con los de fábrica y no vería NINGÚN
+        // trabajo en vuelo — la compuerta de silencio quedaría abierta para siempre y el
+        // daemon podría reiniciar el servicio a media venta con tarjeta.
         services.init(app.getPath('userData'), {
             onChange: broadcastServices,
             // El daemon sólo reporta cuando se da por vencido con un servicio: el canal
@@ -2050,6 +2125,7 @@ app.whenReady().then(async () => {
             // servidor) y deduplica por 6 h, así que no es para telemetría de rutina.
             report: (info) => posError.report(info)
         });
+        watchServiceTraffic();
 
         if (IS_DEV) {
             console.log(`[dev] frontend desde ${DEV_URL} (sin bundle, sin auto-update); API hacia ${serverOrigin}`);

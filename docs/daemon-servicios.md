@@ -3,7 +3,7 @@
 Vigila los dos microservicios de los que depende el punto de venta y los levanta
 cuando se caen, sin que nadie tenga que entrar a la caja.
 
-| Servicio | Qué es | Puerto | Cómo arranca |
+| Servicio | Qué es | Puerto (de fábrica) | Cómo arranca |
 |---|---|---|---|
 | Impresión | `nestor_printer.exe`, servicio de Windows bajo NSSM (`NestorPrinter`) | 8331 | El SCM, al iniciar el equipo |
 | Terminal EMV | `NestorSantanderEmvService.exe`, app de bandeja | 5000 | Tarea programada `NestorSantanderEMV` (ONLOGON, elevada) |
@@ -136,26 +136,99 @@ salud, los pasos intentados y cuántos rescates lleva en la hora. Una sola por e
 **Por qué no rescató** — `status()` expone `lastTrafficAt` y `holdUntil` justamente para
 eso: casi siempre la respuesta es que no se toca un servicio que se está usando.
 
-## Interruptores
+## Cómo se configura
 
-| Variable | Por omisión | Para qué |
-|---|---|---|
-| `NESTOR_SERVICES` | `1` | `0` apaga el daemon entero |
-| `NESTOR_SERVICES_RESCUE` | `1` | `0` = **modo observación**: sondea, registra y reporta, sin tocar nada |
-| `NESTOR_SERVICES_WATCH_MS` | `15000` | Cada cuánto se sondea (mínimo 5 s) |
-| `NESTOR_SERVICES_STRIKES` | `3` | Fallos seguidos antes de actuar |
-| `NESTOR_SERVICES_QUIET_MS` | `90000` | Silencio exigido antes de rescatar |
-| `NESTOR_SERVICES_MAX_HOUR` | `5` | Rescates por hora antes de rendirse |
-| `NESTOR_PRINTER_SERVICE` | de `instance.json` | Override del nombre del servicio |
-| `NESTOR_EMV_TASK` | `NestorSantanderEMV` | Override del nombre de la tarea |
-| `NESTOR_SERVICES_SETTLE_EMV_MS` | `60000` | Cuánto se espera a que el EMV conteste |
+Desde la ventana de **Configuración del cliente → Servicios de la caja → «Configurar
+servicios…»**, que abre un asistente de cinco pasos
+([`src/pages/services.wizard.html`](../src/pages/services.wizard.html)). Lo que se
+guarda vive en `config.json` **junto a la bitácora**, no en el userData: por lo mismo
+que la bitácora, tiene que sobrevivir al botón rojo de «Eliminar datos y caché». Que
+borrar el caché te devuelva una caja apuntando al servicio equivocado sería una trampa.
 
-En macOS y Linux el daemon corre siempre en observación: no hay servicios ni tareas de
-Windows que rescatar.
+El esquema —de aquí salen los valores de fábrica, el saneado y los campos del
+asistente— vive en [`src/services.config.js`](../src/services.config.js).
 
-**Conviene pilotear con `NESTOR_SERVICES_RESCUE=0`.** Desplegar rescate automático a una
-flota con un error adentro es una caída de flota, y el modo observación ya entrega lo
-más valioso: saber qué cajas están fallando y por qué.
+Antes de esto el daemon **sólo** se sintonizaba con variables de entorno, y el cliente
+no lee ningún `.env`: en la práctica una caja corría con los valores de fábrica y
+cambiar cualquier cosa —el nombre del servicio de impresión, poner una caja en
+observación— pedía entrar por escritorio remoto a tocar el entorno del usuario y
+reiniciar.
+
+### Precedencia: entorno > archivo > fábrica
+
+El entorno **gana siempre**, y esa es la decisión importante: una variable de entorno es
+la vía de emergencia (arrancar una caja rota con `NESTOR_SERVICES=0`) y la de
+desarrollo, y si el archivo pudiera pisarla dejaría de ser fiable justo cuando se
+necesita. A cambio, un campo fijado por entorno se muestra **bloqueado y con el nombre
+de la variable que lo fija** — porque el único fallo peor que no poder configurar algo
+es configurarlo y que no surta efecto sin que nadie lo diga. Guardar tampoco lo escribe:
+esas claves vuelven en `ignoradas` y el asistente las nombra en pantalla.
+
+Todo se aplica **en caliente**: `aplicaConfig()` reescribe los umbrales, reprograma el
+intervalo, invalida el nombre de servicio cacheado y borra los fallos acumulados (un
+servicio recién reapuntado no debe arrastrar los del anterior). No hace falta reiniciar
+el cliente ni la caja.
+
+### Los ajustes
+
+| Clave | Fábrica | Variable que lo fija | Para qué |
+|---|---|---|---|
+| `enabled` | `true` | `NESTOR_SERVICES` | Apagado, ni sondea |
+| `rescue` | `true` | `NESTOR_SERVICES_RESCUE` | Apagado = **modo observación** |
+| `printer_watch` | `siempre` | — | `nunca` para una caja que no imprime aquí |
+| `printer_service` | *(descubrir)* | `NESTOR_PRINTER_SERVICE` | Nombre del servicio de Windows |
+| `printer_instance_file` | *(los dos de siempre)* | — | De qué `instance.json` leerlo |
+| `printer_port` | `8331` | `NESTOR_PRINTER_PORT` | Puerto del printer |
+| `printer_rescue_task` | `NestorPrinterRescue` | `NESTOR_PRINTER_RESCUE_TASK` | Tarea elevada de respaldo |
+| `emv_watch` | `auto` | — | `auto` \| `siempre` \| `nunca` |
+| `emv_task` | `NestorSantanderEMV` | `NESTOR_EMV_TASK` | Única vía de rescate del EMV |
+| `emv_exe` | `NestorSantanderEmvService.exe` | `NESTOR_EMV_EXE` | Para ver si vive y terminarlo |
+| `emv_port` | `5000` | `NESTOR_EMV_PORT` | Puerto del EMV |
+| `watch_ms` | `15000` | `NESTOR_SERVICES_WATCH_MS` | Cada cuánto se sondea (mínimo 5 s) |
+| `probe_ms` | `2500` | `NESTOR_SERVICES_PROBE_MS` | Paciencia de cada sondeo |
+| `strikes` | `3` | `NESTOR_SERVICES_STRIKES` | Fallos seguidos antes de actuar |
+| `quiet_ms` | `90000` | `NESTOR_SERVICES_QUIET_MS` | Silencio exigido antes de rescatar |
+| `max_per_hour` | `5` | `NESTOR_SERVICES_MAX_HOUR` | Rescates por hora antes de rendirse |
+| `settle_printer_ms` | `20000` | `NESTOR_SERVICES_SETTLE_PRINTER_MS` | Espera a que el printer conteste |
+| `settle_emv_ms` | `60000` | `NESTOR_SERVICES_SETTLE_EMV_MS` | Espera a que el EMV conteste |
+
+`NESTOR_SERVICES_DIR` sigue siendo sólo de entorno: es dónde vive la bitácora, y por
+tanto dónde se busca este mismo archivo.
+
+**`emv_watch: nunca` gana sobre el POS.** El paquete dice si el *negocio* tiene
+terminal; esto dice si *esta caja* la tiene enchufada, y eso sólo lo sabe quien está
+delante. Sin ese portillo, una caja sin PIN pad en un negocio que sí cobra con tarjeta
+intentaría lanzar el microservicio en cada arranque, para siempre.
+
+### El asistente
+
+Cinco pasos: **Estado** (qué se ve ahora mismo, y el interruptor maestro) → **Impresión**
+→ **Terminal** → **Comportamiento** → **Resumen** (el diff de lo que va a cambiar).
+
+Las dos cosas que lo hacen útil, y que son la razón de que no sea un formulario plano:
+
+- **Se elige de una lista, no se teclea.** El nombre del servicio sale de `sc query type=
+  service state= all` y el de la tarea de `schtasks /Query /FO CSV /NH`, con lo que
+  *parece* nuestro (nestor/printer/emv/santander) agrupado arriba: en una máquina con 250
+  servicios, una lista alfabética es lo mismo que no tener lista. Se muestra además qué
+  dice cada `instance.json`, y el `instance.json` se puede elegir con el diálogo del
+  sistema. Teclear de memoria un nombre que además cambia entre instalaciones es la forma
+  más fácil de configurar esto mal.
+- **Se prueba antes de guardar.** El botón «Probar» sondea el puerto candidato y consulta
+  el SCM y las tareas, y contesta con un renglón por comprobación. Sin eso habría que
+  guardar, esperar la siguiente ronda y deducir el resultado del color de una pastilla.
+
+Lo que el asistente **no** hace es registrar el servicio ni la tarea: eso es cosa del
+instalador y pide elevación, y el cliente no corre elevado (ver *Dos landmines de
+despliegue*). Cuando faltan, lo dice con esas palabras en vez de intentarlo.
+
+En macOS y Linux el daemon corre siempre en observación —no hay servicios ni tareas de
+Windows que rescatar— y las listas salen vacías con esa explicación, en vez de parecer
+un error.
+
+**Conviene estrenar una caja en observación** (paso 1 → «Sólo observar y reportar»).
+Desplegar rescate automático a una flota con un error adentro es una caída de flota, y el
+modo observación ya entrega lo más valioso: saber qué cajas están fallando y por qué.
 
 ## Lo que prepara el instalador
 
@@ -193,6 +266,19 @@ UAC por su cuenta.
   frontend lo sirve el backend y el cliente se actualiza por su cuenta, así que un
   frontend nuevo sobre un cliente viejo es lo normal — y un canal inexistente hace que
   `invoke` **rechace**, no que devuelva un error manejable.
+- Ajuste nuevo → un renglón en `ESQUEMA` (`services.config.js`) **y** su control en
+  `services.wizard.html` con `data-clave="<clave>"`. `check-services-wizard.js` falla si
+  falta cualquiera de los dos; sin él, el campo queda imposible de configurar y la página
+  se dibuja igual de bien.
+- Contenido nuevo en el asistente o en la página de Configuración → va dentro de
+  `<main>` / `.contenido`, que es donde vive el scroll. El documento **no** se desplaza
+  (`body { overflow:hidden }`): si algo se cuelga fuera de esa área, en una caja táctil
+  sin rueda queda inalcanzable, y las barras van estilizadas justamente para que se
+  vean siempre — en Windows 11 una barra oculta hace que "no se puede bajar" y "no hay
+  nada más abajo" se vean igual.
+- Radio nuevo → con `name`. Sin él el grupo no se excluye, quedan dos marcados a la vez y
+  se guarda la opción que el operador **no** eligió. Es invisible a ojo y silencioso en
+  ejecución; el check lo comprueba.
 - Estado nuevo en el vocabulario → agrégalo a `stateLabel` en
   `services/client.services.js` y a la lista de `check-services-watchdog.js`, o saldrá
   como texto vacío en la barra.
