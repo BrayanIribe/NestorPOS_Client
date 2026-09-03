@@ -5,7 +5,7 @@
   "main": "src/main.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "check": "node --check src/main.js && node --check src/preload.js && node --check src/proxy.js && node --check src/xhr.capture.js && node --check src/ledger.js && node --check src/pos.error.js && node --check src/services.watchdog.js && node --check src/services.config.js && node scripts/check-config-page.js && node scripts/check-services-watchdog.js && node scripts/check-services-wizard.js",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/proxy.js && node --check src/xhr.capture.js && node --check src/ledger.js && node --check src/pos.error.js && node --check src/services.watchdog.js && node --check src/services.config.js && node --check src/services.tasks.js && node scripts/check-config-page.js && node scripts/check-services-watchdog.js && node scripts/check-services-wizard.js && node scripts/check-services-tasks.js",
     "start": "electron src/main.js",
     "dev": "NESTOR_DEV_URL=http://127.0.0.1:8081 NESTOR_SERVER=http://127.0.0.1:8180 NESTOR_FULLSCREEN=0 electron src/main.js",
     "dev:win": "set NESTOR_DEV_URL=http://127.0.0.1:8081&& set NESTOR_SERVER=http://127.0.0.1:8180&& set NESTOR_FULLSCREEN=0&& electron src/main.js",

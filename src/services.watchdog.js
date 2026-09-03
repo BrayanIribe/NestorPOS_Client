@@ -49,8 +49,13 @@ const os = require('os');
 const net = require('net');
 const path = require('path');
 const http = require('http');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const configStore = require('./services.config');
+// Diagnóstico y reparación de tareas programadas. Vive aparte porque es lo único de
+// aquí que necesita PowerShell y una elevación, y porque el asistente lo usa sin pasar
+// por el daemon. Ver su cabecera: ahí está explicado por qué `schtasks /Run`
+// devolviendo 0 no significa que haya arrancado nada.
+const tasks = require('./services.tasks');
 
 // ── Configuración ───────────────────────────────────────────────────────────────
 //
@@ -111,6 +116,13 @@ let PRINTER_RESCUE_TASK = cfg.valores.printer_rescue_task;
 let PRINTER_INSTANCE_FILE = cfg.valores.printer_instance_file;
 let EMV_TASK = cfg.valores.emv_task;
 let EMV_EXE_NAME = cfg.valores.emv_exe;
+// Ruta del ejecutable del EMV. Vacía = se descubre de la propia tarea programada, y si
+// no, de la carpeta que deja el instalador.
+let EMV_EXE_PATH = cfg.valores.emv_exe_path;
+// ¿Se puede lanzar el ejecutable DIRECTAMENTE cuando la tarea no arranca nada? Es el
+// último escalón, y el que convierte «Rescatando» para siempre en un rescate de verdad
+// en la caja cuya tarea quedó mal registrada.
+let EMV_DIRECT = cfg.valores.emv_direct_launch;
 
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
 
@@ -162,6 +174,22 @@ function nuevoEstado(id, label) {
         // Rescate
         attempts: 0,
         nextAttemptAt: 0,
+        // Hasta cuándo se le da margen a un servicio RECIÉN LANZADO para que empiece a
+        // contestar. Antes esto era un bucle con await dentro de la ronda: bloqueaba el
+        // daemon entero hasta un minuto —sin sondear el printer, sin difundir estado y
+        // con el botón de reparar de la barra colgado de la misma promesa—, de modo que
+        // la caja veía «Rescatando» congelado aunque ya se hubiera arreglado. Ahora es
+        // una marca de tiempo, y las rondas normales siguen su curso mientras arranca.
+        settleUntil: 0,
+        settleStep: '',
+        // Un fallo ESTRUCTURAL: no está la tarea, no está el ejecutable, no hay permisos.
+        // No mejora por reintentar, así que se recuerda y se deja de intentar hasta que
+        // alguien cambie algo (reparar a mano, guardar configuración, o que el servicio
+        // vuelva solo). Sin esto la caja alternaba entre «rendido» y «rescatando» cada
+        // vez que el tope por hora dejaba hueco, y desde fuera eso se ve exactamente
+        // igual que un rescate que sigue intentándolo.
+        fatal: false,
+        fatalMotivo: '',
         rescues: [],
         lastRescueAt: 0,
         lastRescueStep: '',
@@ -518,6 +546,112 @@ async function emvProcessAlive() {
     return r.stdout.toLowerCase().includes(EMV_EXE_NAME.toLowerCase());
 }
 
+let emvExeCache = '';
+
+// El ejecutable del EMV pide administrador y este cliente no corre elevado: Windows
+// devuelve ERROR_ELEVATION_REQUIRED en CreateProcess sin abrir ningún UAC. Se recuerda
+// tras el primer intento porque el manifiesto de un .exe no cambia mientras corre el
+// cliente, y reintentarlo en cada rescate sólo llena la bitácora de la misma línea. Se
+// olvida al guardar configuración o al instalar requisitos: ahí sí pudo cambiar la ruta.
+let emvDirectoNecesitaAdmin = false;
+
+/**
+ * Dónde está el ejecutable del EMV en ESTA caja.
+ *
+ * Por orden: lo que diga la configuración, lo que diga la ACCIÓN de la tarea programada
+ * —que es la fuente más fiable, porque es literalmente lo que Windows va a ejecutar— y
+ * por último la carpeta de fábrica del instalador.
+ *
+ * Leerlo de la tarea no es un lujo: cuando el componente se reinstala en otra carpeta,
+ * la tarea se actualiza y una ruta quemada aquí apuntaría al sitio de antes. Y es
+ * justamente ese desajuste el que deja la tarea devolviendo 0x2 sin decírselo a nadie.
+ */
+async function emvExePath(tareaInfo) {
+    const configurada = String(EMV_EXE_PATH || '').trim();
+    if (configurada) return configurada;
+
+    if (tareaInfo && tareaInfo.comando) {
+        emvExeCache = tareaInfo.comando;
+        return emvExeCache;
+    }
+    if (emvExeCache) return emvExeCache;
+
+    if (IS_WIN) {
+        const info = await tasks.taskInfo(EMV_TASK, {});
+        if (info.comando) {
+            emvExeCache = info.comando;
+            return emvExeCache;
+        }
+    }
+    return tasks.EMV_EXE_DEFAULT;
+}
+
+function existeArchivo(ruta) {
+    try { return !!ruta && fs.existsSync(ruta); } catch { return false; }
+}
+
+/**
+ * Espera a que APAREZCA el proceso del EMV, hasta `ms`.
+ *
+ * Es la comprobación que faltaba y que explica el atasco. `schtasks /Run` devuelve 0 en
+ * cuanto el Programador acepta la petición: no espera al proceso ni mira si llegó a
+ * arrancar. El daemon lo tomaba como éxito y se iba a esperar 60 s al puerto 5000 — y
+ * cuando la tarea había descartado el arranque en silencio (IgnoreNew, usuario sin
+ * sesión, .exe que ya no está), ahí se quedaba, intento tras intento.
+ *
+ * Mirar el PROCESO en vez del puerto separa dos preguntas que no son la misma: «¿llegó
+ * a arrancar?» se contesta en segundos, «¿ya está listo para cobrar?» tarda hasta un
+ * minuto porque el EMV hace login contra el host y detecta el puerto COM.
+ */
+async function esperarProcesoEmv(ms) {
+    const limite = Date.now() + Math.max(1000, ms || 8000);
+    while (Date.now() < limite) {
+        if (await emvProcessAlive()) return true;
+        await sleep(700);
+    }
+    return false;
+}
+
+/**
+ * Lanza el ejecutable del EMV directamente, sin pasar por el Programador.
+ *
+ * Es el último escalón. Falla si el ejecutable pide administrador y esta caja no corre
+ * elevada: Windows NO abre un UAC desde CreateProcess, simplemente devuelve
+ * ERROR_ELEVATION_REQUIRED (740). Eso no es un problema — es información, y decirlo con
+ * esas palabras es mejor que dejar la caja en «Rescatando».
+ */
+function lanzarEmvDirecto(exe) {
+    return new Promise((resolve) => {
+        let hecho = false;
+        const fin = (r) => { if (!hecho) { hecho = true; resolve(r); } };
+        try {
+            const hijo = spawn(exe, [], {
+                cwd: path.dirname(exe),
+                detached: true,
+                stdio: 'ignore',
+                // El EMV tiene ícono de bandeja: esconder su ventana lo dejaría corriendo
+                // sin que el cajero pueda verlo ni cerrarlo.
+                windowsHide: false
+            });
+            hijo.once('error', (e) => {
+                const msg = e && e.message ? e.message : String(e);
+                // 740 llega como EACCES/EPERM según la versión de libuv, y el número
+                // aparece en el texto. Se mira todo, porque distinguirlo cambia el
+                // consejo: no es «falló», es «hace falta administrador».
+                const elevacion = /740|elevat|EACCES|EPERM/i.test(msg);
+                fin({ ok: false, elevacion, error: msg });
+            });
+            hijo.once('spawn', () => {
+                try { hijo.unref(); } catch { }
+                fin({ ok: true, pid: hijo.pid, error: '' });
+            });
+        } catch (e) {
+            const msg = e && e.message ? e.message : String(e);
+            fin({ ok: false, elevacion: /740|elevat|EACCES|EPERM/i.test(msg), error: msg });
+        }
+    });
+}
+
 /** ¿Existe la tarea programada? */
 async function taskExists(nombre) {
     if (!IS_WIN) return false;
@@ -679,7 +813,24 @@ async function rescuePrinter(st) {
     //    servicio le sobra, y no pide UAC.
     if (await taskExists(PRINTER_RESCUE_TASK)) {
         const r = await run(sysExe('schtasks.exe'), ['/Run', '/TN', PRINTER_RESCUE_TASK], 20000);
-        if (r.code === 0) return { ok: true, step: `schtasks /Run ${PRINTER_RESCUE_TASK}` };
+        if (r.code === 0) {
+            // Mismo error que en el EMV, y por eso se comprueba igual: `schtasks /Run`
+            // devuelve 0 en cuanto el Programador acepta la petición. Que la tarea llegue
+            // a ejecutar el `sc start` es otra cosa, y el SCM sí lo sabe decir.
+            for (let i = 0; i < 10; i++) {
+                await sleep(1000);
+                const e = await serviceState(svc);
+                if (e.state === 'running') return { ok: true, step: `schtasks /Run ${PRINTER_RESCUE_TASK}` };
+            }
+            const info = await tasks.taskInfo(PRINTER_RESCUE_TASK, {});
+            return {
+                ok: false,
+                step: `schtasks /Run ${PRINTER_RESCUE_TASK}`,
+                error: `la tarea de respaldo aceptó el disparo y el servicio ${svc} sigue sin arrancar`
+                    + (info.problemas && info.problemas.length ? `: ${info.problemas.join('; ')}` : '')
+                    + (info.ultimoResultadoTexto ? ` (${info.ultimoResultadoTexto})` : '')
+            };
+        }
         return {
             ok: false,
             step: `schtasks /Run ${PRINTER_RESCUE_TASK}`,
@@ -692,53 +843,194 @@ async function rescuePrinter(st) {
         step: 'sin escalones',
         fatal: estado.state === 'sin-permiso',
         error: estado.state === 'sin-permiso'
-            ? `este usuario no puede controlar el servicio ${svc} y no existe la tarea ${PRINTER_RESCUE_TASK}; `
-              + 'hay que reinstalar para que el instalador conceda el permiso'
+            ? `este usuario no puede controlar el servicio ${svc} y no existe la tarea ${PRINTER_RESCUE_TASK}. `
+              + 'Configuración → Servicios de la caja → paso 5 «Requisitos» registra la tarea y concede el permiso, '
+              + 'sin reinstalar.'
             : `no se pudo arrancar ${svc}`
     };
 }
 
 /**
- * Rescate de la terminal EMV.
+ * Rescate de la terminal EMV, de menos a más invasivo.
  *
- * La única vía es la tarea programada. El exe del EMV es requireAdministrator (abre
- * HttpListener en :5000) y este cliente NO corre elevado: un CreateProcess directo
- * plantaría un UAC en la cara del cajero a media venta. `schtasks /Run` sobre una
- * tarea /RL HIGHEST lo lanza elevado y sin preguntar.
+ * ── Lo que estaba mal ───────────────────────────────────────────────────────────
+ *
+ * Había un solo escalón —`schtasks /Run`— y se daba por bueno con que devolviera 0.
+ * Ese código de salida sólo dice que el Programador ACEPTÓ la petición: no espera al
+ * proceso, no comprueba que arrancara y no dice por qué no. Cuando la tarea descartaba
+ * el arranque en silencio (MultipleInstances=IgnoreNew, que es lo que deja
+ * `schtasks /Create`; el usuario registrado sin sesión iniciada; el .exe movido por el
+ * antivirus), el daemon se iba a esperar sesenta segundos al puerto 5000, no pasaba
+ * nada, y volvía a intentarlo. Para siempre. Desde la caja: «Rescatando» fijo.
+ *
+ * Y encima mataba el proceso colgado ANTES de saber si tenía con qué relanzarlo, así
+ * que cada intento dejaba la caja peor de lo que estaba: sin terminal y sin el ícono de
+ * bandeja con el que el cajero podía arrancarla a mano.
+ *
+ * ── Lo que hace ahora ───────────────────────────────────────────────────────────
+ *
+ *   0. Averigua qué vías hay ANTES de tocar nada. Si no hay ninguna, lo dice con el
+ *      motivo concreto y se declara perdido — sin matar el proceso.
+ *   1. La tarea programada, si no tiene un problema que la inutilice. Y después
+ *      COMPRUEBA que el proceso apareciera, que es lo que faltaba.
+ *   2. El ejecutable, lanzado directamente. Sigue siendo cierto que el exe pide
+ *      administrador y que este cliente no corre elevado — pero eso hace que
+ *      CreateProcess devuelva ERROR_ELEVATION_REQUIRED, no que aparezca un UAC en la
+ *      cara del cajero. Si la caja sí es administradora, este escalón la rescata; si
+ *      no, se dice con esas palabras.
  */
 async function rescueEmv(st) {
-    if (!await taskExists(EMV_TASK)) {
+    const usuario = tasks.usuarioActual();
+    const tarea = IS_WIN
+        ? await tasks.taskInfo(EMV_TASK, { usuarioEsperado: usuario, procesoLargo: true })
+        : { existe: false, problemas: [], bloqueantes: [] };
+
+    const exe = await emvExePath(tarea);
+    const hayExe = existeArchivo(exe);
+
+    // Una tarea con un problema BLOQUEANTE no se intenta: dispararla sólo gasta el rato
+    // que la caja pasa sin poder cobrar. Un problema no bloqueante (IgnoreNew) sí se
+    // intenta, porque a veces arranca — y para eso está la comprobación del paso 1.
+    const viaTarea = tarea.existe && !(tarea.bloqueantes || []).length;
+    const viaExe = EMV_DIRECT && hayExe && !emvDirectoNecesitaAdmin;
+
+    // ── 0. ¿Hay alguna vía? ─────────────────────────────────────────────────────
+    if (!viaTarea && !viaExe) {
+        const motivos = [];
+        if (!tarea.existe) {
+            motivos.push(`no existe la tarea ${EMV_TASK} en esta caja`);
+        } else if ((tarea.bloqueantes || []).length) {
+            motivos.push(`la tarea ${EMV_TASK} no puede arrancar nada: ${tarea.bloqueantes.join('; ')}`);
+        }
+        if (!hayExe) {
+            motivos.push(`tampoco está el ejecutable en ${exe}`);
+        } else if (!EMV_DIRECT) {
+            motivos.push('y lanzar el ejecutable directamente está desactivado en la configuración de esta caja');
+        }
         return {
             ok: false,
-            step: 'schtasks /Query',
+            step: 'comprobación previa',
             fatal: true,
-            error: `no existe la tarea ${EMV_TASK} en esta caja; hay que reinstalar el componente EMV Santander`
+            // Se dice qué hacer, no sólo qué pasa. Este texto acaba en la barra del POS
+            // y en la incidencia que sube a la nube: es lo que va a leer quien atienda.
+            error: `${motivos.join('; ')}. Abre Configuración → Servicios de la caja → paso 5 `
+                + '«Requisitos» y pulsa «Revisar e instalar»: desde ahí se registra la tarea correctamente. '
+                + 'Si falta el ejecutable, hay que reinstalar el componente EMV Santander.'
         };
     }
 
-    // Si el proceso vive pero el puerto no contesta, está colgado: hay que matarlo
-    // antes. Lanzar la tarea también lo haría —el propio exe mata las instancias
-    // previas al arrancar (Program.cs)—, pero hacerlo aquí deja el motivo en la
-    // bitácora en vez de que parezca que el EMV "se reinició solo".
-    if (await emvProcessAlive()) {
-        log('[emv] el proceso vive pero :5000 no contesta; se termina antes de relanzar');
+    // Colgado: el puerto no contesta pero el proceso vive. AHORA sí se termina, porque
+    // ya sabemos que hay con qué relanzarlo.
+    const vivo = await emvProcessAlive();
+    if (vivo) {
+        log(`[emv] el proceso vive pero :${PUERTOS.emv} no contesta; se termina antes de relanzar`);
         await run(sysExe('taskkill.exe'), ['/IM', EMV_EXE_NAME, '/F'], 15000);
-        await sleep(1500);
+        // El Programador tarda en darse cuenta de que la instancia murió, y hasta que se
+        // entera una tarea en IgnoreNew descarta cada relanzamiento devolviendo 0. Segundo
+        // y medio no le bastaba.
+        await sleep(3000);
     }
 
-    const r = await run(sysExe('schtasks.exe'), ['/Run', '/TN', EMV_TASK], 20000);
-    if (r.code === 0) return { ok: true, step: `schtasks /Run ${EMV_TASK}` };
+    // ── 1. La tarea programada ──────────────────────────────────────────────────
+    if (viaTarea) {
+        const r = await run(sysExe('schtasks.exe'), ['/Run', '/TN', EMV_TASK], 20000);
+        const salida = `${r.stdout}${r.stderr}`.trim().slice(0, 300);
 
-    const salida = (r.stdout + r.stderr).trim().slice(0, 300);
-    const denegado = /denegado|denied|0x80070005/i.test(salida);
+        if (r.code === 0) {
+            // Un 0 no es un arranque: se comprueba que el proceso exista de verdad. Esto
+            // es lo que faltaba y lo que dejaba la caja en «Restableciendo…».
+            if (await esperarProcesoEmv(8000)) {
+                return { ok: true, step: `schtasks /Run ${EMV_TASK}` };
+            }
+
+            // Que no haya aparecido en ocho segundos NO prueba que no vaya a arrancar.
+            // Con la tarea bien registrada (usuario correcto, StopExisting) el
+            // Programador todavía tiene que localizar la sesión interactiva del usuario,
+            // y el antivirus escanea el ejecutable la primera vez tras registrarla. En
+            // una caja real eso tardó más de diez segundos y acabó arrancando bien.
+            log(`[emv] la tarea ${EMV_TASK} aceptó el disparo y el proceso aún no aparece`);
+
+            if (viaExe) {
+                const d = await lanzarEmvDirecto(exe);
+                if (d.ok) return { ok: true, step: `arranque directo de ${path.basename(exe)}` };
+                if (d.elevacion) {
+                    // Una vez basta para saberlo: el manifiesto del ejecutable no cambia
+                    // mientras corra este cliente. Reintentarlo en cada rescate sólo
+                    // llena la bitácora de la misma línea.
+                    emvDirectoNecesitaAdmin = true;
+                    log(`[emv] el ejecutable pide administrador y este cliente no corre elevado; `
+                        + 'no se vuelve a intentar el arranque directo. La vía es la tarea programada.');
+                } else {
+                    log(`[emv] el arranque directo no funcionó: ${d.error}`);
+                }
+            }
+
+            // La tarea ACEPTÓ el disparo. Eso es un lanzamiento, y lo que sigue es
+            // esperar — que es justo para lo que existe la ventana de arranque, y que no
+            // bloquea el daemon.
+            //
+            // Antes aquí se declaraba `fatal`, y esa era la trampa: una caja cuya tarea
+            // funcionaba (sólo que tardaba) se daba por irrecuperable para siempre y
+            // subía una incidencia. O sea, el mismo fallo de antes con otra cara — dar
+            // por bueno lo que no se ha comprobado, sólo que al revés.
+            return {
+                ok: true,
+                step: `schtasks /Run ${EMV_TASK}`,
+                lento: true
+            };
+        }
+
+        const denegado = /denegado|denied|0x80070005|acceso/i.test(salida);
+        log(`[emv] schtasks /Run falló (${r.code}): ${salida}`);
+        if (!viaExe) {
+            return {
+                ok: false,
+                step: `schtasks /Run ${EMV_TASK}`,
+                fatal: denegado,
+                error: denegado
+                    ? `este usuario no tiene permiso para disparar la tarea ${EMV_TASK}. `
+                      + 'Configuración → Servicios de la caja → paso 5 «Requisitos» se lo concede.'
+                    : `la tarea no arrancó (${r.code}): ${salida}`
+            };
+        }
+    }
+
+    // ── 2. El ejecutable, directo ───────────────────────────────────────────────
+    // Sólo se llega aquí cuando la tarea NO era una vía (no existe, o tiene un problema
+    // que la inutiliza). Si la tarea aceptó el disparo, arriba ya se decidió.
+    if (viaExe) {
+        log(`[emv] se lanza el ejecutable directamente: ${exe}`);
+        const r = await lanzarEmvDirecto(exe);
+        if (r.ok) return { ok: true, step: `arranque directo de ${path.basename(exe)}` };
+
+        if (r.elevacion) emvDirectoNecesitaAdmin = true;
+
+        const admin = await tasks.esAdministrador();
+        const porTarea = tarea.existe
+            ? `La tarea ${EMV_TASK} no sirve (${(tarea.bloqueantes || []).join('; ') || 'sin diagnóstico'}). `
+            : `No existe la tarea ${EMV_TASK}. `;
+
+        return {
+            ok: false,
+            step: `arranque directo de ${path.basename(exe)}`,
+            fatal: true,
+            error: r.elevacion
+                ? `${porTarea}Y el ejecutable pide permisos de administrador, que este cliente no tiene`
+                  + `${admin ? '' : ` (${usuario || 'este usuario'} tampoco es administrador de la máquina)`}. `
+                  + 'La vía tiene que ser la tarea programada: Configuración → Servicios de la caja → '
+                  + 'paso 5 «Requisitos» la registra bien.'
+                : `${porTarea}Y no se pudo lanzar ${exe}: ${r.error}`
+        };
+    }
+
     return {
         ok: false,
-        step: `schtasks /Run ${EMV_TASK}`,
-        fatal: denegado,
-        error: denegado
-            ? `este usuario no tiene permiso para disparar la tarea ${EMV_TASK}. `
-              + 'Reinstala el componente EMV (el instalador concede el permiso) o ejecútalo una vez como administrador.'
-            : `la tarea no arrancó (${r.code}): ${salida}`
+        step: 'sin escalones',
+        fatal: true,
+        error: emvDirectoNecesitaAdmin
+            ? `la tarea ${EMV_TASK} no puede arrancar la terminal y el ejecutable pide administrador. `
+              + 'Configuración → Servicios de la caja → paso 5 «Requisitos» vuelve a registrar la tarea.'
+            : 'no quedó ninguna vía de rescate para la terminal'
     };
 }
 
@@ -766,6 +1058,13 @@ function payloadDe(st) {
         rescuesLastHour: st.rescues.length,
         attempts: st.attempts,
         nextAttemptAt: st.nextAttemptAt,
+        // Hasta cuándo se le está dando margen a un arranque en curso. Es la diferencia
+        // entre «se está levantando ahora mismo» y «lleva media hora diciendo lo mismo»,
+        // que desde la barra del POS se veían idénticas.
+        settleUntil: st.settleUntil,
+        // El rescate no es posible en esta caja y ya se sabe por qué (`detail` lo dice).
+        // No va a haber más intentos hasta que alguien cambie algo.
+        fatal: st.fatal,
         // Las dos compuertas, visibles. Sin esto, "el daemon no hizo nada" es
         // indistinguible de "el daemon está roto", y la respuesta suele ser la primera:
         // no se toca un servicio que se está usando.
@@ -945,19 +1244,52 @@ async function ronda(st) {
     if (sonda.alive) {
         const veniaMal = st.state !== 'ok' && st.state !== 'desconocido';
         if (veniaMal) {
-            log(`[${st.id}] restablecido tras ${st.attempts} intento(s) de rescate`);
+            const como = st.settleStep ? ` con ${st.settleStep}` : '';
+            log(`[${st.id}] restablecido${como} tras ${st.attempts} intento(s) de rescate`);
         }
         st.state = 'ok';
-        st.detail = st.warn || 'atendiendo';
+        st.detail = st.warn || (st.settleStep ? `restablecido con ${st.settleStep}` : 'atendiendo');
         st.strikes = 0;
         st.lastOkAt = ahora;
         st.lastError = '';
         st.attempts = 0;
         st.nextAttemptAt = 0;
+        st.settleUntil = 0;
+        st.settleStep = '';
         st.reported = false;
+        st.fatal = false;
+        st.fatalMotivo = '';
         st.lastFailAt = 0;
         st.lastFailError = '';
         return;
+    }
+
+    // ── Arrancando ──────────────────────────────────────────────────────────────
+    //
+    // Se acaba de lanzar y todavía está dentro de su margen. NO cuenta como fallo nuevo
+    // ni dispara otro rescate: el EMV tarda de verdad —login contra el host de Santander
+    // y detección del puerto COM— y pedir otro rescate encima mata el proceso que acaba
+    // de nacer.
+    //
+    // Esto era un bucle con await dentro de la propia ronda. Bloqueaba el daemon entero
+    // hasta un minuto: el printer no se sondeaba, no se difundía nada y el botón de
+    // reparar de la barra se quedaba esperando la misma promesa. Ahora es una marca de
+    // tiempo, y cada ronda —cada 3 s— vuelve por aquí, actualiza el detalle y lo difunde.
+    if (st.settleUntil > ahora) {
+        const quedan = Math.round((st.settleUntil - ahora) / 1000);
+        st.state = 'rescatando';
+        st.detail = `arrancando con ${st.settleStep}: ${quedan} s más antes de darlo por fallido`;
+        return;
+    }
+    if (st.settleUntil) {
+        // Se agotó el margen sin que contestara. El intento se da por fallido AQUÍ, no
+        // dentro del rescate, y a partir de ahora vuelven a contar las reglas normales.
+        st.settleUntil = 0;
+        st.nextAttemptAt = ahora + BACKOFF_MS[Math.min(Math.max(st.attempts - 1, 0), BACKOFF_MS.length - 1)];
+        st.lastRescueError = `se lanzó ${st.settleStep} pero el servicio no contestó en `
+            + `${Math.round(SETTLE_MS[st.id] / 1000)} s`;
+        log(`[${st.id}] ${st.lastRescueError}`);
+        st.settleStep = '';
     }
 
     // ── No contesta ─────────────────────────────────────────────────────────────
@@ -989,18 +1321,37 @@ async function ronda(st) {
         return;
     }
 
-    const espera = motivoParaEsperar(st, ahora);
-    if (espera) {
-        // Ya se confirmaron los STRIKES fallos: el servicio está abajo y se sabe. Que
-        // estemos esperando no lo vuelve una sospecha — si ya hubo intentos es un
-        // rescate en curso, y si no, está caído y esperando su turno.
-        st.state = st.attempts > 0 ? 'rescatando' : 'caido';
-        st.detail = `${st.lastError} — en espera: ${espera}`;
+    // ── Ya se sabe que no hay nada que hacer ────────────────────────────────────
+    //
+    // Un fallo estructural —no está la tarea, no está el ejecutable, no hay permisos— no
+    // mejora por reintentar. Antes se declaraba `rendido` una vez y luego el tope por
+    // hora, que es una ventana DESLIZANTE, dejaba hueco al cabo de un rato y la caja
+    // volvía a «rescatando»: alternaba entre los dos estados para siempre, gastando
+    // intentos contra una tarea que no existe y enseñando «Rescatando» a quien mirara.
+    // Se recuerda, y se sale de aquí sólo cuando alguien cambia algo (reparar, guardar
+    // configuración) o cuando el servicio vuelve solo.
+    if (st.fatal) {
+        st.state = 'rendido';
+        st.detail = st.fatalMotivo || st.detail || 'el rescate no es posible en esta caja';
+        await reportarRendicion(st);
         return;
     }
 
     podarRescates(st);
-    if (st.rescues.length >= MAX_RESCUES_PER_HOUR) {
+    const agotado = st.rescues.length >= MAX_RESCUES_PER_HOUR;
+
+    const espera = motivoParaEsperar(st, ahora);
+    if (espera) {
+        // Ya se confirmaron los STRIKES fallos: el servicio está abajo y se sabe. Que
+        // estemos esperando NO es rescatar — antes esto ponía «rescatando» mientras el
+        // daemon no hacía absolutamente nada durante cinco minutos de backoff, que es
+        // media explicación de por qué la caja parecía atascada en ese estado.
+        st.state = agotado ? 'rendido' : 'caido';
+        st.detail = `${st.lastError} — en espera: ${espera}`;
+        return;
+    }
+
+    if (agotado) {
         st.state = 'rendido';
         st.detail = `${st.rescues.length} rescates en la última hora sin que se sostenga. `
             + 'Esto ya no se arregla reiniciando: hay que revisar la caja.';
@@ -1033,50 +1384,26 @@ async function ronda(st) {
     if (!res.ok) {
         log(`[${st.id}] el rescate falló en "${res.step}": ${res.error}`);
         if (res.fatal) {
-            // Un fallo estructural (no está el servicio, no está la tarea, no hay
-            // permisos) no mejora por reintentar: se declara perdido de una vez y se
-            // reporta, en vez de gastar la hora entera de intentos.
+            st.fatal = true;
+            st.fatalMotivo = res.error || 'el rescate no es posible en esta caja';
             st.state = 'rendido';
-            st.detail = res.error || 'el rescate no es posible en esta caja';
+            st.detail = st.fatalMotivo;
             await reportarRendicion(st);
             return;
         }
         st.nextAttemptAt = ahora + BACKOFF_MS[Math.min(st.attempts - 1, BACKOFF_MS.length - 1)];
         st.detail = `el rescate falló: ${res.error}`;
+        st.state = 'caido';
         return;
     }
 
+    // Lanzado. El margen de arranque se lleva por marca de tiempo y lo vigilan las
+    // rondas siguientes (ver «Arrancando», arriba): así el daemon sigue sondeando el
+    // otro servicio, difunde el estado cada 3 s y no deja colgado el botón de reparar.
+    st.settleUntil = Date.now() + SETTLE_MS[st.id];
+    st.settleStep = res.step || 'el rescate';
+    st.detail = `arrancando con ${st.settleStep}: hasta ${Math.round(SETTLE_MS[st.id] / 1000)} s`;
     log(`[${st.id}] rescate lanzado (${res.step}); esperando a que conteste`);
-
-    // Esperar a que arranque de verdad. El EMV tarda: login contra el host y detección
-    // de puertos COM. Declararlo fallido a los 5 s sería pedir otro rescate encima del
-    // que está arrancando — y en el EMV eso mata el proceso que acaba de nacer.
-    const limite = Date.now() + SETTLE_MS[st.id];
-    while (Date.now() < limite) {
-        // Cada segundo, no cada dos: esto corre mientras la caja está sin imprimir, y
-        // es tiempo que el cajero pasa mirando la pantalla.
-        await sleep(1000);
-        let s;
-        try { s = await SONDAS[st.id](); } catch { s = { alive: false }; }
-        if (s.alive) {
-            st.state = 'ok';
-            st.warn = s.warn || '';
-            st.info = s.info || st.info;
-            st.detail = st.warn || `restablecido con ${res.step}`;
-            st.strikes = 0;
-            st.lastOkAt = Date.now();
-            st.lastError = '';
-            st.attempts = 0;
-            st.nextAttemptAt = 0;
-            st.reported = false;
-            log(`[${st.id}] restablecido con ${res.step}`);
-            return;
-        }
-    }
-
-    st.nextAttemptAt = Date.now() + BACKOFF_MS[Math.min(st.attempts - 1, BACKOFF_MS.length - 1)];
-    st.detail = `se lanzó ${res.step} pero el servicio no contestó en ${Math.round(SETTLE_MS[st.id] / 1000)} s`;
-    log(`[${st.id}] ${st.detail}`);
 }
 
 /**
@@ -1136,6 +1463,13 @@ function aplicaConfig(nueva) {
         st.attempts = 0;
         st.nextAttemptAt = 0;
         st.reported = false;
+        // Guardar configuración es exactamente lo que hace alguien DESPUÉS de leer por
+        // qué el rescate era imposible. Seguir dando la caja por perdida con la razón
+        // vieja convertiría el arreglo en «no sirvió de nada».
+        st.fatal = false;
+        st.fatalMotivo = '';
+        st.settleUntil = 0;
+        st.settleStep = '';
     }
 
     if (timer) clearInterval(timer);
@@ -1164,6 +1498,10 @@ function aplicaConfigValores() {
     PRINTER_INSTANCE_FILE = cfg.valores.printer_instance_file;
     EMV_TASK = cfg.valores.emv_task;
     EMV_EXE_NAME = cfg.valores.emv_exe;
+    EMV_EXE_PATH = cfg.valores.emv_exe_path;
+    EMV_DIRECT = cfg.valores.emv_direct_launch;
+    emvExeCache = '';
+    emvDirectoNecesitaAdmin = false;
 }
 
 /** La configuración efectiva, con la procedencia de cada valor y el esquema. */
@@ -1393,12 +1731,34 @@ async function probeTarget(arg) {
     }
 
     const tarea = String(a.task || '').trim() || EMV_TASK;
-    const hay = await taskExists(tarea);
     out.tarea = tarea;
+
+    // Antes esto sólo decía «registrada» o «no existe», y ninguna de las dos contestaba
+    // la pregunta que importa: si esa tarea VA A ARRANCAR algo. Una tarea registrada a
+    // nombre de quien instaló, o en IgnoreNew, o apuntando a un .exe que el antivirus se
+    // llevó, sale «registrada» y no rescata nunca.
+    const info = await tasks.taskInfo(tarea, {
+        usuarioEsperado: tasks.usuarioActual(),
+        procesoLargo: true
+    });
     out.pasos.push({
         paso: `tarea ${tarea}`,
-        ok: hay,
-        detalle: hay ? 'registrada' : 'no existe: es la ÚNICA vía de rescate del EMV (hay que reinstalar el componente)'
+        ok: info.existe && !(info.problemas || []).length,
+        detalle: !info.existe
+            ? (info.error || 'no existe en esta caja')
+            : ((info.problemas || []).length
+                ? info.problemas.join(' · ')
+                : `a nombre de ${info.usuario || '(sin usuario)'}${info.elevada ? ', elevada' : ''}`
+                  + `${info.ultimoResultadoTexto ? ' — ' + info.ultimoResultadoTexto : ''}`)
+    });
+
+    const exe = await emvExePath(info);
+    const hayExe = existeArchivo(exe);
+    out.emvExe = exe;
+    out.pasos.push({
+        paso: 'ejecutable de la terminal',
+        ok: hayExe,
+        detalle: hayExe ? exe : `${exe} — no está: hay que reinstalar el componente EMV Santander`
     });
 
     const vivo = await emvProcessAlive();
@@ -1408,6 +1768,65 @@ async function probeTarget(arg) {
         detalle: vivo ? 'corriendo' : 'no está corriendo'
     });
     return out;
+}
+
+/**
+ * ¿Está esta caja en condiciones de rescatarse sola?
+ *
+ * Lo consume el paso «Requisitos» del asistente. Vale la pena que sea una pregunta
+ * aparte de `probeTarget`: aquella comprueba un destino que se está CONFIGURANDO, y
+ * esta comprueba la caja tal como está — que es lo que hay que saber antes de decidir
+ * si hace falta pulsar el botón que instala lo que falte.
+ */
+async function requirements() {
+    return tasks.requirements({
+        emvTask: EMV_TASK,
+        emvExePath: await emvExePath(null),
+        printerRescueTask: PRINTER_RESCUE_TASK,
+        printerService: IS_WIN ? resolvePrinterService() : '',
+        vigilaEmv: cfg.valores.emv_watch !== 'nunca'
+    });
+}
+
+/**
+ * Instala/repara lo que falte. ABRE UN AVISO DE UAC.
+ *
+ * Sólo se llama desde el botón del asistente, con una persona delante: nunca desde el
+ * daemon. Un UAC apareciendo solo a media venta sería peor que el fallo que viene a
+ * arreglar — y además nadie estaría ahí para aceptarlo.
+ */
+async function installTasks(que) {
+    const r = await tasks.installMissing({
+        que,
+        emvTask: EMV_TASK,
+        emvExePath: await emvExePath(null),
+        printerRescueTask: PRINTER_RESCUE_TASK,
+        printerService: IS_WIN ? resolvePrinterService() : ''
+    });
+
+    for (const paso of (r.pasos || [])) {
+        log(`[requisitos] ${paso.clave}: ${paso.ok ? 'ok' : 'FALLÓ'} — ${paso.detalle}`);
+    }
+    if (r.cancelado) log('[requisitos] la instalación se canceló en el aviso de Windows');
+
+    if (r.ok) {
+        // Lo que acaba de cambiar es justo lo que hacía imposible el rescate. Si no se
+        // limpiara, la caja seguiría dándose por perdida con el motivo de antes y el
+        // botón parecería no haber servido de nada.
+        for (const st of Object.values(servicios)) {
+            st.fatal = false;
+            st.fatalMotivo = '';
+            st.attempts = 0;
+            st.nextAttemptAt = 0;
+            st.rescues = [];
+            st.reported = false;
+        }
+        emvExeCache = '';
+        emvDirectoNecesitaAdmin = false;
+        tick('requisitos instalados').catch(() => { });
+    }
+
+    return { ...r, requisitos: await requirements() };
 }
 
 // ── API pública ─────────────────────────────────────────────────────────────────
@@ -1446,6 +1865,10 @@ async function ensure(id, options) {
         st.attempts = 0;
         st.nextAttemptAt = 0;
         st.reported = false;
+        st.fatal = false;
+        st.fatalMotivo = '';
+        st.settleUntil = 0;
+        st.settleStep = '';
         broadcast();
     }
 
@@ -1490,6 +1913,13 @@ async function repair(id) {
     st.nextAttemptAt = 0;
     st.strikes = Math.max(st.strikes, STRIKES - 1);
     st.reported = false;
+    // Quien pulsa el botón acaba de leer POR QUÉ no se podía rescatar, y lo más probable
+    // es que venga de arreglarlo. Volver a darlo por imposible sin ni siquiera intentarlo
+    // es lo que hace que un botón parezca roto.
+    st.fatal = false;
+    st.fatalMotivo = '';
+    st.settleUntil = 0;
+    st.settleStep = '';
     await tick(`repair:${st.id}`);
     return { ok: st.state === 'ok', service: payloadDe(st) };
 }
@@ -1684,6 +2114,12 @@ module.exports = {
     resetConfig,
     discover,
     probeTarget,
+    // Qué le falta a esta caja para poder rescatarse sola, y el botón que lo instala.
+    // Ver services.tasks.js: la mitad de lo que docs/daemon-servicios.md daba por hecho
+    // que hacía el instalador nunca se escribió, y las cajas ya instaladas no se
+    // reinstalan.
+    requirements,
+    installTasks,
     // Expuestas para scripts/check-services-watchdog.js: son las dos decisiones que
     // impidieron el incidente del Spooler, y las dos son puras.
     pareceServicioNuestro,

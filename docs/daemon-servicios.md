@@ -121,12 +121,91 @@ deja vacío porque comparte el de la principal.
 4. Sin permiso → `schtasks /Run /TN NestorPrinterRescue` (tarea elevada como SYSTEM que
    registra el instalador).
 
-**Terminal EMV** — la única vía es la tarea programada: el exe es
-`requireAdministrator` y el cliente **no corre elevado**, así que un `CreateProcess`
-directo plantaría un UAC en la cara del cajero. Se mata el proceso colgado si lo hay
-(para dejarlo dicho en la bitácora, no porque haga falta) y se dispara
-`schtasks /Run /TN NestorSantanderEMV`. Después se espera **hasta 60 s** a que
-conteste: el arranque hace login contra el host de Santander y detecta el puerto COM.
+**Terminal EMV** — no es un servicio de Windows: es un ejecutable con ícono de
+bandeja.
+
+0. **Se decide antes de tocar nada.** Se lee la definición de la tarea y su último
+   resultado, y se comprueba que el ejecutable esté. Si no hay ninguna vía, se dice con
+   el motivo concreto y se declara `fatal` — **sin matar el proceso**. Antes se mataba
+   primero y se descubría después que no había con qué relanzarlo: cada intento dejaba
+   la caja sin terminal *y* sin el ícono de bandeja con el que el cajero podía
+   arrancarla a mano.
+1. Si el proceso vive pero el puerto no contesta (colgado), `taskkill /F` y **3 s** de
+   margen para que el Programador reapareje la instancia.
+2. `schtasks /Run /TN NestorSantanderEMV` — **y después se comprueba que el proceso
+   aparezca** (hasta 10 s). Ver abajo por qué esto es la mitad del arreglo.
+3. Arranque directo del ejecutable (`emv_direct_launch`, encendido de fábrica). Falla
+   con `ERROR_ELEVATION_REQUIRED` si el exe pide administrador y la caja no lo es —
+   Windows no abre un UAC desde `CreateProcess`, devuelve el error. Eso se dice con
+   esas palabras en vez de dejar la caja en «Restableciendo…».
+
+### Por qué `schtasks /Run` devolviendo 0 no significa nada
+
+Es la causa del atasco que se veía en las cajas: la terminal se quedaba en
+«Restableciendo…» indefinidamente. `schtasks /Run` devuelve 0 en cuanto el Programador
+**acepta** la petición — no espera al proceso, no comprueba que arrancara y no dice por
+qué no. El daemon lo tomaba como éxito, se iba a esperar 60 s al puerto 5000, no pasaba
+nada, y volvía a intentarlo.
+
+Las cuatro formas de que devuelva 0 sin arrancar nada:
+
+| Causa | Cómo se ve | Qué la arregla |
+|---|---|---|
+| `MultipleInstancesPolicy = IgnoreNew` | Estado `Queued`/`Running` | Registrarla con `StopExisting` |
+| Registrada a nombre de quien instaló (`schtasks /Create` sin `/RU`) | Último resultado `0x41303` | Registrarla a nombre de quien usa la caja |
+| La acción apunta a un .exe que ya no está | Último resultado `0x2` | Reinstalar el componente |
+| La tarea está deshabilitada | — | Habilitarla |
+
+Sólo las dos últimas bloquean. Las otras se intentan igual, porque a veces arrancan y la
+única prueba que vale es si aparece el proceso.
+
+Ninguna se distingue por el código de salida; todas se distinguen leyendo la
+**definición** de la tarea (`schtasks /Query /XML`, que no está traducido) y su
+**último resultado** (`Get-ScheduledTaskInfo`, que devuelve un número y no texto en
+español). Eso es `src/services.tasks.js`, y es lo que convierte «Rescatando» en una
+frase que se puede leer en la caja.
+
+El diagnóstico separa **problemas** de **bloqueantes**: `IgnoreNew` es un problema pero
+no bloquea —a veces arranca, según si el Programador ya reaparejó la instancia
+anterior—, así que se intenta igual y se comprueba el resultado. Una tarea deshabilitada
+o apuntando a un .exe que no está no arranca nunca, y probar sólo gasta el rato que la
+caja pasa sin cobrar.
+
+> **`0x41303` no siempre significa avería.** Una tarea **recién creada y nunca
+> disparada** trae ese mismo último resultado y una fecha centinela
+> (`30/11/1999`) — que es el estado normal de la tarea de respaldo, que no tiene
+> disparador y existe sólo para que alguien la llame. Al contarlo como problema, el paso
+> «Requisitos» instalaba la tarea correctamente y **seguía diciendo que faltaba**: el
+> operador volvía a pulsar el botón, aceptaba otro UAC y no cambiaba nada. Se distinguen
+> por la fecha (`nuncaEjecutada`).
+
+> **Que el proceso no aparezca a los ocho segundos tampoco es prueba.** Con la tarea
+> bien registrada, el Programador todavía tiene que localizar la sesión interactiva del
+> usuario, y el antivirus escanea el ejecutable la primera vez tras registrarla; en una
+> caja real eso tardó más de diez segundos y acabó arrancando bien. Por eso, cuando la
+> tarea **acepta** el disparo, se le entrega la ventana de arranque (`settleUntil`) en
+> vez de declarar `fatal`. Declararlo era el mismo error de antes con otra cara — dar
+> por bueno lo que no se ha comprobado, sólo que al revés: una caja perfectamente
+> rescatable se daba por perdida para siempre y subía una incidencia.
+
+> **Cuidado con comparar el usuario.** El XML trae el `UserId` de una cuenta normal
+> como SID crudo (`S-1-5-21-…-1002`), no como `EQUIPO\usuario`. Comparar eso contra un
+> nombre da distinto siempre, y declararía bloqueante —o sea, no intentable— una tarea
+> perfectamente registrada. Se compara por SID; por nombre sólo cuando el XML trae un
+> nombre. Cuando no se puede comparar con certeza **no se acusa**: apagar la vía
+> principal de rescate por una sospecha es peor que no comprobar nada.
+
+### La espera de arranque no bloquea
+
+Tras lanzar un servicio se le da margen (`settle_printer_ms` / `settle_emv_ms`) para
+que empiece a contestar. Eso era un bucle con `await` dentro de la ronda: bloqueaba el
+daemon **entero** hasta un minuto —sin sondear el printer, sin difundir nada y con el
+botón de reparar de la barra colgado de la misma promesa—, así que la caja veía
+«Restableciendo…» congelado aunque ya se hubiera arreglado.
+
+Ahora es una marca de tiempo (`settleUntil`) y las rondas normales siguen su curso:
+cada 3 s se vuelve a sondear, se actualiza el detalle («arrancando con X: 42 s más») y
+se difunde.
 
 ## Encendido desde el POS
 
@@ -216,7 +295,7 @@ el cliente ni la caja.
 | `printer_service` | *(descubrir)* | `NESTOR_PRINTER_SERVICE` | Nombre del servicio de Windows |
 | `printer_instance_file` | *(los dos de siempre)* | — | De qué `instance.json` leerlo |
 | `printer_port` | `8331` | `NESTOR_PRINTER_PORT` | Puerto del printer |
-| `printer_rescue_task` | `NestorPrinterRescue` | `NESTOR_PRINTER_RESCUE_TASK` | Tarea elevada de respaldo |
+| `printer_rescue_task` | `NestorPrinterRescue` | `NESTOR_PRINTER_RESCUE_TASK` | Tarea elevada de respaldo (último escalón) |
 | `emv_watch` | `auto` | — | `auto` \| `siempre` \| `nunca` |
 | `emv_task` | `NestorSantanderEMV` | `NESTOR_EMV_TASK` | Única vía de rescate del EMV |
 | `emv_exe` | `NestorSantanderEmvService.exe` | `NESTOR_EMV_EXE` | Para ver si vive y terminarlo |
@@ -239,8 +318,9 @@ intentaría lanzar el microservicio en cada arranque, para siempre.
 
 ### El asistente
 
-Cinco pasos: **Estado** (qué se ve ahora mismo, y el interruptor maestro) → **Impresión**
-→ **Terminal** → **Comportamiento** → **Resumen** (el diff de lo que va a cambiar).
+Seis pasos: **Estado** (qué se ve ahora mismo, y el interruptor maestro) → **Impresión**
+→ **Terminal** → **Comportamiento** → **Requisitos** → **Resumen** (el diff de lo que va
+a cambiar).
 
 Las dos cosas que lo hacen útil, y que son la razón de que no sea un formulario plano:
 
@@ -254,6 +334,12 @@ Las dos cosas que lo hacen útil, y que son la razón de que no sea un formulari
 - **Se prueba antes de guardar.** El botón «Probar» sondea el puerto candidato y consulta
   el SCM y las tareas, y contesta con un renglón por comprobación. Sin eso habría que
   guardar, esperar la siguiente ronda y deducir el resultado del color de una pastilla.
+  Para una tarea programada ya no dice «registrada» a secas —eso no contesta la pregunta
+  que importa, que es si **va a arrancar algo**— sino su usuario, si está elevada y qué
+  pasó la última vez que se disparó.
+- **El paso «Requisitos» arregla la caja, no la configura.** Los otros cuatro pasos
+  apuntan nombres; éste enseña el estado de la máquina y lo instala si falta. Ver
+  [Requisitos de la caja](#requisitos-de-la-caja).
 
 ### Nunca se toca un servicio ajeno
 
@@ -292,35 +378,58 @@ un error.
 Desplegar rescate automático a una flota con un error adentro es una caída de flota, y el
 modo observación ya entrega lo más valioso: saber qué cajas están fallando y por qué.
 
-## Lo que prepara el instalador
+## Requisitos de la caja
 
-En `NestorPOS_Setup.iss`, al registrar el servicio de impresión:
+Para que el rescate funcione hacen falta tres cosas registradas en Windows. **Durante
+mucho tiempo ninguna de las tres estuvo**: este documento las describía como si el
+instalador las dejara, y `NestorPrinterRescue` no aparecía en `NestorPOS_Setup.iss`
+por ningún lado. De ahí que el campo «Tarea de respaldo» del asistente no significara
+nada, y que el rescate de la terminal aceptara el disparo sin arrancar nunca.
+
+| Requisito | Para qué | Qué pasa sin él |
+|---|---|---|
+| ACE de control en el servicio de impresión para `IU` | Que el cliente, sin elevar, pueda `sc start` | El primer escalón falla y todo depende de la tarea |
+| Tarea `NestorPrinterRescue` (SYSTEM, sin disparador) | Último escalón cuando lo anterior no se puede | No hay tercer escalón: la caja se rinde |
+| SDDL `(A;;FRFX;;;AU)` en las dos tareas | Que un cajero **no administrador** pueda dispararlas | `schtasks /Run` → «Acceso denegado» |
+
+Y la tarea del EMV tiene además que estar **a nombre de quien usa la caja** y con
+`MultipleInstances = StopExisting`.
+
+### Quién las instala
+
+**El instalador** (`NestorPOS_Setup.iss`), desde ahora:
 
 - `HardenPrinterService` — NSSM reinicia el proceso al terminar (`AppExit Restart`,
   `AppThrottle 5000`), el SCM reinicia el servicio si muere el propio NSSM
-  (`sc failure` + `failureflag`), y la salida va a `logs\printer.log` con rotación.
-- `GrantServiceControlToInteractiveUsers` — añade un ACE a la DACL del servicio para que
-  el usuario de la caja pueda consultarlo, pararlo y arrancarlo. Es lo que permite que
-  el cliente, sin elevar, haga `sc start`. Lee el SDDL vigente con `sc sdshow` y le
-  agrega el ACE; **no** lo escribe desde cero, que dejaría al SCM sin sus permisos.
-- `RegisterPrinterRescueTask` — la tarea de respaldo `NestorPrinterRescue`, como SYSTEM,
-  con el SDDL que permite dispararla a usuarios autenticados.
+  (`sc failure` + `failureflag`), y la salida va a `logsprinter.log` con rotación.
+- `GrantServiceControlToInteractiveUsers` — lee el SDDL vigente con `sc sdshow` y le
+  **agrega** el ACE; no lo escribe desde cero, que dejaría al SCM sin sus permisos.
+- `RegisterPrinterRescueTask` y la tarea del EMV — por la **API COM** del Programador
+  (`Schedule.Service`), no con `schtasks`: es la única forma de fijar el descriptor de
+  seguridad y `MultipleInstances`. `schtasks` no tiene opción para ninguna de las dos,
+  y por eso nunca estuvieron.
 
-Y en el componente EMV, el mismo SDDL sobre `NestorSantanderEMV` para que el cliente
-pueda invocarla.
+**Y el propio cliente**, en Configuración → Servicios de la caja → **paso 5,
+«Requisitos»**. Porque arreglarlo sólo en el instalador no sirve de nada: nadie
+reinstala una caja que «casi» funciona. El paso enseña qué falta y qué no se puede
+arreglar desde ahí (si falta el .exe del EMV, hay que reinstalar el componente), y el
+botón abre **un** aviso de UAC, **una** vez, y sólo con una persona delante.
 
-## Dos landmines de despliegue
+> El daemon **nunca** lo llama solo. Un UAC apareciendo a media venta sería peor que el
+> fallo que viene a arreglar, y además no habría nadie para aceptarlo.
 
-**La tarea del EMV se registra bajo la cuenta que instaló** (`schtasks /Create` sin
-`/RU`). Si la caja inicia sesión con otro usuario, ni el disparador ONLOGON se dispara
-para él ni el ícono de bandeja aparecerá en su sesión. **Instala con la cuenta con la
-que se trabaja en la caja.**
+El script elevado se escribe en un directorio temporal del **propio usuario**
+(`mkdtemp`), no junto a la bitácora: `ProgramData` lo puede escribir cualquier usuario
+de la máquina, y dejar ahí un script que va a correr como administrador es regalar una
+escalada de privilegios a cambio de nada.
 
-**Las instalaciones existentes no tienen los permisos.** El ACE del servicio y los SDDL
-de las tareas los concede el instalador, así que una caja que no se reinstale caerá en
-"sin permiso" y el daemon lo dirá con esas palabras: *"este usuario no puede controlar
-el servicio y no existe la tarea de respaldo; hay que reinstalar"*. No intenta pedir
-UAC por su cuenta.
+## Un landmine de despliegue que queda
+
+**Instala con la cuenta con la que se trabaja en la caja.** La tarea del EMV se
+registra a nombre de quien corre el instalador; si se eleva con otra cuenta de
+administrador, queda a nombre de ésa. Ya no es un callejón sin salida —el cliente
+detecta el desajuste comparando SIDs y lo ofrece corregir desde el paso 5— pero es una
+visita menos si se hace bien a la primera.
 
 ## Al tocar esto
 
@@ -341,6 +450,25 @@ UAC por su cuenta.
 - Radio nuevo → con `name`. Sin él el grupo no se excluye, quedan dos marcados a la vez y
   se guarda la opción que el operador **no** eligió. Es invisible a ojo y silencioso en
   ejecución; el check lo comprueba.
+- Estado nuevo en `state` → es un **vocabulario cerrado que pinta el frontend**
+  (`services/client.services.js` → `stateLabel`, y los dos indicadores de la barra). El
+  frontend lo sirve el backend y se actualiza por su cuenta, así que un estado nuevo sale
+  como texto vacío en las cajas que aún no lo tengan. Si hace falta más matiz, va en
+  `detail` o en un campo propio del payload — así se resolvieron `settleUntil` y `fatal`.
+- Tocar `schtasks` → **nunca te creas su código de salida**. `/Run` devuelve 0 en cuanto
+  el Programador acepta la petición. Comprueba el efecto (que aparezca el proceso, que el
+  servicio pase a RUNNING) y, si no aparece, lee el último resultado con
+  `Get-ScheduledTaskInfo`.
+- Cambiar el SDDL de las tareas → está en **dos** sitios que tienen que coincidir:
+  `SDDL_TAREA` en `src/services.tasks.js` y `#define TaskSddl` en
+  `NestorPOS_Setup.iss`. `check-services-tasks.js` comprueba que el del cliente siga
+  concediendo ejecución a los usuarios autenticados.
+- Tocar el script elevado (`scriptElevado()`) → es PowerShell dentro de un template
+  literal de JavaScript, y `node --check` lo da por bueno pase lo que pase dentro de las
+  comillas. Un error de sintaxis ahí sólo se ve como «la reparación no dejó resultado»,
+  después del UAC y con el operador delante. `check-services-tasks.js` le pasa el
+  analizador de PowerShell y comprueba que las variables de entorno que lee sean las que
+  `installMissing()` escribe.
 - Estado nuevo en el vocabulario → agrégalo a `stateLabel` en
   `services/client.services.js` y a la lista de `check-services-watchdog.js`, o saldrá
   como texto vacío en la barra.

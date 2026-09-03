@@ -1805,15 +1805,43 @@ function wireIpc() {
     // Probar un destino candidato ANTES de guardarlo.
     servicesHandle('nestor:services:probe', (arg) => services.probeTarget(arg));
 
+    // ── Requisitos de la caja ───────────────────────────────────────────────
+    // Qué le falta a ESTA caja para poder rescatarse sola, y el botón que lo instala.
+    // Existe porque la mitad de lo que docs/daemon-servicios.md daba por hecho que
+    // dejaba el instalador —la tarea NestorPrinterRescue, el permiso de control del
+    // servicio, el descriptor que deja al cajero disparar la tarea del EMV— nunca se
+    // escribió en NestorPOS_Setup.iss; y aunque se escriba hoy, las cajas que ya están
+    // instaladas no se reinstalan. Ver src/services.tasks.js.
+    servicesHandle('nestor:services:requirements', () => services.requirements());
+
+    // Instala lo que falte. ABRE UN AVISO DE UAC: sólo se llega aquí desde el botón del
+    // asistente, con una persona delante. El daemon NO lo llama nunca — un UAC saliendo
+    // solo a media venta sería peor que el fallo que viene a arreglar, y además no
+    // habría nadie para aceptarlo.
+    servicesHandle('nestor:services:install-tasks', async (arg) => {
+        const que = arg && Array.isArray(arg.que) ? arg.que : [];
+        const r = await services.installTasks(que);
+        // Puede haber cambiado el nombre del servicio o los puertos vistos por el
+        // observador de tráfico: se rearma, igual que tras guardar configuración.
+        watchServiceTraffic();
+        return r;
+    });
+
     // Elegir el instance.json con el diálogo del sistema. Teclear una ruta de Windows
     // a mano en un campo de texto es la forma más fácil de configurar mal esto.
     servicesHandle('nestor:services:pick-file', async (arg) => {
         const win = configWindow && !configWindow.isDestroyed() ? configWindow : mainWindow;
+        // El mismo diálogo sirve para el instance.json y para el .exe de la terminal;
+        // ofrecer sólo JSON en el segundo caso obliga a poner "Todos los archivos" a
+        // mano, que es justo el paso donde alguien acaba tecleando la ruta.
+        const filtros = (arg && arg.tipo === 'exe')
+            ? [{ name: 'Programas', extensions: ['exe'] }, { name: 'Todos', extensions: ['*'] }]
+            : [{ name: 'JSON', extensions: ['json'] }, { name: 'Todos', extensions: ['*'] }];
         const res = await dialog.showOpenDialog(win || undefined, {
             title: (arg && arg.title) || 'Selecciona el archivo',
             defaultPath: (arg && arg.defaultPath) || undefined,
             properties: ['openFile'],
-            filters: [{ name: 'JSON', extensions: ['json'] }, { name: 'Todos', extensions: ['*'] }]
+            filters: filtros
         });
         if (res.canceled || !res.filePaths || !res.filePaths.length) return { ok: false, canceled: true };
         return { ok: true, ruta: res.filePaths[0] };

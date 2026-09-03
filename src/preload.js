@@ -277,11 +277,14 @@ contextBridge.exposeInMainWorld('NestorClient', {
     // que `invoke` RECHACE en vez de devolver un error manejable.
     services: {
         // v2: configuración del daemon desde la ventana de Configuración
-        // (config/configSave/configReset/discover/probe/pickFile).
-        version: 2,
+        //     (config/configSave/configReset/discover/probe/pickFile).
+        // v3: requisitos de la caja e instalación de lo que falte
+        //     (requirements/installTasks).
+        version: 3,
         capabilities: [
             'status', 'ensure', 'release', 'repair', 'hold', 'unhold', 'openFolder', 'onChange',
-            'config', 'configSave', 'configReset', 'discover', 'probe', 'pickFile'
+            'config', 'configSave', 'configReset', 'discover', 'probe', 'pickFile',
+            'requirements', 'installTasks'
         ],
 
         // { ok, enabled, rescue, mode, services: [{ id, state, detail, warn, ... }] }
@@ -315,6 +318,18 @@ contextBridge.exposeInMainWorld('NestorClient', {
         // Probar un destino candidato sin guardarlo.
         probe: (arg) => invoke('nestor:services:probe', arg || {}),
         pickFile: (arg) => invoke('nestor:services:pick-file', arg || {}),
+
+        // ── Requisitos de la caja ───────────────────────────────────────────
+        // Qué le falta a ESTA caja para poder rescatarse sola: la tarea programada del
+        // EMV bien registrada, la tarea de respaldo del printer, y el permiso para que
+        // el usuario de la caja pueda arrancar el servicio de impresión sin elevar.
+        //
+        // { ok, usuario, administrador, requisitos: [{ clave, titulo, ok, reparable, detalle }] }
+        requirements: () => invoke('nestor:services:requirements'),
+        // Instala lo que falte. ABRE UN AVISO DE UAC: llámalo sólo desde un botón, con
+        // una persona delante. `que` es la lista de claves de requisito a reparar, para
+        // que lo que se ejecuta elevado sea exactamente lo que el operador vio y aceptó.
+        installTasks: (que) => invoke('nestor:services:install-tasks', { que: que || [] }),
         // Cambios de estado (se cayó / se está rescatando / volvió). Devuelve la
         // función para darse de baja.
         onChange: (cb) => subscribe('nestor:services', cb)
