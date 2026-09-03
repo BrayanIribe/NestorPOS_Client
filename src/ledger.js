@@ -124,12 +124,16 @@ const RISKY = ['charged', 'closing', 'queued', 'failed', 'discarded', 'rejected'
 // Base de una referencia EMV = el uuid del ticket con el que se pidió el cobro, que es
 // justamente el `ticket_key` de su venta.
 //
-// La referencia es única POR INTENTO: el primero va con el uuid pelado y los siguientes
-// con sufijo "-2", "-3"… (ver Ticket.nextEmvReference en el frontend; el adquirente no
-// reprocesa una referencia a la que ya le dio desenlace). Así que el cruce del voucher
-// suelto con su venta compara contra la base, no contra la referencia completa: `instr`
-// se aplica sobre `reference || '-'` para que las referencias sin sufijo —todas las
-// anteriores a ese cambio— sigan devolviéndose enteras.
+// La referencia es única POR INTENTO. El primer cobro de una cuenta va con el uuid pelado
+// —y de ahí que sirva para cruzar el voucher suelto con su venta—; los reintentos llevan
+// una referencia NUEVA, sin parentesco con el uuid, porque el host rechaza con `cd_error
+// 201` cualquier cosa que no sean 13 dígitos (ver Ticket.nextEmvReference en el
+// frontend). Un reintento sólo encuentra su venta por `ticket_key`, que es lo que
+// reportEmvAttempt manda desde el primer momento.
+//
+// El recorte del sufijo se conserva por las referencias "{uuid}-2", "-3"… que quedaron
+// guardadas mientras esa rotación estuvo viva: `instr` se aplica sobre `reference || '-'`
+// para que las referencias sin sufijo —las de antes y las de ahora— vuelvan enteras.
 const EMV_REF_BASE = "substr(reference, 1, instr(reference || '-', '-') - 1)";
 
 let db = null;
@@ -359,11 +363,11 @@ function ensureSchema(handle) {
         CREATE INDEX IF NOT EXISTS idx_emv_vouchers_op  ON emv_vouchers (operation_number);
         CREATE INDEX IF NOT EXISTS idx_emv_vouchers_at  ON emv_vouchers (at_ms DESC);
         -- La referencia es el segundo vínculo del voucher con su venta (ver list()/get()):
-        -- el intento se anota antes de que el ticket exista, así que hay vouchers cuya
-        -- única forma de encontrar su venta es ésta. El índice plano sirve a la
+        -- hay vouchers viejos, anotados antes de que el intento cargara su ticket_key,
+        -- cuya única forma de encontrar su venta es ésta. El índice plano sirve a la
         -- deduplicación de insertEmv (compara la referencia completa); el de la BASE de la
-        -- referencia sirve al cruce con la venta, que recorta el sufijo del intento
-        -- (ver EMV_REF_BASE).
+        -- referencia sirve a ese cruce, que recorta el sufijo del intento (ver
+        -- EMV_REF_BASE).
         CREATE INDEX IF NOT EXISTS idx_emv_vouchers_ref ON emv_vouchers (reference);
         CREATE INDEX IF NOT EXISTS idx_emv_vouchers_refbase
             ON emv_vouchers (substr(reference, 1, instr(reference || '-', '-') - 1));
@@ -1154,15 +1158,16 @@ function list(query) {
         // Los cobros con terminal se adjuntan en una sola consulta: la tabla es chica y una
         // consulta por renglón se notaba al abrir el panel con el turno completo.
         //
-        // Se buscan por ticket_key Y por reference. El intento se anota en cuanto la
+        // Se buscan por ticket_key Y por reference. El intento se anotaba en cuanto la
         // terminal responde —con la cuenta todavía abierta y, por tanto, sin ticket_key— y
         // la fila queda sellada: el vínculo posterior sólo se anota como evento, así que un
         // filtro por ticket_key a secas dejaba fuera precisamente los vouchers de las ventas
         // que nunca llegaron a registrarse. Eso pasó el 20/ago/2026: la copia para soporte
         // decía "emv: []" en la venta cuya tarjeta SÍ se había cobrado ($192.00, oper.
-        // 612915484). La referencia con la que se pide el cobro lleva el uuid del ticket
-        // como prefijo (ver startSantanderEmvPayment), así que sirve de vínculo sin
-        // inventar nada: se compara contra su base (EMV_REF_BASE).
+        // 612915484). Hoy el intento nace con su ticket_key (ver reportEmvAttempt), pero el
+        // cruce por referencia se mantiene para los que se guardaron sueltos: el primer
+        // cobro de una cuenta se pide con el uuid del ticket, así que sirve de vínculo sin
+        // inventar nada (se compara contra su base, EMV_REF_BASE).
         const keys = rows.map(r => String(r.ticket_key));
         const emvByKey = new Map();
         if (keys.length > 0) {
