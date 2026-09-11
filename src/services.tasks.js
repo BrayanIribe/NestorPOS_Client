@@ -642,7 +642,7 @@ async function requirements(spec) {
     // El permiso que se da es de CONTROL, pero el daemon sólo lo usa para ARRANCARLO:
     // parar el Spooler es justamente lo que dejó una máquina sin imprimir nada y lo que
     // puso a este servicio a la cabeza de SERVICIOS_PROTEGIDOS.
-    const spooler = await puedeControlarServicio(SPOOLER_SERVICE);
+    const spooler = await puedeArrancarServicio(SPOOLER_SERVICE);
     out.requisitos.push({
         clave: 'spooler_acl',
         titulo: 'Permiso para arrancar la cola de impresión de Windows',
@@ -668,6 +668,49 @@ async function requirements(spec) {
  * secundarios, y el caso real que hay en las cajas (la DACL de fábrica de NSSM) niega
  * las dos a la vez.
  */
+/**
+ * ¿Puede el usuario de esta caja ARRANCAR este servicio sin elevar?
+ *
+ * No vale preguntárselo a `sc query` como hace puedeControlarServicio(): consultar y
+ * arrancar son permisos distintos, y en el Spooler esa diferencia lo es todo. La DACL de
+ * fábrica de Windows ya deja que cualquier usuario interactivo CONSULTE el Spooler
+ * —`(A;;CCLCSWLOCRRC;;;IU)`, sin RP— así que `sc query` contesta perfectamente en una
+ * caja que no puede arrancarlo. Con esa sonda el requisito salía en VERDE mientras la
+ * caja se quedaba sin imprimir, que es la peor respuesta posible: la que hace que nadie
+ * vaya a mirar.
+ *
+ * Así que se lee el descriptor y se busca RP de verdad. `sc sdshow` funciona sin elevar
+ * porque ese mismo ACE de fábrica concede RC (leer seguridad).
+ */
+async function puedeArrancarServicio(nombre) {
+    if (!IS_WIN) return { ok: false, detalle: `no aplica en ${process.platform}` };
+    const r = await run(sysExe('sc.exe'), ['sdshow', nombre], 8000);
+    const sddl = `${r.stdout}${r.stderr}`.replace(/\s+/g, '');
+    if (!/D:/.test(sddl)) {
+        return { ok: false, detalle: `no se pudo leer el descriptor de seguridad de ${nombre}.` };
+    }
+
+    // Un ACE SDDL son seis campos: (tipo;banderas;derechos;guid;guid_heredado;cuenta).
+    const ACE = /\(([^;()]*);([^;]*);([^;]*);([^;]*);([^;]*);([^)]*)\)/g;
+    // Quién cuenta como "el usuario de la caja": usuarios interactivos, autenticados,
+    // el grupo Usuarios y Todos.
+    const CUENTAS = ['IU', 'AU', 'BU', 'WD'];
+
+    let m;
+    while ((m = ACE.exec(sddl)) !== null) {
+        const [, tipo, , derechos, , , cuenta] = m;
+        if (tipo.toUpperCase() !== 'A') continue;            // sólo ACE de permiso
+        if (!CUENTAS.includes(cuenta.toUpperCase())) continue;
+        // Los derechos son códigos de DOS letras pegados; se parten en pares en vez de
+        // buscar "RP" como subcadena, que es lo obvio y lo frágil.
+        const codigos = (derechos.toUpperCase().match(/../g) || []);
+        if (codigos.includes('RP') || codigos.includes('GA') || codigos.includes('FA')) {
+            return { ok: true, detalle: '' };
+        }
+    }
+    return { ok: false, detalle: `el usuario de esta caja no puede arrancar ${nombre}.` };
+}
+
 async function puedeControlarServicio(nombre) {
     if (!IS_WIN) return { ok: false, detalle: `no aplica en ${process.platform}` };
     const r = await run(sysExe('sc.exe'), ['query', nombre], 8000);
@@ -837,10 +880,18 @@ if ($Hacer -contains 'spooler_acl') {
     $sc = Join-Path $env:SystemRoot 'System32\\sc.exe'
     $actual = (& $sc sdshow 'Spooler') -join ''
     if ($actual -notmatch 'D:') { throw "sc sdshow no devolvio un descriptor: $actual" }
-    $ace = '(A;;CCLCSWRPWPDTLOCRRC;;;IU)'
+    # SOLO arrancar y consultar: CC LC RP LO RC. Sin WP (detener) ni DT (pausar), que
+    # es lo que dejaria a cualquier usuario dejar la maquina sin imprimir — el incidente
+    # que puso a este servicio a la cabeza de SERVICIOS_PROTEGIDOS. Y nunca DC (cambiar
+    # configuracion): con eso se le cambia el ejecutable a un servicio que corre como
+    # SYSTEM. Es el mismo ACE que concede el instalador.
+    $ace = '(A;;CCLCRPLORC;;;IU)'
     if ($actual -like "*$ace*") {
       Paso 'spooler_acl' $true 'el permiso ya estaba concedido'
     } else {
+      # La DACL de fabrica del Spooler YA trae un ACE de usuarios interactivos (de solo
+      # consulta, sin RP). Se AGREGA otro: dos ACE de permiso para el mismo SID son
+      # validos y los derechos se suman.
       $dacl, $sacl = $actual -split '(?=S:)', 2
       $nuevo = ($dacl.TrimEnd() + $ace + $sacl)
       $r = (& $sc sdset 'Spooler' $nuevo) -join ' '

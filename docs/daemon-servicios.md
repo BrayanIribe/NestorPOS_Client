@@ -277,11 +277,31 @@ requisito. Por defecto un usuario que no es administrador no puede arrancar el S
 así que el rescate se estrella contra un acceso denegado y la caja se queda sin imprimir
 por Windows hasta que va alguien con permisos. No hay forma de esquivarlo desde un proceso
 sin elevar —`net start`, `Start-Service` y WMI piden exactamente el mismo permiso—, así
-que se resuelve UNA vez: el requisito **`spooler_acl`** del paso 5 concede el ACE de
-control a los usuarios interactivos con un solo aviso de UAC, igual que `printer_acl`. A
-partir de ahí la caja se levanta la cola sola. El permiso es de control, pero el daemon
-sólo lo usa para ARRANCARLA: pararla es lo que la puso a la cabeza de
-`SERVICIOS_PROTEGIDOS`.
+que se resuelve UNA vez concediendo el permiso, y se concede por dos vías:
+
+| Cajas | Cómo |
+|---|---|
+| **Nuevas** | El instalador, en el mismo bloque que el servicio de impresión (`GrantSpoolerStartToInteractiveUsers`). Nacen sin el problema. |
+| **Ya instaladas** | Requisito **`spooler_acl`** del paso 5 del asistente: un solo aviso de UAC. |
+
+El ACE es **`(A;;CCLCRPLORC;;;IU)`** y no el del servicio de impresión, y la diferencia
+importa: concede **arrancar** y consultar, **sin `WP` (detener) ni `DT` (pausar)**. Repartir
+el permiso de parar el Spooler a cualquier usuario interactivo sería repartir justamente el
+incidente que puso a este servicio a la cabeza de `SERVICIOS_PROTEGIDOS` — una máquina que
+deja de imprimir del todo. Y nunca `DC` (cambiar configuración): con eso se le cambia el
+ejecutable a un servicio que corre como SYSTEM.
+
+Dos trampas del SDDL que costaron sendos fallos, las dos por la misma causa — **la DACL de
+fábrica del Spooler YA trae un ACE de usuarios interactivos**, `(A;;CCLCSWLOCRRC;;;IU)`, de
+sólo consulta:
+
+- El guard del instalador salía si encontraba *cualquier* ACE `;;;IU)`, así que no concedía
+  nada justo en el servicio que lo necesitaba. Ahora compara el ACE **exacto**. Añadir un
+  segundo ACE de permiso para el mismo SID es válido: los derechos se suman.
+- La comprobación del requisito usaba `sc query`, que un usuario normal **ya puede** hacer
+  sobre el Spooler. El requisito salía en VERDE con la caja incapaz de arrancarlo, que es
+  la peor respuesta posible: la que hace que nadie vaya a mirar. Ahora `puedeArrancarServicio()`
+  lee el descriptor con `sc sdshow` y busca `RP` de verdad.
 
 ### La impresora en sí
 
