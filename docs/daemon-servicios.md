@@ -231,7 +231,14 @@ enlace lento): ese rato es gratis y es justo el que hace falta para levantar un 
 caído sin que nadie lo note. Va contando lo que hace por `nestor:services:boot`, y el
 splash lo pinta en su propio renglón, debajo de la barra de progreso.
 
-Orden: **impresión → EMV → cola de impresión de Windows**.
+Orden: **impresión → EMV → cola de impresión de Windows → la impresora en sí**.
+
+El texto que sale en el splash **no es el del daemon**. "nadie escucha en 127.0.0.1:8331
+(ECONNREFUSED)" es justo el dato que hace falta en la bitácora —distingue "caído" de
+"arriba pero colgado"— y justo el que no significa nada para quien está esperando para
+abrir la caja. Las frases se arman en `fraseDeEspera()` desde el **estado**, sin puertos,
+IPs, rutas, códigos ni nombres de archivo; `detail` y `lastError` siguen intactos para el
+log, la barra de estado y el diagnóstico.
 
 No se rinde con la impresión: limpia en cada vuelta lo que le haría rendirse (la espera
 entre intentos, el tope por hora y el `fatal` pegajoso). Para que eso no se convierta en
@@ -254,9 +261,38 @@ de lanzar y está arrancando — pedir otro rescate ahí mata el proceso recién
 `reported` (una caída, una incidencia; limpiarlo en cada vuelta subiría una cada pocos
 segundos mientras dure la espera).
 
-La **cola de impresión de Windows** (`Spooler`) se revisa al final y **no frena**: sólo se
-arranca —jamás `sc stop`, es el servicio que encabeza `SERVICIOS_PROTEGIDOS`—, se confirma
-con cinco sondeos, y si no levanta sale un aviso en el POS y la caja abre igual.
+La **cola de impresión de Windows** (`Spooler`) **no frena**: sólo se arranca —jamás
+`sc stop`, es el servicio que encabeza `SERVICIOS_PROTEGIDOS`— y si no levanta sale un
+aviso en el POS y la caja abre igual. Son cinco **intentos**, no cinco sondeos, y la
+distinción costó un bug: se lanzaba `sc start` una vez y luego sólo se miraba, así que un
+arranque perdido —recién matado el proceso, el SCM todavía está cerrando el servicio y
+devuelve 1053/1061— dejaba la cola muerta mientras la pantalla contaba "comprobando 1/5…
+5/5". Cada intento arranca y **espera unos segundos comprobando**, porque `sc start`
+vuelve cuando el SCM acepta la petición, no cuando el servicio está en pie. Dos casos
+salen antes de gastar los cinco: sin permiso (error 5) no mejora repitiendo, y
+deshabilitado (1058) se intenta rehabilitar una vez con `sc config start= auto`.
+
+### La impresora en sí
+
+El servicio de impresión puede estar impecable y la caja no imprimir igual, porque el
+problema está un escalón más allá: sin papel, tapa abierta, papel atascado, o marcada
+"sin conexión" en Windows. Eso no lo ve ninguna sonda —el puerto contesta, `/health`
+contesta— y hoy se descubre al cobrar el primer ticket.
+
+En Windows toda impresión no virtual de NestorPOS_Printer termina en la cola que nombra
+`printer_uri` (`models/printer.go` → `SendRawToPrinter`, `printPagesGDI`), así que se le
+pregunta a **esa** cola, por WMI (`Win32_Printer`). Va **la última** y no por importancia:
+`Win32_Printer` lo sirve el propio Spooler, y preguntarlo antes daría "no se pudo
+consultar" justo en las cajas donde hay algo que contar.
+
+No se comprueba —y no se avisa— cuando no hay nada que afirmar: impresora virtual, sin
+nombre de cola, o `printer_host` apuntando a **otra máquina** (ahí la cola vive allá, y
+mirar las impresoras locales encontraría otra cosa o nada). Si WMI no contesta tampoco se
+afirma nada: un aviso falso en cada arranque enseña a ignorar los avisos.
+
+El nombre de la impresora lo teclea una persona y puede llevar comillas, acentos o barras
+invertidas, así que se piden **todas** las impresoras y se casa por nombre en JS, en vez
+de meter ese texto dentro de la consulta.
 
 ## Lo que ve el cajero
 

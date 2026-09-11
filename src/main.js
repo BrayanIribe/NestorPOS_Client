@@ -1785,6 +1785,11 @@ function wireIpc() {
     // esperar no le cuesta a nadie. Ver bootGate() en el daemon.
     servicesHandle('nestor:services:boot-gate', (arg) => services.bootGate({
         emv: !!(arg && arg.emv),
+        // La impresora asignada a ESTA caja, tal como viene en el paquete del POS. Con
+        // ella se comprueba que la cola de Windows no esté en error (sin papel, tapa
+        // abierta, atascada): el servicio de impresión puede estar impecable y la caja
+        // no imprimir igual, y eso hoy se descubre al cobrar el primer ticket.
+        printer: (arg && arg.printer) || null,
         onPaso: broadcastBootGate
     }));
     servicesHandle('nestor:services:release', (arg) => services.release(arg && arg.id));

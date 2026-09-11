@@ -1960,8 +1960,15 @@ async function repair(id) {
 // daño en aquel incidente era el `sc stop` (una máquina que deja de imprimir del todo),
 // no el `sc start`.
 const SPOOLER_SERVICE = 'Spooler';
-const SPOOLER_SONDEOS = 5;
-const SPOOLER_PAUSA_MS = 1500;
+// INTENTOS, no sondeos. La diferencia costó un bug: se lanzaba `sc start` UNA vez y
+// luego se sondeaba cinco veces sin volver a intentarlo, así que un arranque perdido
+// —recién matado el proceso, el SCM todavía está cerrando el servicio y rechaza la
+// petición— dejaba la cola muerta y en pantalla sólo "comprobando 1/5… 5/5".
+const SPOOLER_INTENTOS = 5;
+// Cuánto se espera, comprobando, a que el servicio esté de verdad en pie tras cada
+// intento: `sc start` vuelve cuando el SCM ACEPTA la petición, no cuando arrancó.
+const SPOOLER_ESPERA_MS = 6000;
+const SPOOLER_PAUSA_MS = 1000;
 
 // Respiro entre vueltas del candado. Crece y se estanca: es tiempo que alguien pasa
 // mirando una pantalla, así que las primeras vueltas van rápido, pero martillear `sc`
@@ -1976,6 +1983,80 @@ let gateEnCurso = null;
 
 function gatePausa(vuelta) {
     return GATE_PAUSAS_MS[Math.min(vuelta - 1, GATE_PAUSAS_MS.length - 1)];
+}
+
+// ── El texto que ve el cajero ───────────────────────────────────────────────────
+//
+// Lo que el daemon se dice a sí mismo NO sirve para una pantalla de arranque. "nadie
+// escucha en 127.0.0.1:8331 (ECONNREFUSED)" es exactamente el dato que hace falta en la
+// bitácora —distingue "caído" de "arriba pero colgado", que es la mitad de la razón de
+// existir de este archivo— y exactamente el dato que no significa nada para quien está
+// esperando para abrir la caja.
+//
+// Así que el splash NO recibe `detail` ni `lastError`. Las frases se arman aquí, desde
+// el estado, sin puertos, sin IPs, sin rutas, sin códigos de error y sin nombres de
+// servicios de Windows. Lo técnico sigue entero en el log y en `payloadDe` (de donde
+// beben la barra de estado y el modal de diagnóstico), que es donde se va a buscar.
+// El nombre lleva su género porque las frases lo usan: "la terminal … Iniciándola",
+// "el servicio … Iniciándolo". Un genérico para los dos sale mal en uno de ellos.
+const NOMBRE_SENCILLO = {
+    printer: { nombre: 'el servicio de impresión', iniciando: 'Iniciándolo' },
+    emv: { nombre: 'la terminal de tarjetas', iniciando: 'Iniciándola' }
+};
+const SERVICIO_GENERICO = { nombre: 'un servicio de la caja', iniciando: 'Iniciándolo' };
+
+/** Cómo se llama este servicio delante de una persona. */
+function nombreSencillo(st) {
+    return (NOMBRE_SENCILLO[st.id] || SERVICIO_GENERICO).nombre;
+}
+
+/** Primera mayúscula, para cuando la frase empieza por el nombre. */
+function capitalizar(s) {
+    return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+/**
+ * La frase del splash mientras se espera a un servicio.
+ *
+ * `intentos` es cuántas veces se ha intentado levantarlo ya (0 = todavía ninguna).
+ */
+function fraseDeEspera(st, intentos) {
+    const voz = NOMBRE_SENCILLO[st.id] || SERVICIO_GENERICO;
+    const nombre = voz.nombre;
+
+    if (intentos === 0) {
+        return `${capitalizar(nombre)} no responde. ${voz.iniciando}…`;
+    }
+
+    let frase = `${capitalizar(nombre)} sigue sin responder. Reintentando… (intento ${intentos})`;
+
+    // A partir del tercero se dice CÓMO SALIR. Si el rescate no prende tres veces
+    // seguidas casi nunca es mala suerte: o el componente no está instalado en esta
+    // caja, o esta caja no imprime aquí. Ninguna de las dos se arregla esperando, y
+    // quien está delante no tiene por qué adivinarlo.
+    if (intentos >= 3 && st.id === 'printer') {
+        frase += '. Si esta caja no imprime, puedes desactivarlo en Configuración → '
+            + 'Servicios de la caja.';
+    }
+    return frase;
+}
+
+/**
+ * Un aviso del daemon, dicho para una persona.
+ *
+ * Los `warn` de las sondas están escritos para diagnosticar —nombran el .dll, el estado
+ * de la terminal— y acaban en un toast del POS que lee un cajero. Se traducen los casos
+ * conocidos y el resto pasa tal cual: inventar una frase genérica para un aviso que no
+ * se conoce sería cambiar información por nada.
+ */
+function avisoParaPersonas(warn) {
+    const t = String(warn || '');
+    if (!t) return '';
+    if (/dll_loaded|nestor_printer\.dll/i.test(t)) {
+        return 'El servicio de impresión está en pie pero no puede imprimir. '
+            + 'Suele ser el antivirus: revisa Configuración → Servicios de la caja.';
+    }
+    return t;
 }
 
 /**
@@ -2061,8 +2142,8 @@ async function esperarServicioDelArranque(st, aviso, opciones) {
         // acaba de nacer — que es justo lo que este candado existe para evitar.
         const quedan = st.settleUntil - Date.now();
         if (quedan > 0) {
-            aviso(`${st.label}: arrancando${st.settleStep ? ` (${st.settleStep})` : ''}… `
-                + `${Math.ceil(quedan / 1000)} s`);
+            // El paso técnico (`settleStep` = "schtasks /Run …") va al log, no aquí.
+            aviso(`${capitalizar(nombreSencillo(st))} está iniciando… ${Math.ceil(quedan / 1000)} s`);
             await sleep(Math.min(2000, quedan));
             continue;
         }
@@ -2075,15 +2156,17 @@ async function esperarServicioDelArranque(st, aviso, opciones) {
                 ok: false,
                 intentos,
                 ms: Date.now() - t0,
-                warn: `${st.label}: ${motivo}`,
+                // El aviso que va a leer el cajero dice qué pasa y a dónde ir; el motivo
+                // exacto (qué tarea falta, en qué ruta se buscó el ejecutable) lo enseña
+                // ese mismo paso del asistente, y ya está en la bitácora.
+                warn: `No se pudo iniciar ${nombreSencillo(st)} en esta caja. `
+                    + 'Revísalo en Configuración → Servicios de la caja → Requisitos.',
                 detalle: motivo
             };
         }
 
         intentos++;
-        aviso(intentos === 1
-            ? `${st.label}: no responde. Restableciendo…`
-            : `${st.label}: restableciendo (intento ${intentos})…`);
+        aviso(fraseDeEspera(st, intentos - 1));
 
         // Lo que le haría rendirse, fuera. Un `repair()` pedido a mano hace lo mismo;
         // aquí además se repite, porque nadie va a volver a pulsar el botón. `fatal` se
@@ -2121,15 +2204,11 @@ async function esperarServicioDelArranque(st, aviso, opciones) {
         // rama del margen ya cuenta los segundos en pantalla.
         if (st.settleUntil > Date.now()) continue;
 
-        // Qué pasó, en la pantalla. A partir del tercer intento se dice también CÓMO
-        // SALIR: si el rescate no prende, casi siempre es que este componente no está
-        // instalado en esta caja, y eso no lo arregla esperar más.
-        let texto = `${st.label}: ${st.detail || st.lastError || 'no responde'} (intento ${intentos})`;
-        if (intentos >= 3 && st.id === 'printer') {
-            texto += ' — si esta caja no imprime aquí, ponlo en Configuración → '
-                + 'Servicios de la caja → Vigilancia del servicio de impresión: "nunca".';
-        }
-        aviso(texto);
+        // El intento no prendió. El porqué exacto ya quedó en el log y en `st.detail`
+        // (que es lo que leen la barra de estado y el diagnóstico); aquí va la frase.
+        log(`[${st.id}] candado de arranque: el intento ${intentos} no prendió — `
+            + `${st.detail || st.lastError || 'no responde'}`);
+        aviso(fraseDeEspera(st, intentos));
 
         await sleep(gatePausa(intentos));
     }
@@ -2161,33 +2240,246 @@ async function asegurarColaDeWindows(aviso) {
     }
 
     log(`[spooler] la cola de impresión de Windows dice "${inicial.state}"; se intenta arrancar`);
-    aviso('Cola de impresión de Windows: arrancando…');
-    const r = await run(sysExe('sc.exe'), ['start', SPOOLER_SERVICE], 30000);
-    // 1056 = ERROR_SERVICE_ALREADY_RUNNING. Alguien se adelantó y eso es un éxito, no
-    // un fallo: no se trata distinto, los sondeos de abajo lo confirman igual.
-    if (r.code !== 0 && r.code !== 1056) {
-        log(`[spooler] "sc start" falló (${r.code}): ${(r.stdout + r.stderr).trim().slice(0, 200)}`);
-    }
 
-    for (let i = 1; i <= SPOOLER_SONDEOS; i++) {
-        aviso(`Cola de impresión de Windows: comprobando (${i}/${SPOOLER_SONDEOS})…`);
-        await sleep(SPOOLER_PAUSA_MS);
-        const e = await serviceState(SPOOLER_SERVICE);
-        if (e.state === 'running') {
-            log(`[spooler] corriendo (confirmado al sondeo ${i}/${SPOOLER_SONDEOS})`);
-            return { ok: true, detalle: `arrancada, confirmada al sondeo ${i}/${SPOOLER_SONDEOS}` };
+    let ultimo = { code: -1, salida: '' };
+    let rehabilitada = false;
+
+    for (let i = 1; i <= SPOOLER_INTENTOS; i++) {
+        aviso(i === 1
+            ? 'Iniciando la cola de impresión de Windows…'
+            : `Iniciando la cola de impresión de Windows… (intento ${i} de ${SPOOLER_INTENTOS})`);
+
+        const r = await run(sysExe('sc.exe'), ['start', SPOOLER_SERVICE], 30000);
+        const salida = `${r.stdout}${r.stderr}`.trim();
+        ultimo = { code: r.code, salida: salida.slice(0, 200) };
+
+        // 5 = ERROR_ACCESS_DENIED. Es determinista: insistir cuatro veces más no va a
+        // conceder un permiso que no se tiene, sólo alarga el arranque de la caja.
+        if (r.code === 5 || /denegado|denied|0x80070005/i.test(salida)) {
+            log(`[spooler] sin permiso para arrancarlo (${r.code}): ${ultimo.salida}`);
+            break;
+        }
+
+        // 1058 = ERROR_SERVICE_DISABLED. Arrancar un servicio deshabilitado no falla por
+        // mala suerte: falla siempre. Se intenta rehabilitarlo UNA vez —también puede no
+        // haber permiso— y se vuelve a probar en la siguiente vuelta.
+        if (r.code === 1058 && !rehabilitada) {
+            rehabilitada = true;
+            log('[spooler] está DESHABILITADO; se intenta ponerlo en arranque automático');
+            aviso('La cola de impresión de Windows está deshabilitada. Habilitándola…');
+            const c = await run(sysExe('sc.exe'), ['config', SPOOLER_SERVICE, 'start=', 'auto'], 20000);
+            if (c.code !== 0) {
+                log(`[spooler] no se pudo rehabilitar (${c.code}): ${`${c.stdout}${c.stderr}`.trim().slice(0, 200)}`);
+                break;
+            }
+            continue;
+        }
+
+        if (r.code !== 0 && r.code !== 1056) {
+            // 1056 = ERROR_SERVICE_ALREADY_RUNNING (alguien se adelantó: es un éxito).
+            // El resto suele ser transitorio y es la razón de que esto sea un bucle de
+            // INTENTOS y no de sondeos: recién matado el proceso, el SCM todavía está
+            // cerrando el servicio y devuelve 1053/1061 ("no acepta mensajes de control").
+            // Un único `sc start` en ese instante se pierde, y antes el bucle sólo MIRABA
+            // — la cola no revivía y en pantalla sólo se veía "comprobando 1/5… 5/5".
+            log(`[spooler] "sc start" falló (${r.code}): ${ultimo.salida}`);
+        }
+
+        // Y ahora sí: esperar unos segundos a que arranque de verdad. `sc start` vuelve
+        // en cuanto el SCM acepta la petición, no cuando el servicio está en pie.
+        aviso(`Comprobando la cola de impresión de Windows… (${i} de ${SPOOLER_INTENTOS})`);
+        const limite = Date.now() + SPOOLER_ESPERA_MS;
+        while (Date.now() < limite) {
+            await sleep(SPOOLER_PAUSA_MS);
+            const e = await serviceState(SPOOLER_SERVICE);
+            if (e.state === 'running') {
+                log(`[spooler] corriendo (confirmado en el intento ${i}/${SPOOLER_INTENTOS})`);
+                return { ok: true, detalle: `arrancada en el intento ${i}/${SPOOLER_INTENTOS}` };
+            }
         }
     }
 
     const final = await serviceState(SPOOLER_SERVICE);
-    const porPermiso = final.state === 'sin-permiso' || /denegado|denied|0x5\b/i.test(`${r.stdout}${r.stderr}`);
+    // Una última mirada antes de dar el aviso: pudo levantar entre la última
+    // comprobación y ahora (el SCM tiene además su propia recuperación automática).
+    if (final.state === 'running') {
+        log('[spooler] corriendo (levantó justo al final)');
+        return { ok: true, detalle: 'arrancada' };
+    }
+
+    const porPermiso = final.state === 'sin-permiso' || ultimo.code === 5
+        || /denegado|denied|0x80070005/i.test(ultimo.salida);
+    // Sólo por el código de `sc start`: `sc query` NO distingue deshabilitado de
+    // detenido (un servicio deshabilitado también reporta STOPPED).
+    const deshabilitada = ultimo.code === 1058;
+
+    // Estos textos los lee el cajero en un aviso del POS, así que dicen QUÉ pasa y QUÉ
+    // hacer — sin códigos de error ni nombres de servicio de Windows. El detalle técnico
+    // queda arriba, en la bitácora.
     const warn = porPermiso
-        ? 'La cola de impresión de Windows (Spooler) está detenida y este usuario no puede arrancarla. '
-        + 'Arráncala como administrador: las impresoras instaladas en Windows no van a imprimir.'
-        : `La cola de impresión de Windows (Spooler) sigue sin arrancar tras ${SPOOLER_SONDEOS} comprobaciones. `
-        + 'Las impresoras instaladas en Windows no van a imprimir.';
-    log(`[spooler] AVISO: ${warn}`);
+        ? 'La cola de impresión de Windows está detenida y esta caja no tiene permiso para iniciarla. '
+        + 'Pide que la inicien como administrador: las impresoras de Windows no van a imprimir.'
+        : deshabilitada
+            ? 'La cola de impresión de Windows está deshabilitada y no se pudo habilitar desde aquí. '
+            + 'Hay que habilitarla como administrador: las impresoras de Windows no van a imprimir.'
+            : 'No se pudo iniciar la cola de impresión de Windows. '
+            + 'Las impresoras de Windows no van a imprimir hasta que alguien la inicie.';
+    log(`[spooler] AVISO tras ${SPOOLER_INTENTOS} intento(s): ${warn} `
+        + `[último sc start: código ${ultimo.code} ${ultimo.salida}] [estado: ${final.state}]`);
     return { ok: false, detalle: `no arrancó (${final.state})`, warn };
+}
+
+// ── Estado de la impresora asignada ─────────────────────────────────────────────
+//
+// El servicio de impresión puede estar perfecto y la caja no imprimir igual, porque el
+// problema está un escalón más allá: la impresora sin papel, con la tapa abierta, con
+// papel atascado o marcada "sin conexión" en Windows. Eso no lo ve ninguna de las
+// sondas de este archivo —el puerto contesta, /health contesta— y el cajero se entera
+// al cobrar el primer ticket.
+//
+// En Windows toda impresión no virtual de NestorPOS_Printer termina en la cola de
+// Windows que nombra `printer_uri` (ver models/printer.go → SendRawToPrinter y
+// printPagesGDI), así que preguntarle a esa cola es preguntar por la impresora que de
+// verdad se va a usar.
+//
+// Esto NO frena el arranque: es un aviso. Una impresora sin papel se arregla en diez
+// segundos y no hay ninguna razón para impedir abrir la caja mientras tanto.
+const IMPRESORA_TIMEOUT_MS = 20000;
+
+// Win32_Printer.DetectedErrorState. Lo que importa es la FRASE, no el número: esto lo
+// lee un cajero. Los estados que no son un problema (2 = sin error) no están aquí.
+const ERROR_IMPRESORA = {
+    3: 'tiene poco papel',
+    4: 'no tiene papel',
+    5: 'tiene poco tóner',
+    6: 'no tiene tóner',
+    7: 'tiene la tapa abierta',
+    8: 'tiene papel atascado',
+    9: 'necesita servicio',
+    10: 'tiene la bandeja de salida llena',
+    11: 'tiene un problema con el papel',
+    12: 'no puede imprimir la página',
+    13: 'necesita que alguien la revise',
+    14: 'se quedó sin memoria'
+};
+
+// Win32_Printer.PrinterStatus
+const PRINTER_STATUS_DETENIDA = 6;
+const PRINTER_STATUS_SIN_CONEXION = 7;
+
+/** Lo que se le sugiere hacer a quien está delante de la caja. */
+const CONSEJO_IMPRESORA = 'Reinicia la impresora: desconecta el cable de corriente, '
+    + 'espera unos segundos, vuelve a conectarla y comprueba que tenga papel.';
+
+/**
+ * ¿Esta caja tiene una impresora de verdad asignada, con cola de Windows?
+ *
+ * `printer` es el objeto que el POS recibe en el paquete. Virtual (o sin nombre de
+ * cola) significa que no hay nada que preguntarle a Windows.
+ */
+function colaDeWindowsDe(printer) {
+    if (!printer || typeof printer !== 'object') return '';
+    // PRINTER_TYPE_VIRTUAL = 0 (ver models/db.printer.go en el backend).
+    if (Number(printer.printer_type) === 0) return '';
+
+    // La caja puede imprimir por el :8331 de OTRA máquina (`printer_host`). Entonces la
+    // cola vive allá, y mirar las impresoras de ESTA máquina sería preguntar por el
+    // equipo equivocado: o no encuentra nada —y avisa de una avería que no existe— o
+    // encuentra una impresora distinta con el mismo nombre. Se calla, que es lo correcto
+    // cuando no se puede saber.
+    const host = String(printer.printer_host || '').trim().toLowerCase();
+    if (host && host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') return '';
+
+    return String(printer.printer_uri || '').trim();
+}
+
+/**
+ * Estado de la cola de Windows de la impresora asignada.
+ *
+ * Se pregunta por WMI y se filtran los resultados AQUÍ, por nombre, en vez de mandar un
+ * filtro dentro del comando: el nombre de una impresora lo teclea una persona en la
+ * configuración y puede llevar comillas, acentos o una barra invertida. Armar una
+ * consulta con eso dentro es pedir que un día no case nada — o algo peor.
+ */
+async function comprobarImpresoraDeWindows(cola, aviso) {
+    if (!IS_WIN) return { ok: true, detalle: 'no es Windows' };
+    if (!cola) return { ok: true, detalle: 'esta caja no tiene impresora de Windows asignada' };
+
+    aviso('Comprobando el estado de la impresora…');
+
+    const ps = sysExe(path.join('WindowsPowerShell', 'v1.0', 'powershell.exe'));
+    // Get-CimInstance no existe en las cajas más viejas; Get-WmiObject sigue estando en
+    // todas las que traen Windows PowerShell. Se intenta el moderno y se cae al otro.
+    const guion = '$ErrorActionPreference="SilentlyContinue";'
+        + '$p = Get-CimInstance Win32_Printer; if(-not $p){$p = Get-WmiObject Win32_Printer};'
+        + '$p | Select-Object Name,PrinterStatus,DetectedErrorState,WorkOffline | ConvertTo-Json -Compress';
+    const r = await run(ps, ['-NoProfile', '-NonInteractive', '-Command', guion], IMPRESORA_TIMEOUT_MS);
+
+    let filas = [];
+    try {
+        const parsed = JSON.parse((r.stdout || '').trim() || 'null');
+        // ConvertTo-Json devuelve un OBJETO cuando sólo hay una impresora, no un array
+        // de uno. Con una sola impresora instalada —que es el caso de casi toda caja—
+        // esto se traga el resultado entero si no se contempla.
+        filas = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+    } catch (e) {
+        filas = [];
+    }
+
+    if (!filas.length) {
+        // Sin lista no se afirma nada: "no se pudo comprobar" es la verdad, y es muy
+        // distinto de "la impresora está mal". Un aviso falso en cada arranque enseña
+        // a ignorar los avisos.
+        log(`[impresora] no se pudo consultar el estado (código ${r.code}): `
+            + `${`${r.stdout}${r.stderr}`.trim().slice(0, 200)}`);
+        return { ok: true, detalle: 'no se pudo consultar el estado de la impresora' };
+    }
+
+    const norm = (s) => String(s || '').trim().toLowerCase();
+    const fila = filas.find((f) => norm(f.Name) === norm(cola));
+    if (!fila) {
+        log(`[impresora] la impresora asignada "${cola}" no está instalada en esta máquina `
+            + `(hay: ${filas.map((f) => f.Name).join(', ').slice(0, 200)})`);
+        return {
+            ok: false,
+            detalle: 'la impresora asignada no está instalada en Windows',
+            warn: `La impresora configurada para esta caja ("${cola}") no está instalada en Windows. `
+                + 'Revísala en el panel de impresoras o avisa a soporte.'
+        };
+    }
+
+    const estado = Number(fila.PrinterStatus);
+    const error = Number(fila.DetectedErrorState);
+    const sinConexion = fila.WorkOffline === true || estado === PRINTER_STATUS_SIN_CONEXION;
+    const motivo = ERROR_IMPRESORA[error];
+
+    if (motivo) {
+        log(`[impresora] "${cola}" ${motivo} (DetectedErrorState=${error} PrinterStatus=${estado})`);
+        return {
+            ok: false,
+            detalle: motivo,
+            warn: `La impresora ${motivo}. ${CONSEJO_IMPRESORA}`
+        };
+    }
+    if (sinConexion) {
+        log(`[impresora] "${cola}" está sin conexión (WorkOffline=${fila.WorkOffline} PrinterStatus=${estado})`);
+        return {
+            ok: false,
+            detalle: 'sin conexión',
+            warn: `La impresora aparece como desconectada en Windows. ${CONSEJO_IMPRESORA}`
+        };
+    }
+    if (estado === PRINTER_STATUS_DETENIDA) {
+        log(`[impresora] "${cola}" está detenida (PrinterStatus=${estado})`);
+        return {
+            ok: false,
+            detalle: 'detenida',
+            warn: `La impresora está detenida en Windows. ${CONSEJO_IMPRESORA}`
+        };
+    }
+
+    log(`[impresora] "${cola}" lista (PrinterStatus=${estado} DetectedErrorState=${error})`);
+    return { ok: true, detalle: 'lista' };
 }
 
 /**
@@ -2214,10 +2506,15 @@ async function bootGate(opciones) {
         const salida = {
             ok: true,
             warn: '',
+            warns: [],
             printer: { ok: true, detalle: '' },
             emv: null,
-            spooler: null
+            spooler: null,
+            impresora: null
         };
+        // Todo lo que hay que decirle a una persona, en orden de urgencia. Se reparte al
+        // final: `warn` (el aviso del POS) y `warns` (la bitácora).
+        const avisos = [];
 
         if (!IS_WIN) {
             salida.printer.detalle = 'no es Windows: no hay servicios que levantar';
@@ -2233,6 +2530,7 @@ async function bootGate(opciones) {
             // existe para pilotear el rescate sin riesgo.
             salida.printer.detalle = 'modo observación: se comprueba pero no se rescata';
             salida.warn = 'Los servicios de esta caja están en modo observación: no se van a levantar solos.';
+            salida.warns = [salida.warn];
             return salida;
         }
 
@@ -2244,8 +2542,9 @@ async function bootGate(opciones) {
             salida.printer = await esperarServicioDelArranque(servicios.printer, aviso);
             if (salida.printer.warn) {
                 // Contesta, pero avisando (el caso real: la DLL no cargó). No frena —el
-                // servicio está en pie— pero tiene que llegar a una persona.
-                salida.warn = salida.printer.warn;
+                // servicio está en pie— pero tiene que llegar a una persona, y a esa
+                // persona el nombre del .dll no le dice nada.
+                avisos.push(avisoParaPersonas(salida.printer.warn));
             }
         }
 
@@ -2268,15 +2567,31 @@ async function bootGate(opciones) {
             // la caja que arranca por ejecutable directo (emv_direct_launch), y volvería
             // a quedarse desfasado en cuanto aparezca una tercera vía.
             salida.emv = await esperarServicioDelArranque(servicios.emv, aviso, { rendirseSiFatal: true });
-            if (!salida.warn && salida.emv.warn) salida.warn = salida.emv.warn;
+            if (salida.emv.warn) avisos.push(avisoParaPersonas(salida.emv.warn));
         }
 
         // ── 3) Cola de impresión de Windows: avisa, no frena ────────────────────
         fase = 'spooler';
         salida.spooler = await asegurarColaDeWindows(aviso);
-        if (!salida.spooler.ok && salida.spooler.warn && !salida.warn) {
-            salida.warn = salida.spooler.warn;
-        }
+        if (!salida.spooler.ok && salida.spooler.warn) avisos.push(salida.spooler.warn);
+
+        // ── 4) La impresora en sí ───────────────────────────────────────────────
+        //
+        // Va LA ÚLTIMA, y no por importancia: Win32_Printer lo sirve la cola de
+        // impresión de Windows. Preguntarlo antes de asegurarla daría "no se pudo
+        // consultar" justo en las cajas donde hay algo que contar.
+        fase = 'impresora';
+        salida.impresora = await comprobarImpresoraDeWindows(colaDeWindowsDe(opts.printer), aviso);
+        // Este aviso va DELANTE del de la cola de Windows aunque se descubra después:
+        // "la impresora no tiene papel" lo resuelve quien está en la caja, ahora, y sin
+        // ayuda de nadie. Es lo primero que tiene que leer.
+        if (!salida.impresora.ok && salida.impresora.warn) avisos.unshift(salida.impresora.warn);
+
+        // `warn` es lo que sale en el aviso del POS: uno solo, el más accionable.
+        // `warns` lleva todos, y de ahí los copia la bitácora del POS — dos problemas a
+        // la vez son raros, pero perder el segundo en silencio no es aceptable.
+        salida.warns = avisos;
+        salida.warn = avisos[0] || '';
 
         fase = 'listo';
         aviso('Servicios de la caja listos');
@@ -2285,9 +2600,12 @@ async function bootGate(opciones) {
         .catch((e) => ({
             ok: false,
             error: e && e.message ? e.message : String(e),
+            warn: '',
+            warns: [],
             printer: { ok: false, detalle: 'el candado falló' },
             emv: null,
-            spooler: null
+            spooler: null,
+            impresora: null
         }))
         .finally(() => { gateEnCurso = null; });
 
