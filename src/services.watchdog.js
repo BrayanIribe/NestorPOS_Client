@@ -1494,6 +1494,316 @@ async function repair(id) {
     return { ok: st.state === 'ok', service: payloadDe(st) };
 }
 
+// ── Candado de servicios del arranque ───────────────────────────────────────────
+//
+// Lo llama el POS al abrir /pos, EN PARALELO con la descarga del catálogo (que puede
+// tardar minutos: el paquete pesa 11-30 MB). Ese rato es gratis, y es exactamente el
+// rato que hace falta para levantar un servicio caído sin que nadie lo note.
+//
+// En qué se diferencia de `ensure()`, que es la pregunta obvia:
+//
+//   ensure()   comprueba, rescata si hace falta y DEVUELVE lo que haya. El POS abre
+//              pase lo que pase. Es lo correcto para la vigilancia continua.
+//   bootGate() NO devuelve hasta que el servicio de impresión contesta. Sin espera
+//              entre intentos y sin tope por hora: insiste mientras haga falta.
+//
+// Es deliberadamente más duro, y la razón es que una caja que abre sin impresión no
+// está "un poco peor": está emitiendo folios que nadie se lleva en papel, y eso se
+// descubre al cobrar el primer ticket, con la fila hecha. Esperar en el arranque
+// —donde la espera no le cuesta a nadie— es estrictamente mejor que fallar al cobrar.
+//
+// Tres salidas, para que "insiste mientras haga falta" no se convierta en una caja
+// que no abre nunca:
+//
+//   1. La caja que no imprime AQUÍ se declara una vez: Configuración → Servicios de la
+//      caja → "Vigilancia del servicio de impresión: nunca". Con eso el candado ni se
+//      plantea. Es la misma llave que ya gobierna la vigilancia, no una nueva.
+//   2. El modo OBSERVACIÓN (rescate apagado) es una decisión explícita de no tocar
+//      nada; bloquear ahí la contradiría, así que se avisa y se sigue.
+//   3. Nada de esto aplica fuera de Windows.
+//
+// La cola de impresión de Windows se revisa al final y NO frena: cinco sondeos, y si
+// no levanta se devuelve un aviso y la caja abre igual.
+
+// La cola de impresión de Windows. Sólo se ARRANCA, jamás se para: es justo el
+// servicio que encabeza SERVICIOS_PROTEGIDOS en services.config.js, y lo que hacía
+// daño en aquel incidente era el `sc stop` (una máquina que deja de imprimir del todo),
+// no el `sc start`.
+const SPOOLER_SERVICE = 'Spooler';
+const SPOOLER_SONDEOS = 5;
+const SPOOLER_PAUSA_MS = 1500;
+
+// Respiro entre vueltas del candado. Crece y se estanca: es tiempo que alguien pasa
+// mirando una pantalla, así que las primeras vueltas van rápido, pero martillear `sc`
+// cada segundo durante media hora tampoco ayuda a nadie.
+const GATE_PAUSAS_MS = [3000, 5000, 10000, 15000];
+
+// Una sola corrida a la vez. El POS puede recargarse a media espera (o haber dos
+// ventanas), y dos candados en paralelo se pisarían los rescates: se devuelve el que
+// ya está corriendo. Los avisos se difunden a TODAS las ventanas, así que la que
+// llegó después ve el progreso igual.
+let gateEnCurso = null;
+
+function gatePausa(vuelta) {
+    return GATE_PAUSAS_MS[Math.min(vuelta - 1, GATE_PAUSAS_MS.length - 1)];
+}
+
+/**
+ * Espera a que un servicio conteste, rescatándolo tantas veces como haga falta.
+ *
+ * Se apoya en `tick()` para el rescate en vez de llamar a RESCATES[] directo, y eso es
+ * a propósito: tick está serializado con la ronda periódica (dos rescates a la vez
+ * sobre el EMV matarían el proceso que acaba de nacer), respeta las compuertas de
+ * trabajo en vuelo y ya hace la espera de arranque del servicio. Lo único que se le
+ * quita antes de cada vuelta es lo que le haría RENDIRSE: la espera entre intentos y
+ * el tope por hora.
+ */
+async function esperarServicioDelArranque(st, aviso) {
+    const t0 = Date.now();
+    let vuelta = 0;
+
+    // Bajo vigilancia desde YA, aunque conteste a la primera. Si sólo se marcara en la
+    // rama del rescate, una terminal EMV que estaba en pie saldría del candado sin
+    // vigilar: el candado la habría dado por buena y la ronda periódica ni la miraría.
+    // (Es lo mismo que hace ensure(); aquí ya se comprobó el "nunca" de la
+    // configuración antes de llamar.)
+    st.supervised = true;
+
+    for (;;) {
+        vuelta++;
+
+        let sonda;
+        try {
+            sonda = await SONDAS[st.id]();
+        } catch (e) {
+            sonda = { alive: false, error: e && e.message ? e.message : String(e), warn: '', info: null };
+        }
+
+        if (sonda.alive) {
+            // Esta sonda vale como ronda: dejar el estado coherente evita que el
+            // indicador de la barra siga enseñando "SIN SERVICIO" un rato después de
+            // que el candado lo dio por bueno.
+            st.state = 'ok';
+            st.warn = sonda.warn || '';
+            if (sonda.info) st.info = sonda.info;
+            st.detail = st.warn || 'atendiendo';
+            st.strikes = 0;
+            st.lastOkAt = Date.now();
+            st.lastError = '';
+            st.attempts = 0;
+            st.nextAttemptAt = 0;
+            st.reported = false;
+            broadcast();
+
+            const ms = Date.now() - t0;
+            const detalle = vuelta === 1
+                ? 'ya estaba atendiendo'
+                : `restablecido tras ${vuelta - 1} intento(s) en ${Math.round(ms / 1000)} s`;
+            log(`[${st.id}] candado de arranque: ${detalle}`);
+            return { ok: true, vueltas: vuelta, ms, warn: sonda.warn || '', detalle };
+        }
+
+        aviso(vuelta === 1
+            ? `${st.label}: no responde. Restableciendo…`
+            : `${st.label}: restableciendo (intento ${vuelta})…`);
+
+        // Lo que le haría rendirse, fuera. Un `repair()` pedido a mano hace lo mismo;
+        // aquí además se repite, porque nadie va a volver a pulsar el botón.
+        st.rescues = [];
+        st.attempts = 0;
+        st.nextAttemptAt = 0;
+        st.strikes = STRIKES;
+        st.reported = false;
+
+        await tick(`arranque:${st.id}`);
+
+        if (st.state === 'ok') {
+            const ms = Date.now() - t0;
+            log(`[${st.id}] candado de arranque: restablecido en ${Math.round(ms / 1000)} s`);
+            return {
+                ok: true,
+                vueltas: vuelta,
+                ms,
+                warn: st.warn || '',
+                detalle: `restablecido tras ${vuelta} intento(s) en ${Math.round(ms / 1000)} s`
+            };
+        }
+
+        // Qué pasó, en la pantalla. A partir de la tercera vuelta se dice también CÓMO
+        // SALIR: si el rescate no prende, casi siempre es que este componente no está
+        // instalado en esta caja, y eso no lo arregla esperar más.
+        let texto = `${st.label}: ${st.detail || st.lastError || 'no responde'} (intento ${vuelta})`;
+        if (vuelta >= 3 && st.id === 'printer') {
+            texto += ' — si esta caja no imprime aquí, ponlo en Configuración → '
+                + 'Servicios de la caja → Vigilancia del servicio de impresión: "nunca".';
+        }
+        aviso(texto);
+
+        await sleep(gatePausa(vuelta));
+    }
+}
+
+/**
+ * La cola de impresión de Windows (Spooler) tiene que estar corriendo.
+ *
+ * No se rescata como los nuestros: sólo se ARRANCA —nunca `sc stop`, ver
+ * SERVICIOS_PROTEGIDOS— y se comprueba cinco veces. Si no levanta se devuelve un aviso
+ * y la caja abre igual: sin el Spooler no imprime la impresora de Windows, pero el
+ * ticket por ESC/POS a puerto puede seguir saliendo, así que frenar el arranque aquí
+ * sería peor que el problema.
+ */
+async function asegurarColaDeWindows(aviso) {
+    if (!IS_WIN) return { ok: true, detalle: 'no es Windows' };
+
+    const inicial = await serviceState(SPOOLER_SERVICE);
+    if (inicial.state === 'running') {
+        return { ok: true, detalle: 'ya estaba corriendo' };
+    }
+    if (inicial.state === 'ausente') {
+        return {
+            ok: false,
+            detalle: 'el servicio no existe en esta máquina',
+            warn: 'La cola de impresión de Windows (Spooler) no existe en esta máquina. '
+                + 'Las impresoras instaladas en Windows no van a imprimir.'
+        };
+    }
+
+    log(`[spooler] la cola de impresión de Windows dice "${inicial.state}"; se intenta arrancar`);
+    aviso('Cola de impresión de Windows: arrancando…');
+    const r = await run(sysExe('sc.exe'), ['start', SPOOLER_SERVICE], 30000);
+    // 1056 = ERROR_SERVICE_ALREADY_RUNNING. Alguien se adelantó y eso es un éxito, no
+    // un fallo: no se trata distinto, los sondeos de abajo lo confirman igual.
+    if (r.code !== 0 && r.code !== 1056) {
+        log(`[spooler] "sc start" falló (${r.code}): ${(r.stdout + r.stderr).trim().slice(0, 200)}`);
+    }
+
+    for (let i = 1; i <= SPOOLER_SONDEOS; i++) {
+        aviso(`Cola de impresión de Windows: comprobando (${i}/${SPOOLER_SONDEOS})…`);
+        await sleep(SPOOLER_PAUSA_MS);
+        const e = await serviceState(SPOOLER_SERVICE);
+        if (e.state === 'running') {
+            log(`[spooler] corriendo (confirmado al sondeo ${i}/${SPOOLER_SONDEOS})`);
+            return { ok: true, detalle: `arrancada, confirmada al sondeo ${i}/${SPOOLER_SONDEOS}` };
+        }
+    }
+
+    const final = await serviceState(SPOOLER_SERVICE);
+    const porPermiso = final.state === 'sin-permiso' || /denegado|denied|0x5\b/i.test(`${r.stdout}${r.stderr}`);
+    const warn = porPermiso
+        ? 'La cola de impresión de Windows (Spooler) está detenida y este usuario no puede arrancarla. '
+        + 'Arráncala como administrador: las impresoras instaladas en Windows no van a imprimir.'
+        : `La cola de impresión de Windows (Spooler) sigue sin arrancar tras ${SPOOLER_SONDEOS} comprobaciones. `
+        + 'Las impresoras instaladas en Windows no van a imprimir.';
+    log(`[spooler] AVISO: ${warn}`);
+    return { ok: false, detalle: `no arrancó (${final.state})`, warn };
+}
+
+/**
+ * Comprobación de servicios del arranque de la caja. Ver el bloque de arriba.
+ *
+ * `opciones.emv`    ¿esta caja tiene terminal Santander? (lo dice /pos/package)
+ * `opciones.onPaso` se llama con { fase, texto } en cada cambio; lo difunde main.js.
+ *
+ * Nunca lanza: como todo lo de este archivo, un fallo suyo no puede impedir abrir la
+ * caja. Devuelve siempre un objeto con lo que pasó en cada servicio.
+ */
+async function bootGate(opciones) {
+    if (gateEnCurso) return gateEnCurso;
+
+    const opts = opciones || {};
+    const onPaso = typeof opts.onPaso === 'function' ? opts.onPaso : null;
+    let fase = 'printer';
+    const aviso = (texto) => {
+        if (!onPaso) return;
+        try { onPaso({ fase, texto }); } catch { }
+    };
+
+    gateEnCurso = (async () => {
+        const salida = {
+            ok: true,
+            warn: '',
+            printer: { ok: true, detalle: '' },
+            emv: null,
+            spooler: null
+        };
+
+        if (!IS_WIN) {
+            salida.printer.detalle = 'no es Windows: no hay servicios que levantar';
+            return salida;
+        }
+        if (!ENABLED || initError) {
+            salida.printer.detalle = 'el daemon de servicios está apagado';
+            return salida;
+        }
+        if (!RESCUE_ENABLED) {
+            // Modo observación: alguien decidió que en esta caja no se toca nada. El
+            // candado lo respeta — bloquear aquí sería desobedecer justo el ajuste que
+            // existe para pilotear el rescate sin riesgo.
+            salida.printer.detalle = 'modo observación: se comprueba pero no se rescata';
+            salida.warn = 'Los servicios de esta caja están en modo observación: no se van a levantar solos.';
+            return salida;
+        }
+
+        // ── 1) Servicio de impresión ────────────────────────────────────────────
+        if (cfg.valores.printer_watch === 'nunca') {
+            salida.printer.detalle = 'vigilancia en "nunca": esta caja no imprime aquí';
+        } else {
+            log('[arranque] candado de servicios: servicio de impresión');
+            salida.printer = await esperarServicioDelArranque(servicios.printer, aviso);
+            if (salida.printer.warn) {
+                // Contesta, pero avisando (el caso real: la DLL no cargó). No frena —el
+                // servicio está en pie— pero tiene que llegar a una persona.
+                salida.warn = salida.printer.warn;
+            }
+        }
+
+        // ── 2) Terminal EMV, DESPUÉS de la impresión ────────────────────────────
+        //
+        // Sólo si el daemon la tiene configurada. "auto" es lo de fábrica y significa
+        // "la enciende el POS cuando el paquete dice que esta caja tiene terminal", así
+        // que ahí manda lo que diga el POS.
+        fase = 'emv';
+        const emvWatch = cfg.valores.emv_watch;
+        const emvPedido = emvWatch === 'siempre' || (emvWatch !== 'nunca' && opts.emv === true);
+        if (!emvPedido) {
+            salida.emv = { ok: true, detalle: emvWatch === 'nunca' ? 'vigilancia en "nunca"' : 'esta caja no tiene terminal' };
+        } else if (!(await taskExists(EMV_TASK))) {
+            // Sin la tarea programada no hay NINGUNA vía de rescate (el exe es
+            // requireAdministrator y este cliente no corre elevado). Esperar aquí sería
+            // esperar algo que no puede pasar: se avisa y se sigue.
+            salida.emv = { ok: false, detalle: `no existe la tarea ${EMV_TASK}` };
+            salida.warn = salida.warn
+                || `La terminal Santander EMV no se puede levantar en esta caja: falta la tarea ${EMV_TASK}. `
+                + 'Hay que reinstalar el componente EMV.';
+        } else {
+            log('[arranque] candado de servicios: terminal EMV');
+            salida.emv = await esperarServicioDelArranque(servicios.emv, aviso);
+            if (!salida.warn && salida.emv.warn) salida.warn = salida.emv.warn;
+        }
+
+        // ── 3) Cola de impresión de Windows: avisa, no frena ────────────────────
+        fase = 'spooler';
+        salida.spooler = await asegurarColaDeWindows(aviso);
+        if (!salida.spooler.ok && salida.spooler.warn && !salida.warn) {
+            salida.warn = salida.spooler.warn;
+        }
+
+        fase = 'listo';
+        aviso('Servicios de la caja listos');
+        return salida;
+    })()
+        .catch((e) => ({
+            ok: false,
+            error: e && e.message ? e.message : String(e),
+            printer: { ok: false, detalle: 'el candado falló' },
+            emv: null,
+            spooler: null
+        }))
+        .finally(() => { gateEnCurso = null; });
+
+    return gateEnCurso;
+}
+
 /**
  * "No toques este servicio durante los próximos N ms."
  *
@@ -1691,6 +2001,9 @@ module.exports = {
     ensure,
     release,
     repair,
+    // Candado del arranque de la caja: no devuelve hasta que la impresión contesta.
+    // Lo llama el POS en paralelo con la descarga del catálogo.
+    bootGate,
     hold,
     unhold,
     noteTraffic,

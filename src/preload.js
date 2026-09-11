@@ -277,11 +277,13 @@ contextBridge.exposeInMainWorld('NestorClient', {
     // que `invoke` RECHACE en vez de devolver un error manejable.
     services: {
         // v2: configuración del daemon desde la ventana de Configuración
-        // (config/configSave/configReset/discover/probe/pickFile).
-        version: 2,
+        //     (config/configSave/configReset/discover/probe/pickFile).
+        // v3: candado de servicios del arranque (bootGate/onBootGate).
+        version: 3,
         capabilities: [
             'status', 'ensure', 'release', 'repair', 'hold', 'unhold', 'openFolder', 'onChange',
-            'config', 'configSave', 'configReset', 'discover', 'probe', 'pickFile'
+            'config', 'configSave', 'configReset', 'discover', 'probe', 'pickFile',
+            'bootGate', 'onBootGate'
         ],
 
         // { ok, enabled, rescue, mode, services: [{ id, state, detail, warn, ... }] }
@@ -292,6 +294,21 @@ contextBridge.exposeInMainWorld('NestorClient', {
         release: (id) => invoke('nestor:services:release', { id }),
         // Reparación pedida por una persona: se salta la espera entre intentos.
         repair: (id) => invoke('nestor:services:repair', { id }),
+
+        // ── Candado del arranque de la caja ──────────────────────────────────
+        // Lo llama el POS al abrir /pos, en paralelo con la descarga del catálogo.
+        // NO devuelve hasta que el servicio de impresión contesta: una caja que abre
+        // sin impresión emite folios que nadie se lleva en papel, y eso se descubre al
+        // cobrar el primer ticket. `{ emv: true }` si esta caja tiene terminal
+        // Santander (lo dice /pos/package). La cola de impresión de Windows se revisa
+        // al final y sólo avisa. Ver bootGate() en src/services.watchdog.js.
+        //
+        //   const r = await window.NestorClient.services.bootGate({ emv: true });
+        //   // { ok, warn, printer:{...}, emv:{...}, spooler:{...} }
+        bootGate: (opts) => invoke('nestor:services:boot-gate', opts || {}),
+        // Qué está haciendo el candado, paso a paso ({ fase, texto }). Es lo que hace
+        // que la espera no sea otro logo quieto. Devuelve la baja.
+        onBootGate: (cb) => subscribe('nestor:services:boot', cb),
         // "No toques este servicio durante los próximos ms." Imprescindible en un cobro
         // con tarjeta: relanzar el EMV mata el proceso, y con él la autorización.
         hold: (id, ms) => invoke('nestor:services:hold', { id, ms }),

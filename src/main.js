@@ -796,6 +796,21 @@ function broadcastServices(payload) {
     }
 }
 
+// Paso a paso del candado de servicios del arranque (ver bootGate en el daemon). Va por
+// su propio canal y no por 'nestor:services' porque no es un cambio de estado: es el
+// relato de una espera, y lo pinta el splash de /pos debajo de la barra de progreso.
+//
+// A TODAS las ventanas, no sólo a la que lo pidió: la ventana del POS puede recargarse
+// a media espera —el candado sobrevive, es uno solo— y la nueva tiene que poder seguir
+// contando lo mismo.
+function broadcastBootGate(payload) {
+    for (const w of BrowserWindow.getAllWindows()) {
+        try {
+            if (!w.isDestroyed()) w.webContents.send('nestor:services:boot', payload);
+        } catch { }
+    }
+}
+
 /**
  * Observa las peticiones de la ventana hacia los microservicios de la caja.
  *
@@ -1764,6 +1779,14 @@ function wireIpc() {
     servicesHandle('nestor:services:ensure', (arg) => services.ensure(
         arg && arg.id, { immediate: !(arg && arg.immediate === false) }
     ));
+    // Candado del ARRANQUE de la caja. No es un `ensure` con otro nombre: no contesta
+    // hasta que el servicio de impresión responde, y no se rinde por el camino. Lo
+    // llama el POS en paralelo con la descarga del catálogo, que es el rato en que
+    // esperar no le cuesta a nadie. Ver bootGate() en el daemon.
+    servicesHandle('nestor:services:boot-gate', (arg) => services.bootGate({
+        emv: !!(arg && arg.emv),
+        onPaso: broadcastBootGate
+    }));
     servicesHandle('nestor:services:release', (arg) => services.release(arg && arg.id));
     // Reparación pedida a mano: se salta el backoff, no la compuerta de trabajo en vuelo.
     servicesHandle('nestor:services:repair', (arg) => services.repair(arg && arg.id));
