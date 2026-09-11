@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="utf-8" />
+    <title>Nestor POS</title>
+    <!--
+      Splash de arranque del cliente.
+
+      Entre que alguien pulsa el icono y aparece el punto de venta pasan varios
+      segundos: se limpia el caché de sesión, se levanta el servidor local, se comprueba
+      la build del servidor y —esto es casi todo el tiempo— se baja y se descomprime el
+      bundle del frontend. Hasta aquí, esos segundos eran pantalla vacía: ni una ventana,
+      ni un logo, nada. Y una aplicación que no dibuja nada al abrirse no parece lenta,
+      parece rota: la gente vuelve a pulsar el icono, que es justo lo que la segunda
+      instancia rechaza.
+
+      Esta página se enseña ANTES de todo eso. Está escrita con una regla por encima de
+      las demás: PINTAR YA.
+
+        · Sin red. Sin fuentes web, sin CDN, sin frameworks. Sólo el logo, que está al
+          lado en disco.
+        · Sin JS al cargar. El único guion que corre es el que manda el proceso
+          principal por executeJavaScript para cambiar de estado — así el splash no
+          necesita preload, ni IPC, ni esperar a nada para dibujarse.
+        · Sin transparencia. Una ventana translúcida obliga al compositor a trabajar y
+          en Windows tarda más y parpadea; el fondo es opaco y del color final, así que
+          el marco aparece ya con su color en vez de con un flash blanco.
+
+      La cara es la del splash del POS (components/system/ILoadingSplash.vue): el mismo
+      logo, el mismo morado y la misma barra. Quien arranca la caja ve una sola pantalla
+      de carga que se transforma, no dos aplicaciones distintas.
+    -->
+    <style>
+        :root {
+            /* $purple-color y compañía, de NestorPOS_Frontend/src/css/app.scss */
+            --morado: #5256ae;
+            --morado-claro: #7b7fd0;
+            --texto: #6c757d;
+            --tenue: #adb5bd;
+            --riel: rgba(0, 0, 0, 0.12);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            margin: 0;
+            height: 100%;
+            overflow: hidden;
+            background: #fff;
+            /* Fuentes del sistema: pedir una por red retrasaría el primer dibujo justo
+               para lo que esta pantalla existe. */
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            /* El marco es sin bordes: esto lo hace arrastrable como una ventana normal. */
+            -webkit-app-region: drag;
+            user-select: none;
+            cursor: default;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 26px 34px;
+            border: 1px solid rgba(0, 0, 0, 0.08);
+        }
+
+        .marca {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            animation: entrar 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+
+        .logo {
+            width: 118px;
+            height: auto;
+            display: block;
+        }
+
+        .nombre {
+            margin-top: 6px;
+            font-size: 1.35rem;
+            font-weight: 400;
+            color: var(--morado);
+            letter-spacing: 0.2px;
+        }
+
+        .avance {
+            width: 100%;
+            margin-top: 26px;
+            animation: aparecer 500ms 140ms ease-out both;
+        }
+
+        .riel {
+            position: relative;
+            height: 0.5rem;
+            border-radius: 0.25rem;
+            background: var(--riel);
+            overflow: hidden;
+        }
+
+        .barra {
+            height: 100%;
+            width: 0;
+            border-radius: 0.25rem;
+            background: var(--morado);
+            transition: width 380ms cubic-bezier(0.22, 1, 0.36, 1), background-color 400ms ease;
+        }
+
+        /* Mientras no se sabe cuánto falta, el riel respira en vez de mentir con un
+           porcentaje inventado. */
+        .riel.indeterminado .barra {
+            width: 38% !important;
+            animation: vaiven 1.25s ease-in-out infinite;
+        }
+
+        .riel.error .barra {
+            background: #dc3545;
+        }
+
+        .pie {
+            margin-top: 12px;
+            text-align: center;
+            /* Altura reservada: sin esto el bloque crece y encoge con cada cambio de
+               frase y la barra baila de arriba abajo todo el arranque. */
+            min-height: 42px;
+        }
+
+        .estado {
+            font-size: 0.9rem;
+            line-height: 1.35;
+            color: var(--texto);
+        }
+
+        .pct {
+            font-weight: 600;
+            color: var(--morado);
+            margin-right: 6px;
+            /* Sin esto el número cambia de ancho al pasar de 9% a 10% y arrastra la
+               frase de al lado en cada actualización. */
+            font-variant-numeric: tabular-nums;
+        }
+
+        .detalle {
+            margin-top: 3px;
+            font-size: 0.76rem;
+            line-height: 1.35;
+            color: var(--tenue);
+            font-variant-numeric: tabular-nums;
+        }
+
+        .error .estado,
+        .error .pct {
+            color: #dc3545;
+        }
+
+        @keyframes entrar {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: none;
+            }
+        }
+
+        @keyframes aparecer {
+            from {
+                opacity: 0;
+            }
+
+            to {
+                opacity: 1;
+            }
+        }
+
+        @keyframes vaiven {
+
+            0% {
+                transform: translateX(-100%);
+            }
+
+            100% {
+                transform: translateX(265%);
+            }
+        }
+
+        /* Una caja táctil puede estar configurada para no animar, y hay quien marea con
+           el movimiento. La pantalla sigue diciendo lo mismo, quieta. */
+        @media (prefers-reduced-motion: reduce) {
+
+            .marca,
+            .avance,
+            .riel.indeterminado .barra {
+                animation: none;
+            }
+
+            .barra {
+                transition: none;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="marca">
+        <img class="logo" src="assets/logo-extended.png" alt="" />
+        <span class="nombre">Nestor POS</span>
+    </div>
+
+    <div class="avance">
+        <div class="riel indeterminado" id="riel">
+            <div class="barra" id="barra"></div>
+        </div>
+        <div class="pie" id="pie">
+            <div class="estado"><span class="pct" id="pct"></span><span id="estado">Iniciando…</span></div>
+            <div class="detalle" id="detalle"></div>
+        </div>
+    </div>
+
+    <script>
+        // Lo llama el proceso principal con executeJavaScript (ver src/splash.window.js).
+        // Se define aquí y no en un preload a propósito: un preload es un archivo más que
+        // cargar antes de poder dibujar, y esta pantalla existe para dibujarse pronto.
+        window.__splash = function (s) {
+            try {
+                var riel = document.getElementById('riel');
+                var pct = document.getElementById('pct');
+
+                if (typeof s.progress === 'number' && s.progress >= 0) {
+                    riel.classList.remove('indeterminado');
+                    document.getElementById('barra').style.width = Math.max(0, Math.min(100, s.progress)) + '%';
+                    pct.textContent = Math.round(s.progress) + '%';
+                } else if (s.progress === null) {
+                    riel.classList.add('indeterminado');
+                    pct.textContent = '';
+                }
+
+                if (typeof s.estado === 'string') document.getElementById('estado').textContent = s.estado;
+                if (typeof s.detalle === 'string') document.getElementById('detalle').textContent = s.detalle;
+
+                if (s.error === true) {
+                    riel.classList.add('error');
+                    document.body.classList.add('error');
+                }
+            } catch (e) {
+                /* El splash nunca puede tumbar el arranque: si algo de esto falla, la
+                   ventana se queda con el último estado bueno y la caja sigue abriendo. */
+            }
+        };
+    </script>
+</body>
+
+</html>

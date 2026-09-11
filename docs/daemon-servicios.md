@@ -272,6 +272,17 @@ vuelve cuando el SCM acepta la petición, no cuando el servicio está en pie. Do
 salen antes de gastar los cinco: sin permiso (error 5) no mejora repitiendo, y
 deshabilitado (1058) se intenta rehabilitar una vez con `sc config start= auto`.
 
+**El «sin permiso» es el caso normal, no una rareza**, y por eso tiene su propio
+requisito. Por defecto un usuario que no es administrador no puede arrancar el Spooler,
+así que el rescate se estrella contra un acceso denegado y la caja se queda sin imprimir
+por Windows hasta que va alguien con permisos. No hay forma de esquivarlo desde un proceso
+sin elevar —`net start`, `Start-Service` y WMI piden exactamente el mismo permiso—, así
+que se resuelve UNA vez: el requisito **`spooler_acl`** del paso 5 concede el ACE de
+control a los usuarios interactivos con un solo aviso de UAC, igual que `printer_acl`. A
+partir de ahí la caja se levanta la cola sola. El permiso es de control, pero el daemon
+sólo lo usa para ARRANCARLA: pararla es lo que la puso a la cabeza de
+`SERVICIOS_PROTEGIDOS`.
+
 ### La impresora en sí
 
 El servicio de impresión puede estar impecable y la caja no imprimir igual, porque el
@@ -289,6 +300,15 @@ No se comprueba —y no se avisa— cuando no hay nada que afirmar: impresora vi
 nombre de cola, o `printer_host` apuntando a **otra máquina** (ahí la cola vive allá, y
 mirar las impresoras locales encontraría otra cosa o nada). Si WMI no contesta tampoco se
 afirma nada: un aviso falso en cada arranque enseña a ignorar los avisos.
+
+> **«Otra máquina» NO es «distinto de 127.0.0.1».** Lo normal en estas cajas es que se
+> nombren a sí mismas por su IP de la red local: en una caja real, `printer_host` era
+> `192.168.10.118` y la impresora `ticket2` estaba ahí mismo. Compararlo contra el bucle
+> local dejaba la comprobación apagada justo donde había algo que comprobar, y decía «esta
+> caja no tiene impresora de Windows asignada» con una impresora asignada. Se compara
+> contra el hostname y contra **todas** las direcciones del equipo (`esEsteEquipo`).
+> Vacío cuenta como local, que es lo que ya asume el POS al imprimir
+> (`printer.printer_host || '127.0.0.1'`).
 
 El nombre de la impresora lo teclea una persona y puede llevar comillas, acentos o barras
 invertidas, así que se piden **todas** las impresoras y se casa por nombre en JS, en vez

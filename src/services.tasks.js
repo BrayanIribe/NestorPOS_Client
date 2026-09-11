@@ -523,6 +523,11 @@ function problemasDe(info, opciones) {
  * reparar desde aquí (no existe el .exe del EMV) se dice tal cual, con lo que hay que
  * hacer, en vez de ofrecer un botón que no va a servir.
  */
+// La cola de impresión de Windows. Se le concede permiso para ARRANCARLA; pararla es lo
+// que dejó una máquina sin imprimir nada y lo que la puso a la cabeza de
+// SERVICIOS_PROTEGIDOS en services.config.js.
+const SPOOLER_SERVICE = 'Spooler';
+
 async function requirements(spec) {
     const s = spec || {};
     const emvTask = String(s.emvTask || 'NestorSantanderEMV');
@@ -626,6 +631,28 @@ async function requirements(spec) {
                   + 'pero dando el permiso se resuelve en el primer escalón y sin pasar por el Programador.'
         });
     }
+
+    // ── Cola de impresión de Windows ────────────────────────────────────────────
+    // Por defecto, un usuario que no es administrador NO puede arrancar el Spooler. Así
+    // que cuando se cae —y se cae— el rescate automático del arranque se estrella contra
+    // un "acceso denegado" y la caja se queda sin imprimir por Windows hasta que alguien
+    // con permisos va hasta allá. Es el mismo problema que `printer_acl`, con el mismo
+    // arreglo: conceder el permiso UNA vez, aquí, con una persona delante.
+    //
+    // El permiso que se da es de CONTROL, pero el daemon sólo lo usa para ARRANCARLO:
+    // parar el Spooler es justamente lo que dejó una máquina sin imprimir nada y lo que
+    // puso a este servicio a la cabeza de SERVICIOS_PROTEGIDOS.
+    const spooler = await puedeControlarServicio(SPOOLER_SERVICE);
+    out.requisitos.push({
+        clave: 'spooler_acl',
+        titulo: 'Permiso para arrancar la cola de impresión de Windows',
+        ok: spooler.ok,
+        reparable: true,
+        detalle: spooler.ok
+            ? 'La caja puede volver a levantar la cola de impresión sola si se cae.'
+            : `${spooler.detalle} Sin esto, si la cola de impresión se detiene, las impresoras `
+              + 'instaladas en Windows dejan de imprimir hasta que alguien la arranque a mano.'
+    });
 
     out.ok = out.requisitos.every((r) => r.ok);
     out.reparables = out.requisitos.filter((r) => !r.ok && r.reparable).map((r) => r.clave);
@@ -799,6 +826,33 @@ if ($Hacer -contains 'printer_acl') {
   }
 }
 
+# ── Permiso para arrancar la cola de impresion de Windows ─────────────────────
+# Mismo procedimiento que printer_acl, y por lo mismo: sin este permiso, un Spooler
+# detenido deja la caja sin imprimir por Windows hasta que va alguien con permisos.
+# El nombre del servicio va QUEMADO aqui y no llega por parametro: este script corre
+# como administrador y hace sdset sobre lo que se le diga, asi que lo que puede tocar
+# se decide en el codigo, no en un archivo que cualquiera puede editar.
+if ($Hacer -contains 'spooler_acl') {
+  try {
+    $sc = Join-Path $env:SystemRoot 'System32\\sc.exe'
+    $actual = (& $sc sdshow 'Spooler') -join ''
+    if ($actual -notmatch 'D:') { throw "sc sdshow no devolvio un descriptor: $actual" }
+    $ace = '(A;;CCLCSWRPWPDTLOCRRC;;;IU)'
+    if ($actual -like "*$ace*") {
+      Paso 'spooler_acl' $true 'el permiso ya estaba concedido'
+    } else {
+      $dacl, $sacl = $actual -split '(?=S:)', 2
+      $nuevo = ($dacl.TrimEnd() + $ace + $sacl)
+      $r = (& $sc sdset 'Spooler' $nuevo) -join ' '
+      if ($LASTEXITCODE -ne 0) { throw "sc sdset fallo ($LASTEXITCODE): $r" }
+      Paso 'spooler_acl' $true 'concedido a los usuarios interactivos'
+    }
+  } catch {
+    $out.ok = $false
+    Paso 'spooler_acl' $false $_.Exception.Message
+  }
+}
+
 $out | ConvertTo-Json -Depth 4 -Compress | Set-Content -LiteralPath $Resultado -Encoding UTF8
 if ($out.ok) { exit 0 } else { exit 2 }
 `;
@@ -817,7 +871,7 @@ async function installMissing(spec) {
     if (!IS_WIN) return { ok: false, error: `no aplica en ${process.platform}` };
 
     const que = (Array.isArray(s.que) ? s.que : [])
-        .filter((k) => ['emv_task', 'printer_task', 'printer_acl'].includes(k));
+        .filter((k) => ['emv_task', 'printer_task', 'printer_acl', 'spooler_acl'].includes(k));
     if (!que.length) return { ok: false, error: 'no se pidió instalar nada' };
 
     const emvTask = String(s.emvTask || 'NestorSantanderEMV');

@@ -2317,8 +2317,15 @@ async function asegurarColaDeWindows(aviso) {
     // hacer — sin códigos de error ni nombres de servicio de Windows. El detalle técnico
     // queda arriba, en la bitácora.
     const warn = porPermiso
+        // Este es el caso REAL en las cajas, no una rareza: por defecto, un usuario que
+        // no es administrador no puede arrancar el Spooler, así que el rescate se
+        // estrella contra un "acceso denegado" y la caja se queda sin imprimir por
+        // Windows. Tiene arreglo, y de una vez para siempre: el paso «Requisitos» del
+        // asistente concede el permiso con UN aviso de administrador. Por eso el aviso
+        // manda ahí en vez de pedir que alguien arranque el servicio a mano cada vez.
         ? 'La cola de impresión de Windows está detenida y esta caja no tiene permiso para iniciarla. '
-        + 'Pide que la inicien como administrador: las impresoras de Windows no van a imprimir.'
+        + 'Entra en Configuración → Servicios de la caja → Requisitos y pulsa «Revisar e instalar» '
+        + 'para concedérselo; mientras tanto, las impresoras de Windows no van a imprimir.'
         : deshabilitada
             ? 'La cola de impresión de Windows está deshabilitada y no se pudo habilitar desde aquí. '
             + 'Hay que habilitarla como administrador: las impresoras de Windows no van a imprimir.'
@@ -2384,13 +2391,43 @@ function colaDeWindowsDe(printer) {
 
     // La caja puede imprimir por el :8331 de OTRA máquina (`printer_host`). Entonces la
     // cola vive allá, y mirar las impresoras de ESTA máquina sería preguntar por el
-    // equipo equivocado: o no encuentra nada —y avisa de una avería que no existe— o
-    // encuentra una impresora distinta con el mismo nombre. Se calla, que es lo correcto
-    // cuando no se puede saber.
-    const host = String(printer.printer_host || '').trim().toLowerCase();
-    if (host && host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') return '';
+    // equipo equivocado. Pero "otra máquina" NO es "distinto de 127.0.0.1": lo normal en
+    // estas cajas es que se nombren a sí mismas por su IP de la red local
+    // (printer_host "192.168.10.118" apuntando a su propio equipo), y darlas por remotas
+    // dejaba la comprobación apagada justo donde había impresora que comprobar.
+    if (!esEsteEquipo(printer.printer_host)) return '';
 
     return String(printer.printer_uri || '').trim();
+}
+
+/**
+ * ¿Esta dirección es ESTE equipo?
+ *
+ * Vacío cuenta como sí: es lo que asume el propio POS al imprimir
+ * (`printer.printer_host || '127.0.0.1'`, ver print.dispatcher.js), y aquí tiene que
+ * significar lo mismo o las dos piezas discreparían sobre a qué máquina le hablan.
+ */
+function esEsteEquipo(host) {
+    const h = String(host || '').trim().toLowerCase();
+    if (!h) return true;
+    if (h === 'localhost' || h === '::1' || h === '0.0.0.0') return true;
+    if (/^127\./.test(h)) return true;
+
+    // El nombre de la máquina, con o sin dominio ("CAJA4" y "caja4.tienda.local").
+    const yo = String(os.hostname() || '').trim().toLowerCase();
+    if (yo && (h === yo || h === yo.split('.')[0] || h.split('.')[0] === yo.split('.')[0])) return true;
+
+    // Y cualquiera de sus direcciones. Es el caso real de las cajas: se configuran con
+    // su propia IP de la LAN en vez de con el bucle local.
+    try {
+        for (const lista of Object.values(os.networkInterfaces() || {})) {
+            for (const ni of lista || []) {
+                if (String(ni.address || '').trim().toLowerCase() === h) return true;
+            }
+        }
+    } catch (e) { /* sin interfaces que mirar: se decide por lo de arriba */ }
+
+    return false;
 }
 
 /**

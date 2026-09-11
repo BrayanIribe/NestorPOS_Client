@@ -9,6 +9,10 @@ const ledger = require('./ledger');
 const xhr = require('./xhr.capture');
 const posError = require('./pos.error');
 const services = require('./services.watchdog');
+// Ventana de arranque. Lo que se ve mientras se levanta el servidor local y se baja el
+// bundle del frontend — antes de esto, esos segundos eran pantalla vacía. Ver
+// src/splash.window.js.
+const splash = require('./splash.window');
 
 app.commandLine.appendSwitch('disable-http-cache');
 
@@ -292,14 +296,39 @@ async function fetchJson(url, timeoutMs) {
     return JSON.parse(body);
 }
 
-async function downloadBytes(url) {
+/**
+ * `onProgress(bajado, total)` va informando mientras cae el cuerpo.
+ *
+ * Se lee por trozos en vez de con `arrayBuffer()` porque esta descarga —el bundle del
+ * frontend— es LA espera del arranque: son varios MB en cada apertura, y por un enlace
+ * lento son los segundos en los que el splash tiene algo que contar. `total` sale de
+ * Content-Length; cuando el servidor no lo manda vale 0 y quien llama decide qué
+ * enseñar (ver splash.progress).
+ */
+async function downloadBytes(url, onProgress) {
     const res = await fetch(url, { cache: 'no-store' });
     if (!res.ok) {
         const body = await res.text().catch(() => '');
         throw new Error(`HTTP ${res.status} ${url}\n${body.slice(0, 300)}`);
     }
-    const ab = await res.arrayBuffer();
-    return Buffer.from(ab);
+    if (typeof onProgress !== 'function' || !res.body) {
+        const ab = await res.arrayBuffer();
+        return Buffer.from(ab);
+    }
+
+    const total = Number(res.headers.get('content-length') || 0) || 0;
+    const reader = res.body.getReader();
+    const trozos = [];
+    let bajado = 0;
+    onProgress(0, total);
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        trozos.push(value);
+        bajado += value.length;
+        onProgress(bajado, total);
+    }
+    return Buffer.concat(trozos.map((t) => Buffer.from(t)));
 }
 
 // Identidad de la build del servidor. Preferimos el commit; el hash del bundle
@@ -327,7 +356,13 @@ async function ensureFrontendCached(origin) {
     // if (sameServer && localMeta.version === remoteVer.version) return { version: remoteVer.version };
 
     const bundleUrl = `${origin}${remoteVer.bundle_path}`;
-    const zipBytes = await downloadBytes(bundleUrl);
+    splash.step('descarga');
+    const zipBytes = await downloadBytes(bundleUrl, (bajado, total) => splash.progress(bajado, total));
+
+    // Descomprimir y relevar el bundle bloquea el hilo un momento: hay que decir que se
+    // está haciendo ANTES de empezar, o la barra se queda clavada al 92% sin motivo
+    // aparente justo al final del arranque.
+    splash.step('instalando');
 
     const tmpDir = path.join(wwwRoot, `tmp_${Date.now()}`);
     await fsp.rm(tmpDir, { recursive: true, force: true });
@@ -1232,6 +1267,11 @@ function createMainWindow() {
         enforceMacNoTrafficLightsSoon(win);
         notifyWinMode(win);
         win.show();
+        // El splash se retira AQUÍ y no antes: entre `createMainWindow()` y este momento
+        // la ventana principal todavía está en blanco (carga el bundle y arranca Vue),
+        // así que cerrarlo al crearla devolvería el escritorio vacío justo al final del
+        // arranque — el hueco que este splash viene a tapar.
+        splash.close();
     });
 
     try {
@@ -2129,6 +2169,16 @@ app.whenReady().then(async () => {
         // dicen nada (ver offerReplaceOther).
         clearLaunchAttempts();
 
+        // Lo PRIMERO que se ve. Va aquí y no más abajo porque todo lo que sigue —el
+        // caché de sesión, el servidor local, la comprobación de build y sobre todo la
+        // descarga del bundle— son los segundos en los que antes no había nada en
+        // pantalla. Y va DESPUÉS del candado de instancia: enseñar un splash para
+        // cerrarlo medio segundo después, porque ya había otro cliente abierto, sería
+        // peor que no enseñar nada.
+        splash.show();
+        splash.step('arranque');
+
+        splash.step('equipo');
         await session.defaultSession.clearCache();
         await session.defaultSession.clearStorageData({
             storages: ['serviceworkers', 'cachestorage']
@@ -2170,6 +2220,7 @@ app.whenReady().then(async () => {
         // el puerto sea ESTE proceso (ver ensureLocalServer). Si el puerto es de alguien
         // más, abrir la ventana significa mostrarle al cajero el frontend de otro proceso
         // sobre datos de otro servidor, así que se dice y se sale.
+        splash.step('servidor');
         await ensureLocalServer('arranque');
         if (localServerState.listening !== true) {
             const detalle = localServerState.foreign
@@ -2177,6 +2228,10 @@ app.whenReady().then(async () => {
                 + 'Lo más probable es que ya haya un cliente de Nestor POS abierto (o uno que '
                 + 'quedó colgado). Ciérralo desde el Administrador de tareas y vuelve a abrir.'
                 : `No se pudo levantar el servidor local en ${LOCAL_FRONT_URL}.\n\n${localServerState.error || ''}`;
+            // El splash está siempre encima: si se deja puesto, este diálogo sale
+            // detrás y la caja se queda en una pantalla de carga eterna que no dice por
+            // qué no arranca.
+            splash.close();
             dialog.showErrorBox('Nestor POS no puede iniciar', detalle);
             app.exit(1);
             return;
@@ -2194,6 +2249,7 @@ app.whenReady().then(async () => {
         // con puertos propios armaría el filtro con los de fábrica y no vería NINGÚN
         // trabajo en vuelo — la compuerta de silencio quedaría abierta para siempre y el
         // daemon podría reiniciar el servicio a media venta con tarjeta.
+        splash.step('servicios');
         services.init(app.getPath('userData'), {
             onChange: broadcastServices,
             // El daemon sólo reporta cuando se da por vencido con un servicio: el canal
@@ -2214,14 +2270,20 @@ app.whenReady().then(async () => {
         // arrancamos con caché limpio. Aquí todavía no hay ventana, así que no
         // se toca localStorage: los borradores del POS de la sesión anterior
         // (ventas encoladas sin subir) tienen que sobrevivir.
+        splash.step('actualizacion');
         await clearCachesIfBuildChanged(serverOrigin);
 
         try {
             await ensureFrontendCached(serverOrigin);
         } catch (e) {
             console.error('[front cache] failed:', e && e.message ? e.message : e);
+            // No frena: se sigue con la copia que ya estaba en disco. Pero se dice, y se
+            // dice AQUÍ, porque un arranque con el bundle de ayer es exactamente el tipo
+            // de cosa que después nadie logra explicar.
+            splash.note('No se pudo actualizar; se abre con la copia guardada');
         }
 
+        splash.step('ventana');
         mainWindow = createMainWindow();
         registerPosShortcuts(mainWindow);
         startVersionWatcher(mainWindow);
@@ -2232,6 +2294,7 @@ app.whenReady().then(async () => {
         }
     } catch (err) {
         console.error(err);
+        splash.close();
         app.quit();
     }
 });
