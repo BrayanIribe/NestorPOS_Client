@@ -126,7 +126,9 @@ const ESQUEMA = {
     printer_rescue_task: {
         tipo: 'texto', def: 'NestorPrinterRescue', paso: 2, env: 'NESTOR_PRINTER_RESCUE_TASK',
         label: 'Tarea de respaldo',
-        ayuda: 'La tarea elevada que registra el instalador. Es el último escalón, para cuando el usuario de la caja no puede arrancar el servicio por sí mismo.'
+        ayuda: 'Una tarea programada que corre como SYSTEM y hace `sc start` del servicio de impresión. Es el ÚLTIMO escalón: '
+            + 'se usa sólo cuando el usuario de la caja no tiene permiso para arrancar el servicio por su cuenta. '
+            + 'Casi ninguna caja la tiene todavía; el paso 5 dice si falta y la instala.'
     },
 
     // ── Paso 3: terminal EMV ───────────────────────────────────────────────────
@@ -139,12 +141,25 @@ const ESQUEMA = {
     emv_task: {
         tipo: 'texto', def: 'NestorSantanderEMV', paso: 3, env: 'NESTOR_EMV_TASK',
         label: 'Tarea programada',
-        ayuda: 'La ÚNICA vía de rescate del EMV: el exe es requireAdministrator y el cliente no corre elevado, así que lanzarlo directo plantaría un UAC en la cara del cajero.'
+        ayuda: 'La vía PRINCIPAL de rescate del EMV: corre elevada, así que no planta un UAC en la cara del cajero. '
+            + 'Si falla, se intenta lanzar el ejecutable directamente (abajo).'
     },
     emv_exe: {
         tipo: 'texto', def: 'NestorSantanderEmvService.exe', paso: 3, env: 'NESTOR_EMV_EXE',
         label: 'Proceso',
-        ayuda: 'Sólo se usa para ver si está vivo y para terminarlo cuando quedó colgado.'
+        ayuda: 'El nombre del proceso, para ver si está vivo y para terminarlo cuando quedó colgado.'
+    },
+    emv_exe_path: {
+        tipo: 'texto', def: '', paso: 3, env: 'NESTOR_EMV_EXE_PATH',
+        label: 'Ruta del ejecutable',
+        ayuda: 'Vacío = se descubre de la propia tarea programada, y si no, C:\\NestorMX\\SantanderEMV\\NestorSantanderEmvService.exe. '
+            + 'Se usa como último escalón de rescate y para saber si el componente está instalado.'
+    },
+    emv_direct_launch: {
+        tipo: 'bool', def: true, paso: 3, env: 'NESTOR_EMV_DIRECT',
+        label: 'Lanzar el ejecutable si la tarea no arranca',
+        ayuda: 'Último escalón, cuando la tarea programada no existe o no levanta nada. Si el ejecutable pide administrador y esta caja no lo es, '
+            + 'no se lanza —Windows lo rechaza sin preguntar— y se dice por qué en vez de quedarse en «Rescatando».'
     },
     emv_port: {
         tipo: 'int', def: 5000, min: 1, max: 65535, paso: 3, env: 'NESTOR_EMV_PORT',

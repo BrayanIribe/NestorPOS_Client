@@ -109,6 +109,15 @@
     </div>
     <div id="aviso-vetados" class="aviso-global" hidden></div>
 
+    <!-- Le falta algo a la caja para poder rescatarse sola. Se dice AQUÍ, en cuanto se
+         abre el asistente y en todos los pasos, y no sólo en el paso 5: enterrado
+         cuatro clics adentro, quien viene a arreglar una caja que "no restablece" no
+         llegaría nunca — que es justo lo que pasaba. -->
+    <div id="aviso-requisitos" class="aviso-global" hidden>
+      <span id="aviso-requisitos-texto"></span>
+      <div style="margin-top:8px;"><button type="button" id="btn-ir-requisitos">Ver qué falta</button></div>
+    </div>
+
     <!-- ── Paso 1 ─────────────────────────────────────────────────────────── -->
     <section class="paso" data-paso="1" hidden>
       <h2>Estado actual</h2>
@@ -225,6 +234,25 @@
       </label>
 
       <label class="campo">
+        <span class="etiqueta">Ruta del ejecutable</span>
+        <div class="fila">
+          <input type="text" data-clave="emv_exe_path" placeholder="(descubrirla de la tarea programada)" />
+          <button type="button" class="secundario angosto" id="btn-examinar-emv">Examinar…</button>
+        </div>
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+        <span id="emv-exe-resuelto" class="detalle"></span>
+      </label>
+
+      <label class="campo">
+        <span class="etiqueta">Si la tarea programada no arranca nada</span>
+        <div class="opciones">
+          <label class="opcion"><input type="radio" name="emv_direct_launch" data-clave="emv_direct_launch" value="true" /><span><b>Lanzar el ejecutable directamente</b><small>Último escalón. Es lo que rescata la caja cuya tarea quedó mal registrada, en vez de dejarla en «Restableciendo…» para siempre.</small></span></label>
+          <label class="opcion"><input type="radio" name="emv_direct_launch" data-clave="emv_direct_launch" value="false" /><span><b>No intentarlo</b><small>Sólo por la tarea programada. Si ésta falla, se declara que la caja necesita atención.</small></span></label>
+        </div>
+        <span class="ayuda"></span><span class="fijado" hidden></span>
+      </label>
+
+      <label class="campo">
         <span class="etiqueta">Puerto</span>
         <div class="fila">
           <input type="number" data-clave="emv_port" min="1" max="65535" />
@@ -248,8 +276,42 @@
       </div>
     </section>
 
-    <!-- ── Paso 5 ─────────────────────────────────────────────────────────── -->
+    <!-- ── Paso 5 ─────────────────────────────────────────────────────────────
+         Requisitos de la caja.
+
+         Este paso existe porque el rescate se apoyaba en cosas que el instalador daba
+         por hechas y nunca llegó a hacer: la tarea NestorPrinterRescue no se registra
+         en NestorPOS_Setup.iss por ningún lado, la tarea del EMV se crea sin /RU (queda
+         a nombre de quien instaló) y sin descriptor de seguridad (el cajero, que no es
+         administrador, no puede dispararla). Con eso, el daemon disparaba tareas que no
+         iban a arrancar nada y la caja se quedaba en «Restableciendo…».
+
+         Arreglarlo sólo en el instalador no sirve de nada para las cajas que ya están
+         puestas: nadie reinstala una caja que "casi" funciona. Así que se arregla desde
+         aquí, con un botón y un aviso de Windows.
+    ────────────────────────────────────────────────────────────────────────── -->
     <section class="paso" data-paso="5" hidden>
+      <h2>Requisitos de la caja</h2>
+      <p class="lead">Para que el cliente pueda levantar solo un servicio caído hacen falta un par de cosas registradas en Windows. Aquí se ve si están, y si faltan se instalan desde aquí mismo — sin reinstalar nada.</p>
+
+      <div class="tarjeta">
+        <h3>Esta caja</h3>
+        <div id="req-caja" class="detalle">Comprobando…</div>
+      </div>
+
+      <div id="req-lista"></div>
+
+      <div class="fila" style="margin-top:4px;">
+        <button type="button" class="secundario angosto" id="btn-req-refrescar">Volver a comprobar</button>
+        <span class="relleno" style="flex:1;"></span>
+        <button type="button" class="angosto" id="btn-req-instalar" disabled>Instalar lo que falta</button>
+      </div>
+      <div class="detalle" style="margin-top:8px;">Windows va a pedir permiso de administrador una vez. No se toca nada más que lo que aparece arriba marcado como «falta».</div>
+      <div id="req-resultado" class="resultado"></div>
+    </section>
+
+    <!-- ── Paso 6 ─────────────────────────────────────────────────────────── -->
+    <section class="paso" data-paso="6" hidden>
       <h2>Resumen</h2>
       <p class="lead">Esto es lo que va a cambiar. Se aplica en el acto: no hace falta reiniciar el cliente ni la caja.</p>
       <div class="tarjeta">
@@ -277,7 +339,7 @@
 (function () {
   'use strict';
 
-  const TITULOS = ['Estado', 'Impresión', 'Terminal', 'Comportamiento', 'Resumen'];
+  const TITULOS = ['Estado', 'Impresión', 'Terminal', 'Comportamiento', 'Requisitos', 'Resumen'];
   const IS_MODAL = new URLSearchParams(location.search).get('modal') === '1';
 
   const puente = window.NestorClient && window.NestorClient.services;
@@ -576,7 +638,116 @@
     });
   }
 
-  // ── Paso 5: resumen ───────────────────────────────────────────────────────
+  // ── Paso 5: requisitos de la caja ─────────────────────────────────────────
+  //
+  // Lo que se enseña aquí NO es configuración: es el estado de la máquina. Cada
+  // renglón es una cosa que Windows tiene o no tiene, y de la que depende que el
+  // rescate funcione. Se separa de los pasos anteriores justamente por eso — apuntar
+  // bien un nombre de tarea no sirve de nada si esa tarea no existe.
+  let requisitos = null;
+
+  async function refrescarRequisitos() {
+    const caja = $('req-caja');
+    const lista = $('req-lista');
+    caja.textContent = 'Comprobando…';
+    lista.innerHTML = '';
+    $('btn-req-instalar').disabled = true;
+
+    try {
+      const r = await puente.requirements();
+      requisitos = r;
+      if (!r || r.ok === undefined) { caja.textContent = 'No se pudo comprobar: ' + ((r && r.error) || 'sin respuesta'); return; }
+
+      if (!r.esWindows) {
+        caja.textContent = r.nota || 'En este sistema no hay tareas programadas ni servicios de Windows.';
+        return;
+      }
+
+      caja.innerHTML = 'Usuario de esta caja: <b>' + escapa(r.usuario || '(desconocido)') + '</b>'
+        + (r.administrador ? ' · es administrador de la máquina' : ' · <b>no</b> es administrador de la máquina')
+        + '<div class="detalle" style="margin-top:6px;">Las tareas se registran a nombre de este usuario. '
+        + 'Si la caja se usa habitualmente con otra cuenta, entra con ésa antes de instalar: una tarea a nombre de '
+        + 'quien no inicia sesión aquí acepta el disparo y no arranca nada.</div>';
+
+      lista.innerHTML = (r.requisitos || []).map((q) => {
+        const pastilla = q.ok
+          ? '<span class="pastilla ok">LISTO</span>'
+          : (q.reparable ? '<span class="pastilla aviso">FALTA</span>' : '<span class="pastilla mal">FALTA</span>');
+        return '<div class="tarjeta"><div class="estado-linea"><span><b>' + escapa(q.titulo) + '</b></span>'
+          + pastilla + '</div><div class="detalle">' + escapa(q.detalle) + '</div>'
+          // Lo que el botón NO puede arreglar se dice aquí y no se ofrece: un botón que
+          // no va a servir es peor que ningún botón.
+          + (!q.ok && !q.reparable ? '<div class="detalle" style="margin-top:6px;color:#b06d00;">Esto no se puede instalar desde aquí.</div>' : '')
+          + '</div>';
+      }).join('') || '<div class="detalle">Nada que comprobar en esta caja.</div>';
+
+      const reparables = r.reparables || [];
+      $('btn-req-instalar').disabled = !reparables.length;
+      $('btn-req-instalar').textContent = reparables.length
+        ? ('Instalar lo que falta (' + reparables.length + ')')
+        : 'No falta nada';
+    } catch (e) {
+      caja.textContent = 'ERROR al comprobar: ' + (e && e.message ? e.message : String(e));
+    }
+  }
+
+  $('btn-req-refrescar').addEventListener('click', refrescarRequisitos);
+  $('btn-ir-requisitos').addEventListener('click', () => mostrarPaso(5));
+
+  /**
+   * El aviso de arriba, que se ve en TODOS los pasos.
+   *
+   * Se comprueba una vez al abrir y después de cada instalación. No en cada ronda:
+   * leer la definición de una tarea arranca PowerShell, y eso no puede pasar cada
+   * cuatro segundos sólo para repintar un renglón.
+   */
+  async function comprobarRequisitosDeFondo() {
+    try {
+      const r = await puente.requirements();
+      requisitos = r;
+      const faltan = (r && r.requisitos ? r.requisitos : []).filter((q) => !q.ok);
+      const av = $('aviso-requisitos');
+      av.hidden = !faltan.length;
+      if (faltan.length) {
+        $('aviso-requisitos-texto').textContent =
+          faltan.length === 1
+            ? 'A esta caja le falta una cosa para poder levantar sola un servicio caído: ' + faltan[0].titulo + '.'
+            : ('A esta caja le faltan ' + faltan.length + ' cosas para poder levantar sola un servicio caído: '
+               + faltan.map((q) => q.titulo).join(', ') + '.');
+      }
+    } catch (e) { /* sin esto el asistente sigue sirviendo; no se estorba por un aviso */ }
+  }
+
+  $('btn-req-instalar').addEventListener('click', async () => {
+    const el = $('req-resultado');
+    const reparables = (requisitos && requisitos.reparables) || [];
+    if (!reparables.length) return;
+
+    el.textContent = 'Windows va a pedir permiso de administrador. Acéptalo para continuar…';
+    $('btn-req-instalar').disabled = true;
+    try {
+      const r = await puente.installTasks(reparables);
+      const lineas = [];
+      if (r && r.cancelado) {
+        // Cancelar el UAC es una decisión, no un fallo. Decirlo como error asusta de más.
+        lineas.push('<div class="detalle">Se canceló el aviso de Windows: no se cambió nada.</div>');
+      } else {
+        (r && r.pasos ? r.pasos : []).forEach((p) => {
+          lineas.push('<div class="' + (p.ok ? 'paso-ok' : 'paso-mal') + '">' + escapa(p.clave) + ' — ' + escapa(p.detalle) + '</div>');
+        });
+        if (r && r.error) lineas.push('<div class="paso-mal">' + escapa(r.error) + '</div>');
+        if (r && r.ok) lineas.push('<div class="detalle">Listo. El daemon ya está comprobando de nuevo los servicios.</div>');
+      }
+      el.innerHTML = lineas.join('') || '<div class="detalle">Sin resultado.</div>';
+      await refrescarRequisitos();
+      await comprobarRequisitosDeFondo();
+    } catch (e) {
+      el.textContent = 'ERROR: ' + (e && e.message ? e.message : String(e));
+      $('btn-req-instalar').disabled = false;
+    }
+  });
+
+  // ── Paso 6: resumen ───────────────────────────────────────────────────────
   function pintarResumen() {
     const cambios = Object.keys(esquema).filter((k) => String(borrador[k]) !== String(valores[k]));
     $('diff').innerHTML = cambios.length
@@ -611,7 +782,8 @@
     if (paso === 1) refrescarEstado();
     if (paso === 2 || paso === 3) { if (!descubierto.servicios.length && !descubierto.tareas.length) refrescarListas(); }
     if (paso === 4) { pintarComportamiento(); pintarCampos(); }
-    if (paso === 5) pintarResumen();
+    if (paso === 5) refrescarRequisitos();
+    if (paso === 6) pintarResumen();
   }
 
   $('pasos').addEventListener('click', (ev) => {
@@ -629,6 +801,18 @@
       borrador.printer_instance_file = r.ruta;
       escribeControl('printer_instance_file', r.ruta);
       refrescarListas();
+    }
+  });
+
+  $('btn-examinar-emv').addEventListener('click', async () => {
+    const r = await puente.pickFile({
+      tipo: 'exe',
+      title: 'Selecciona NestorSantanderEmvService.exe',
+      defaultPath: borrador.emv_exe_path || 'C:\\NestorMX\\SantanderEMV'
+    });
+    if (r && r.ok && r.ruta) {
+      borrador.emv_exe_path = r.ruta;
+      escribeControl('emv_exe_path', r.ruta);
     }
   });
 
@@ -750,6 +934,9 @@
       pintarCampos();
       mostrarPaso(1);
       setInterval(() => { if (paso === 1) refrescarEstado(); }, 4000);
+      // De fondo, sin bloquear la primera pintada: arranca PowerShell y tarda un par de
+      // segundos. Quien abre el asistente ya está viendo su estado mientras tanto.
+      comprobarRequisitosDeFondo();
     } catch (e) {
       $('sin-puente').hidden = false;
       $('sin-puente').textContent = 'No se pudo leer la configuración: ' + (e && e.message ? e.message : String(e));

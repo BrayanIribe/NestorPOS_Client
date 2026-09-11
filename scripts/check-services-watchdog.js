@@ -212,6 +212,33 @@ if (cfgStore.motivoProhibido('printer_service', 'NestorPrinter')) {
     fallas.push('el servicio de Nestor está siendo rechazado por la lista de protegidos');
 }
 
+// ── El estado que se difunde tiene que poder explicar un atasco ────────────────
+//
+// `state` es un vocabulario cerrado de seis palabras, y con seis palabras no se
+// distingue «se está levantando ahora mismo» de «lleva media hora diciendo lo mismo».
+// Esas dos se veían idénticas desde la barra del POS —«RESTABLECIENDO…»— y por eso una
+// caja atascada parecía una caja trabajando. Los dos campos que las separan viajan en
+// el payload; si desaparecen, el síntoma vuelve y no deja rastro.
+for (const s of svc.status().services) {
+    if (!('settleUntil' in s)) {
+        fallas.push(`el servicio "${s.id}" no expone settleUntil: no habría forma de distinguir un arranque en curso de un atasco`);
+    }
+    if (!('fatal' in s)) {
+        fallas.push(`el servicio "${s.id}" no expone fatal: "no se puede rescatar" y "sigue intentándolo" se verían igual`);
+    }
+}
+
+// ── El último escalón del EMV viene encendido ──────────────────────────────────
+//
+// La tarea programada es la vía principal, pero en las cajas ya instaladas está mal
+// registrada (schtasks /Create sin /RU y sin descriptor de seguridad) y acepta el
+// disparo sin arrancar nada. Sin este escalón, esas cajas no tienen NINGUNA vía de
+// rescate — que es el estado del que se viene.
+if (cfgStore.defaults().emv_direct_launch !== true) {
+    fallas.push('el arranque directo del ejecutable del EMV viene apagado de fábrica: '
+        + 'una caja con la tarea mal registrada se quedaría sin ninguna vía de rescate');
+}
+
 svc.shutdown();
 
 if (fallas.length) {
