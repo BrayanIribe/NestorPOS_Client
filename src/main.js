@@ -1086,6 +1086,7 @@ function shutdownForExit(reason) {
     localServer = null;
     try { globalShortcut.unregisterAll(); } catch { }
     try { services.shutdown(); } catch { }
+    try { topology.shutdown(); } catch { }
     try { xhr.shutdown(); } catch { }
     try { ledger.shutdown(); } catch { }
     try { posError.shutdown(); } catch { }
@@ -1482,6 +1483,35 @@ function openConfigWindow() {
     configWindow.on('closed', () => { configWindow = null; });
 }
 
+// Fecha de compilación de ESTE cliente, en ISO. Acompaña a `clientVersion` en la
+// pantalla de acceso del POS ("Cliente POS: 1.0.21 · 19/09/2026").
+//
+// La buena la inyecta build.go al empaquetar (`-c.extraMetadata.buildDate=`, el mismo
+// sello que deploy.go sube al Fact), así que es EXACTAMENTE la del paquete publicado.
+// Un cliente anterior a ese cambio no la trae, y ahí se cae a la fecha del ejecutable
+// instalado: es el criterio que ya usa el servidor para su `binary_built_at` y, para
+// un .exe que nadie recompila en la caja, dice lo mismo con un día de margen.
+let clientBuiltAtCache = null;
+
+function clientBuiltAt() {
+    if (clientBuiltAtCache !== null) return clientBuiltAtCache;
+    clientBuiltAtCache = '';
+
+    try {
+        const meta = require('../package.json');
+        if (meta && meta.buildDate) clientBuiltAtCache = String(meta.buildDate);
+    } catch { /* sin package.json legible: queda el respaldo de abajo */ }
+
+    if (!clientBuiltAtCache) {
+        try {
+            const st = fs.statSync(process.execPath);
+            if (st && st.mtime) clientBuiltAtCache = new Date(st.mtime).toISOString();
+        } catch { /* se queda vacío: la pantalla enseña la versión sin fecha */ }
+    }
+
+    return clientBuiltAtCache;
+}
+
 function removeAndHandle(channel, handler) {
     try { ipcMain.removeHandler(channel); } catch { }
     ipcMain.handle(channel, handler);
@@ -1502,6 +1532,7 @@ ipcMain.on('nestor:get-config-sync', (event) => {
         // de estado del POS la pinta en el primer render y un `await` ahí se ve como un
         // parpadeo en cada arranque de caja.
         clientVersion: app.getVersion(),
+        clientBuiltAt: clientBuiltAt(),
         platform: process.platform
     };
 });
@@ -1598,6 +1629,7 @@ function wireIpc() {
             localFront: `http://127.0.0.1:${LOCAL_FRONT_PORT}`,
             apiBaseUrl: `http://127.0.0.1:${LOCAL_FRONT_PORT}/api/v1`,
             clientVersion: app.getVersion(),
+            clientBuiltAt: clientBuiltAt(),
             platform: process.platform
         };
     });
@@ -1814,6 +1846,10 @@ function wireIpc() {
     });
 
     servicesHandle('nestor:services:status', () => services.status());
+    // Qué versión corre cada componente de esta caja (printer y terminal EMV). Lo pide
+    // la pantalla de acceso del POS; el daemon lo cachea porque una de las vías entra
+    // al hardware. Ver la cabecera de `versiones` en services.watchdog.js.
+    servicesHandle('nestor:services:versions', (arg) => services.versiones(arg || {}));
     // Pone un servicio bajo vigilancia y lo levanta si no está. Es lo que llama el POS
     // al entrar a /pos para la terminal EMV.
     servicesHandle('nestor:services:ensure', (arg) => services.ensure(
@@ -2258,6 +2294,17 @@ app.whenReady().then(async () => {
             report: (info) => posError.report(info)
         });
         watchServiceTraffic();
+
+        // Latido de topología hacia el servidor: versión de este cliente y salud de
+        // los dos microservicios de la caja. Va DESPUÉS del daemon porque lee su
+        // `status()`, y usa la identidad de `xhr` (el token del cajero) para que el
+        // servidor sepa de QUÉ caja es el reporte. Ver src/topology.report.js.
+        topology.init({
+            appVersion: app.getVersion(),
+            serverOrigin: () => serverOrigin,
+            xhr,
+            services
+        });
 
         if (IS_DEV) {
             console.log(`[dev] frontend desde ${DEV_URL} (sin bundle, sin auto-update); API hacia ${serverOrigin}`);

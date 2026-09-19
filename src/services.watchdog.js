@@ -1502,6 +1502,9 @@ function aplicaConfigValores() {
     EMV_DIRECT = cfg.valores.emv_direct_launch;
     emvExeCache = '';
     emvDirectoNecesitaAdmin = false;
+    // Cambiar un puerto o la ruta del EMV cambia DE QUÉ componente se está hablando:
+    // una versión cacheada de antes sería la de otra cosa.
+    versionesCache = { at: 0, datos: null };
 }
 
 /** La configuración efectiva, con la procedencia de cada valor y el esquema. */
@@ -1675,6 +1678,165 @@ async function discover() {
         instancias: readInstanceFiles(),
         servicioResuelto: IS_WIN ? resolvePrinterService() : ''
     };
+}
+
+// ── Versiones de los componentes de la caja ─────────────────────────────────────
+//
+// QUÉ VERSIÓN CORRE CADA PIEZA DE ESTA CAJA, con su fecha de compilación.
+//
+// Lo pinta la pantalla de acceso del POS debajo del número de licencia, y existe para
+// la primera pregunta de casi cualquier reporte de soporte: "¿esta caja está al día?".
+// Hoy eso se contesta entrando a la máquina, o esperando al latido de topología que
+// sube a la nube (topology.report.js) y mirando el panel — con el cajero al teléfono.
+//
+// Tres decisiones que no son obvias:
+//
+// 1. Se aprovecha lo que el daemon YA sabe: `st.info` es el cuerpo del último sondeo
+//    de salud, de hace segundos. Sólo se sale a preguntar lo que falte. En la pantalla
+//    de acceso el EMV todavía no está bajo vigilancia —lo enciende el POS al entrar a
+//    vender—, así que ahí sí hay que sondearlo: /api/health es su puerta barata, la
+//    única que contesta sin activación ni emparejamiento.
+//
+// 2. La fecha del printer sale de /api/v1/health. Un printer anterior no la trae (se
+//    agregó junto con esta pantalla) y entonces se cae a /api/v1, la "cara", que sí la
+//    ha tenido siempre — pero calcula el HWID en cada llamada, entrando al hardware.
+//    Por eso es el RESPALDO y no la vía, y por eso todo esto se cachea: como latido
+//    sería martillar la máquina; una vez cada diez minutos no es nada.
+//
+// 3. La versión del EMV no sale de su ensamblado (AssemblyVersion lleva años en
+//    1.0.0.0): la estampa el Fact al publicar, en un version.txt junto al .exe, y el
+//    microservicio la devuelve en /api/health. La FECHA no la estampa nadie, así que
+//    se usa la del EJECUTABLE instalado — el mismo criterio que el `binary_built_at`
+//    del servidor, y lo más cercano a la verdad que hay sin recompilar el componente.
+//
+// Como todo lo de este archivo: no lanza nunca. Un dato que no se pudo averiguar va
+// vacío, y la pantalla enseña la versión sin fecha en vez de no enseñar nada.
+const VERSIONES_TTL_MS = 10 * 60 * 1000;
+let versionesCache = { at: 0, datos: null };
+
+async function versiones(opts) {
+    const forzar = !!(opts && opts.force);
+    const ahora = Date.now();
+    if (!forzar && versionesCache.datos && (ahora - versionesCache.at) < VERSIONES_TTL_MS) {
+        return { ...versionesCache.datos, cacheada: true };
+    }
+
+    const [printer, emv] = await Promise.all([versionPrinter(), versionEmv()]);
+    const datos = { ok: true, at: ahora, printer, emv };
+    versionesCache = { at: ahora, datos };
+    return { ...datos, cacheada: false };
+}
+
+/** Sello del microservicio de impresión de ESTA caja (el que el daemon vigila). */
+async function versionPrinter() {
+    const st = servicios.printer;
+    const out = {
+        puerto: PUERTOS.printer,
+        version: '',
+        commit: '',
+        branch: '',
+        buildDate: '',
+        layoutVersion: 0,
+        contesta: false,
+        fuente: '',
+        // "nunca" es una caja que no imprime aquí (imprime en otra máquina, o no
+        // imprime). Mismo criterio que el EMV: donde no hay componente no hay versión
+        // de la que hablar, y un renglón vacío se lee como una falla.
+        aplica: String(cfg.valores.printer_watch || '') !== 'nunca'
+    };
+    if (!out.aplica) return out;
+
+    // El sondeo vivo, si lo hay. Con la vigilancia apagada (o antes de la primera
+    // ronda) no hay nada guardado y se pregunta aquí mismo: /api/v1/health no toca la
+    // DLL ni la impresora.
+    let salud = (st && st.info) || null;
+    if (salud && salud.build_version) {
+        out.contesta = true;
+    } else {
+        const sonda = await probePrinter();
+        salud = (sonda && sonda.info) || null;
+        out.contesta = !!(sonda && sonda.alive);
+    }
+
+    if (salud) {
+        out.version = String(salud.build_version || '');
+        out.commit = String(salud.build_commit || '');
+        out.buildDate = String(salud.build_date || '');
+        out.layoutVersion = Number(salud.layout_version) || 0;
+        if (out.version) out.fuente = 'health';
+    }
+
+    // Respaldo para un printer anterior a que /health llevara la fecha. Se paga el HWID
+    // una vez por ventana de caché, y sólo cuando hay alguien contestando al otro lado.
+    if (!out.buildDate && out.contesta) {
+        const r = await httpGet(`http://127.0.0.1:${PUERTOS.printer}/api/v1`, PROBE_TIMEOUT_MS);
+        const cara = (r && r.ok && r.status === 200 && r.body) || null;
+        if (cara) {
+            out.version = String(cara.build_version || out.version || '');
+            out.commit = String(cara.build_commit || out.commit || '');
+            out.branch = String(cara.build_branch || '');
+            out.buildDate = String(cara.build_date || '');
+            out.layoutVersion = Number(cara.layout_version) || out.layoutVersion;
+            out.fuente = 'index';
+        }
+    }
+
+    return out;
+}
+
+/** Sello del microservicio EMV Santander, si esta caja lo tiene. */
+async function versionEmv() {
+    const st = servicios.emv;
+    const out = {
+        puerto: PUERTOS.emv,
+        version: '',
+        dllVersion: '',
+        exe: '',
+        instalado: false,
+        builtAt: '',
+        contesta: false,
+        // "nunca" es lo que se pone en una caja SIN terminal. No es que no se sepa la
+        // versión: es que aquí no hay componente del que hablar, y la pantalla no debe
+        // enseñar un renglón en gris que parezca una falla.
+        aplica: String(cfg.valores.emv_watch || '') !== 'nunca'
+    };
+    if (!out.aplica) return out;
+
+    let salud = (st && st.info) || null;
+    if (salud && salud.service_version) {
+        out.contesta = true;
+    } else {
+        const sonda = await probeEmv();
+        salud = (sonda && sonda.info) || null;
+        out.contesta = !!(sonda && sonda.alive);
+    }
+
+    if (salud) {
+        out.version = String(salud.service_version || '');
+        const detalle = salud.detail || {};
+        out.dllVersion = String(detalle.version || '');
+    }
+
+    // El ejecutable instalado: es lo que distingue "la terminal está apagada" de "en
+    // esta caja no hay componente EMV", y de él sale la fecha.
+    if (IS_WIN) {
+        try {
+            out.exe = await emvExePath(null);
+            out.instalado = existeArchivo(out.exe);
+            out.builtAt = fechaDeArchivo(out.exe);
+        } catch { /* se queda sin ruta: la versión igual vale */ }
+    }
+
+    return out;
+}
+
+/** Fecha de modificación de un archivo, en ISO. '' si no se pudo leer. */
+function fechaDeArchivo(ruta) {
+    try {
+        if (!ruta) return '';
+        const st = fs.statSync(ruta);
+        return st && st.mtime ? new Date(st.mtime).toISOString() : '';
+    } catch { return ''; }
 }
 
 /**
@@ -2839,6 +3001,9 @@ module.exports = {
     resetConfig,
     discover,
     probeTarget,
+    // Qué versión corre cada componente de esta caja. Lo pide la pantalla de acceso
+    // del POS; se cachea diez minutos porque una de las vías entra al hardware.
+    versiones,
     // Qué le falta a esta caja para poder rescatarse sola, y el botón que lo instala.
     // Ver services.tasks.js: la mitad de lo que docs/daemon-servicios.md daba por hecho
     // que hacía el instalador nunca se escribió, y las cajas ya instaladas no se

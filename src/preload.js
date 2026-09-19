@@ -54,6 +54,10 @@ contextBridge.exposeInMainWorld('NestorClient', {
     // En navegador `window.NestorClient` no existe y el POS cae al User-Agent, que
     // también la trae (`nestorpos_client/1.0.5`).
     clientVersion: initialConfig ? String(initialConfig.clientVersion || '') : '',
+    // Fecha de compilación del paquete instalado, en ISO. Viaja por el mismo canal
+    // síncrono y por lo mismo. Vacía en un cliente anterior: quien la pinta enseña la
+    // versión sola, nunca una fecha inventada.
+    clientBuiltAt: initialConfig ? String(initialConfig.clientBuiltAt || '') : '',
     platform: initialConfig ? String(initialConfig.platform || '') : '',
 
     minimize: () => invoke('win:minimize'),
@@ -281,16 +285,21 @@ contextBridge.exposeInMainWorld('NestorClient', {
         // v3: requisitos de la caja e instalación de lo que falte
         //     (requirements/installTasks).
         // v4: candado de servicios del arranque (bootGate/onBootGate).
-        version: 4,
+        // v5: versiones de los componentes de la caja (versions).
+        version: 5,
         capabilities: [
             'status', 'ensure', 'release', 'repair', 'hold', 'unhold', 'openFolder', 'onChange',
             'config', 'configSave', 'configReset', 'discover', 'probe', 'pickFile',
             'requirements', 'installTasks',
-            'bootGate', 'onBootGate'
+            'bootGate', 'onBootGate',
+            'versions'
         ],
 
         // { ok, enabled, rescue, mode, services: [{ id, state, detail, warn, ... }] }
         status: () => invoke('nestor:services:status'),
+        // { ok, printer: { version, buildDate, ... }, emv: { version, builtAt, aplica, ... } }
+        // Cacheado 10 min en el daemon; `{ force: true }` lo salta.
+        versions: (options) => invoke('nestor:services:versions', options || {}),
         // Pone el servicio bajo vigilancia y, si no contesta, lo levanta AHORA.
         ensure: (id, options) => invoke('nestor:services:ensure', Object.assign({ id }, options || {})),
         // Deja de vigilarlo (no apaga nada). El de impresión se vigila siempre.
