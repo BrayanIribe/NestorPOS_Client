@@ -9,6 +9,10 @@ const ledger = require('./ledger');
 const xhr = require('./xhr.capture');
 const posError = require('./pos.error');
 const services = require('./services.watchdog');
+// Latido de topología hacia el servidor: versión de este cliente y salud de los dos
+// microservicios de la caja. Se arranca abajo, en app.whenReady(), después del daemon
+// de servicios porque lee su `status()`. Ver src/topology.report.js.
+const topology = require('./topology.report');
 // Ventana de arranque. Lo que se ve mientras se levanta el servidor local y se baja el
 // bundle del frontend — antes de esto, esos segundos eran pantalla vacía. Ver
 // src/splash.window.js.
