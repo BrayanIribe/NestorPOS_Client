@@ -825,6 +825,16 @@ function record(entry) {
 // Los renglones se versionan en vez de reescribirse: una venta puede recapturarse entre el
 // cobro con terminal y el cierre, y perder la foto anterior sería perder justo la prueba de
 // qué se cobró primero. Se guarda una revisión nueva sólo si de verdad cambió algo.
+// Columnas de ticket_products para LEER. qty/price/total salen como REAL: node:sqlite
+// revienta (ERR_OUT_OF_RANGE) al leer un entero mayor a 2^53, y un renglón así existe —un
+// código de barras que entró como cantidad (27/sep/2026, D4 Almaguer, TC-2-6533: qty
+// 7502208804075 × 1e6)—. Con `SELECT *` esa lectura tumbaba el detalle de la venta ("No hay
+// más detalle guardado"), el cotejo de revisiones de saveProducts y el archivado. Como REAL
+// el valor llega aproximado, que para mostrarlo y compararlo basta.
+const PRODUCT_READ_COLS = `id, ticket_key, rev, line_no, product_id, name, description, sold_code,
+    CAST(qty AS REAL) AS qty, CAST(price AS REAL) AS price, CAST(total AS REAL) AS total,
+    is_cancel, is_purchase, offer_name, notes, at_ms`;
+
 function saveProducts(key, rev, products, atMs) {
     const list = Array.isArray(products) ? products : null;
     if (!list || list.length === 0) return;
@@ -838,7 +848,7 @@ function saveProducts(key, rev, products, atMs) {
     if (prevFp) {
         const prevRev = num(prevFp.rev);
         const prevRows = db.prepare(
-            'SELECT product_id, qty, price, total, is_cancel FROM ticket_products WHERE ticket_key = ? AND rev = ? ORDER BY line_no'
+            `SELECT ${PRODUCT_READ_COLS} FROM ticket_products WHERE ticket_key = ? AND rev = ? ORDER BY line_no`
         ).all(key, prevRev);
         const prevFingerprint = sha256(JSON.stringify(prevRows.map(p => [
             num(p.product_id), num(p.qty), num(p.price), num(p.total), num(p.is_cancel),
@@ -1208,7 +1218,7 @@ function get(key) {
         if (!ticket) return { ok: false, error: 'la venta no está en el ledger' };
 
         const products = db.prepare(
-            'SELECT * FROM ticket_products WHERE ticket_key = ? AND rev = (SELECT MAX(rev) FROM ticket_products WHERE ticket_key = ?) ORDER BY line_no'
+            `SELECT ${PRODUCT_READ_COLS} FROM ticket_products WHERE ticket_key = ? AND rev = (SELECT MAX(rev) FROM ticket_products WHERE ticket_key = ?) ORDER BY line_no`
         ).all(k, k);
         // Igual que en list(): también los vouchers que se anotaron sueltos (sin ticket_key)
         // y que corresponden a esta venta por su referencia (por su base — la referencia
@@ -1491,7 +1501,7 @@ function archive(options) {
         };
 
         const tickets = keys.length ? enLotes('SELECT * FROM tickets WHERE ticket_key IN ({{in}})', keys) : [];
-        const productos = keys.length ? enLotes('SELECT * FROM ticket_products WHERE ticket_key IN ({{in}})', keys) : [];
+        const productos = keys.length ? enLotes(`SELECT ${PRODUCT_READ_COLS} FROM ticket_products WHERE ticket_key IN ({{in}})`, keys) : [];
         const vouchers = keys.length ? enLotes('SELECT * FROM emv_vouchers WHERE ticket_key IN ({{in}})', keys) : [];
 
         // ── 1. El archivo, ANTES de tocar la base ──
