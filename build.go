@@ -296,8 +296,12 @@ func main() {
 	//    esto lo único disponible en la caja es la fecha del .exe, que es la de la
 	//    instalación y no la de la compilación. Es el mismo `ts` que viaja en
 	//    client_build.json y que deploy.go sube al Fact: un solo sello para los dos.
-	fmt.Println("\n=> electron-builder --win…")
-	if err := run("npx", "electron-builder", "--win",
+	// --x64 explícito: el cliente corre en las cajas x86-64 de las tiendas. Sin el
+	// flag, electron-builder compila para el arch del HOST, y en el agente VM (Windows
+	// ARM64) saldría un paquete win-arm64 inútil para las cajas. En el agente x64 el
+	// flag es un no-op (el default ya era x64). Ver MIGRACION-WIN32-VM.md.
+	fmt.Println("\n=> electron-builder --win --x64…")
+	if err := run("npx", "electron-builder", "--win", "--x64",
 		"-c.extraMetadata.version="+version,
 		"-c.extraMetadata.buildDate="+ts,
 		"-c.extraMetadata.buildCommit="+commit,
