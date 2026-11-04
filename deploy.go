@@ -8,7 +8,7 @@
 // Lee output/client_build.json (generado por build.go) para saber qué .exe
 // subir y con qué versión/canal. Luego:
 //   1. Autentica contra /panel/v1/auth/login (env NESTOR_DEPLOY_USER/PASS).
-//   2. POST multipart (en chunks de 50MB para sortear el límite de Cloudflare)
+//   2. POST multipart (en chunks de 8 MB con reintento; ver deployChunkDefault)
 //      a /panel/v1/installers con platform=nestor-client-windows.
 //   3. El Fact auto-publica el instalador y borra el anterior de ese (canal,
 //      plataforma). Queda servido en:
@@ -31,6 +31,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -39,6 +40,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -48,7 +50,7 @@ const (
 	clientPlatform    = "nestor-client-windows"
 	outputDir         = "output"
 	buildMetaFile     = "output/client_build.json"
-	installerChunkSz  = 50 * 1024 * 1024 // 50 MB — por debajo del límite de Cloudflare.
+	installerChunkSz  = deployChunkDefault // ver deployChunkDefault / NESTOR_DEPLOY_CHUNK_MB
 )
 
 type buildMeta struct {
@@ -192,13 +194,97 @@ type installerMeta struct {
 
 // uploadInstallerChunked sube el .exe en trozos a /panel/v1/installers. Los
 // chunks intermedios responden 202; el último ensambla y devuelve el resultado.
+// ─── Subida resistente a redes inestables ─────────────────────────────────
+// Antes: chunks de 50 MB sin reintento, y un solo chunk corrupto en el camino
+// («tls: bad record MAC», ~1 de cada 8 subidas de 50 MB desde la red de la
+// oficina, medido el 4-nov-2026) tumbaba el deploy completo. Ahora: chunks
+// chicos + reintento por chunk con espera creciente.
+//
+// Reenviar es idempotente: el Fact guarda cada chunk como
+// <upload_id>_<indice>.chunk y lo SOBRESCRIBE; solo el ultimo chunk ensambla.
+// TLS rechaza un chunk corrupto, asi que nunca se guarda danado, y el ZIP
+// ensamblado se valida contra su sha256/firma del lado del Fact.
+
+// deployChunkDefault — tamano de chunk por default. Override con
+// NESTOR_DEPLOY_CHUNK_MB (1..95; Cloudflare corta en 100 MB por request).
+const deployChunkDefault = 8 * 1024 * 1024
+
+// deployChunkAttempts — intentos por chunk (1 + 5 reintentos).
+const deployChunkAttempts = 6
+
+// deployChunkTimeout — tope por REQUEST (un chunk), no por subida completa.
+const deployChunkTimeout = 10 * time.Minute
+
+func deployChunkSize() int64 {
+	if v := strings.TrimSpace(os.Getenv("NESTOR_DEPLOY_CHUNK_MB")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 95 {
+			return int64(n) * 1024 * 1024
+		}
+		fmt.Fprintf(os.Stderr, "[warn] NESTOR_DEPLOY_CHUNK_MB=%q invalido (1..95); se usan %d MB\n", v, deployChunkDefault/(1024*1024))
+	}
+	return deployChunkDefault
+}
+
+// deployHTTPError — el Fact respondio con un status inesperado. Los errores de
+// red (sin respuesta) no usan este tipo y siempre se reintentan.
+type deployHTTPError struct {
+	status int
+	msg    string
+}
+
+func (e *deployHTTPError) Error() string { return e.msg }
+
+// retryable — 5xx, 408 y 429 pueden ser transitorios; el resto de 4xx (auth,
+// campos, 413) no se arregla reenviando lo mismo.
+func (e *deployHTTPError) retryable() bool {
+	return e.status >= 500 || e.status == 408 || e.status == 429
+}
+
+// sendChunkWithRetry corre send() hasta deployChunkAttempts veces.
+func sendChunkWithRetry[T any](i, n int, send func() (*T, error)) (*T, error) {
+	waits := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second}
+	netErr := false
+	for attempt := 1; ; attempt++ {
+		res, err := send()
+		if err == nil {
+			if attempt > 1 {
+				fmt.Printf("     chunk %d/%d OK al intento %d\n", i+1, n, attempt)
+			}
+			return res, nil
+		}
+		var he *deployHTTPError
+		if errors.As(err, &he) {
+			if !he.retryable() {
+				return nil, err // 4xx: reintentar no lo arregla
+			}
+		} else {
+			netErr = true
+		}
+		if attempt >= deployChunkAttempts {
+			// El ultimo chunk es el que arma y PERSISTE la publicacion. Si un
+			// intento previo se corto DESPUES de que el Fact lo procesara, el
+			// reintento ya no encuentra los chunks anteriores (se limpian al
+			// publicar) y responde chunk_assemble_failed aunque si quedo publicada.
+			if i == n-1 && netErr && strings.Contains(err.Error(), "chunk_assemble_failed") {
+				err = fmt.Errorf("%w\n\n   OJO: un intento anterior del ultimo chunk se corto en la red; la publicacion\n   puede haber quedado hecha. Revisar el panel antes de volver a desplegar", err)
+			}
+			return nil, fmt.Errorf("%w (tras %d intentos)", err, attempt)
+		}
+		wait := waits[attempt-1]
+		fmt.Printf("     ! chunk %d/%d intento %d/%d fallo: %v — reintentando en %s\n",
+			i+1, n, attempt, deployChunkAttempts, err, wait)
+		time.Sleep(wait)
+	}
+}
+
 func uploadInstallerChunked(uploadURL, token, exePath, exeName string, meta installerMeta) (*installerResult, error) {
 	info, err := os.Stat(exePath)
 	if err != nil {
 		return nil, fmt.Errorf("stat exe: %w", err)
 	}
 	total := info.Size()
-	totalChunks := int((total + installerChunkSz - 1) / installerChunkSz)
+	chunkSize := deployChunkSize()
+	totalChunks := int((total + chunkSize - 1) / chunkSize)
 	if totalChunks < 1 {
 		totalChunks = 1
 	}
@@ -208,22 +294,24 @@ func uploadInstallerChunked(uploadURL, token, exePath, exeName string, meta inst
 		fmt.Printf("   EXE %d bytes — envío directo (1 chunk)\n", total)
 	} else {
 		fmt.Printf("   EXE %d bytes — %d chunks de %d bytes (upload_id=%s)\n",
-			total, totalChunks, installerChunkSz, uploadID)
+			total, totalChunks, chunkSize, uploadID)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Minute}
+	client := &http.Client{Timeout: deployChunkTimeout}
 
 	for i := 0; i < totalChunks; i++ {
-		offset := int64(i) * int64(installerChunkSz)
-		size := int64(installerChunkSz)
+		offset := int64(i) * chunkSize
+		size := chunkSize
 		if offset+size > total {
 			size = total - offset
 		}
 		fmt.Printf("   → chunk %d/%d (%d bytes)\n", i+1, totalChunks, size)
-		result, err := uploadInstallerChunkOnce(
-			client, uploadURL, token, exePath, exeName,
-			offset, size, i, totalChunks, uploadID, meta,
-		)
+		result, err := sendChunkWithRetry(i, totalChunks, func() (*installerResult, error) {
+			return uploadInstallerChunkOnce(
+				client, uploadURL, token, exePath, exeName,
+				offset, size, i, totalChunks, uploadID, meta,
+			)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("chunk %d/%d: %w", i+1, totalChunks, err)
 		}
@@ -315,7 +403,7 @@ func uploadInstallerChunkOnce(
 		if resp.StatusCode == 413 {
 			msg += "\n\nEl chunk excede el límite del proxy. Reduce installerChunkSz o usa NESTOR_DEPLOY_UPLOAD_URL apuntando a un subdominio DNS-only."
 		}
-		return nil, fmt.Errorf("%s", msg)
+		return nil, &deployHTTPError{status: resp.StatusCode, msg: msg}
 	}
 }
 
