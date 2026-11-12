@@ -9,6 +9,17 @@ const https = require('https');
 const LOCAL_FRONT_PORT = parseInt(process.env.NESTOR_FRONT_PORT || '18180', 10);
 const CACHE_MAX_BYTES = parseInt(process.env.NESTOR_API_CACHE_MAX_BYTES || String(5 * 1024 * 1024), 10);
 
+// Tope para CONECTAR con el servidor del negocio (sólo el TCP/TLS, no la respuesta: un
+// register-ticket puede tardar lo que tarde y no se corta).
+//
+// Caso real (12/nov/2026, CAJA03): con el servidor inalcanzable el proxy no tenía tope
+// alguno, así que cada petición se quedaba colgada hasta que la ventana se rendía (8, 10,
+// 26 s) y el cajero veía la caja "trabada" en vez de un error claro. Con el tope, un
+// servidor que no contesta da 502 a los pocos segundos —o la copia en caché de un GET—
+// igual que un EHOSTUNREACH.
+const UPSTREAM_CONNECT_TIMEOUT_MS = Math.max(1000,
+    parseInt(process.env.NESTOR_UPSTREAM_CONNECT_MS || '6000', 10));
+
 function sha256Hex(s) {
     return crypto.createHash('sha256').update(String(s)).digest('hex');
 }
@@ -417,6 +428,31 @@ function startLocalFrontendServer(currentDir, getServerOriginFn, options = {}) {
     // 127.0.0.1:18180 soy yo. Ver `/__client/ping`.
     const identity = Object.assign({ app: 'nestorpos_client', pid: process.pid, nonce: '' }, options.identity || {});
 
+    // ── ¿Está vivo, aunque vaya lento? ─────────────────────────────────────────
+    //
+    // El vigilante de main.js decidía "muerto" sólo porque `/__client/ping` no contestó
+    // en 2.5 s, y lo reiniciaba cortando todas las conexiones — incluido el
+    // register-ticket en vuelo (12/nov/2026, CAJA03, tres veces en un día). Un express
+    // que sigue terminando peticiones NO está muerto: está lento, y reiniciarlo no
+    // arregla la lentitud. Esto le da al vigilante con qué distinguir una cosa de la otra.
+    const activity = { inflight: 0, lastFinishedAt: 0, finished: 0 };
+    ex.use((req, res, next) => {
+        activity.inflight++;
+        let done = false;
+        res.once('close', () => {
+            if (done) return;
+            done = true;
+            activity.inflight = Math.max(0, activity.inflight - 1);
+            // Sólo cuenta como "contestó" si de verdad salió una respuesta; una conexión
+            // que la ventana abandona no dice nada de la salud del servidor.
+            if (res.headersSent) {
+                activity.lastFinishedAt = Date.now();
+                activity.finished++;
+            }
+        });
+        next();
+    });
+
     ex.get('/__client/config', (req, res) => {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         res.end(configHtml());
@@ -611,7 +647,28 @@ function startLocalFrontendServer(currentDir, getServerOriginFn, options = {}) {
             proxyRes.pipe(res, { end: true });
         });
 
+        // Tope de conexión (ver UPSTREAM_CONNECT_TIMEOUT_MS). Con keep-alive el socket
+        // puede venir ya conectado del pool: ahí no hay nada que cronometrar.
+        proxyReq.on('socket', (sock) => {
+            if (!sock || !sock.connecting) return;
+            const timer = setTimeout(() => {
+                const err = new Error(`connect ETIMEDOUT ${options.hostname}:${options.port}`
+                    + ` (sin respuesta en ${UPSTREAM_CONNECT_TIMEOUT_MS} ms)`);
+                err.code = 'ETIMEDOUT';
+                proxyReq.destroy(err);
+            }, UPSTREAM_CONNECT_TIMEOUT_MS);
+            const clear = () => clearTimeout(timer);
+            sock.once('connect', clear);
+            sock.once('close', clear);
+        });
+
         proxyReq.on('error', async (err) => {
+            // Si la respuesta ya había empezado a salir, no hay 502 que mandar: se corta
+            // la conexión para que la ventana sepa que llegó incompleta.
+            if (res.headersSent) {
+                try { res.destroy(err); } catch { }
+                return;
+            }
             if (canCacheRequest) {
                 const ok = await serveCached();
                 if (ok) return;
@@ -681,6 +738,7 @@ function startLocalFrontendServer(currentDir, getServerOriginFn, options = {}) {
     // (probado en macOS con express 5.2.1), no es una rareza de Windows.
     return new Promise((resolve, reject) => {
         const server = ex.listen(LOCAL_FRONT_PORT, '127.0.0.1');
+        server.nestorActivity = () => Object.assign({}, activity);
         server.once('listening', () => resolve(server));
         server.once('error', reject);
     });

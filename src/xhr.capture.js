@@ -72,6 +72,7 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const health = require('./main.health');
 
 // ── Palancas ────────────────────────────────────────────────────────────────────
 
@@ -468,9 +469,13 @@ function lockedByOtherProcess(harFile) {
 function writeChunk(text) {
     if (!current) return;
     try {
+        const t0 = Date.now();
         const buf = Buffer.from(text, 'utf8');
         fs.writeSync(current.fd, buf);
         current.bytes += buf.length;
+        // writeSync corre en el proceso principal —el del proxy—: si el disco o el
+        // antivirus lo detienen, se detiene la caja entera. Ver src/main.health.js.
+        health.noteDuration(`xhr escritura ${Math.round(buf.length / 1024)}KB`, Date.now() - t0);
     } catch (e) {
         // Disco lleno o descriptor caído: la captura se apaga sola, la caja sigue.
         console.warn('[xhr] no se pudo escribir la captura:', e && e.message ? e.message : e);

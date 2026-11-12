@@ -8,6 +8,7 @@ const { startLocalFrontendServer } = require('./proxy');
 const ledger = require('./ledger');
 const xhr = require('./xhr.capture');
 const posError = require('./pos.error');
+const health = require('./main.health');
 const services = require('./services.watchdog');
 // Latido de topología hacia el servidor: versión de este cliente y salud de los dos
 // microservicios de la caja. Se arranca abajo, en app.whenReady(), después del daemon
@@ -797,7 +798,40 @@ async function probeLocalServer(timeoutMs = LOCAL_SERVER_PROBE_TIMEOUT_MS) {
             error: ''
         };
     } catch (e) {
-        return { ok: false, mine: false, foreign: false, error: e && e.message ? e.message : String(e) };
+        const cause = e && e.cause;
+        return {
+            ok: false,
+            mine: false,
+            foreign: false,
+            // Se venció el tiempo (AbortSignal.timeout) — NO es lo mismo que "nadie
+            // escucha": el express puede estar vivo y el bucle de este proceso ocupado.
+            timeout: !!e && (e.name === 'TimeoutError' || /aborted due to timeout/i.test(String(e.message || ''))),
+            code: (cause && cause.code) || (e && e.code) || '',
+            error: e && e.message ? e.message : String(e)
+        };
+    }
+}
+
+// Cuánto tiempo sin que el express termine NINGUNA respuesta hace falta para tratar un
+// sondeo vencido como servidor muerto (y no como servidor lento).
+const LOCAL_SERVER_STALL_MS = 90 * 1000;
+
+/**
+ * El sondeo se venció: ¿el express está vivo pero lento, o de verdad atorado?
+ *
+ * Vivo = sigue en `listening` y terminó alguna respuesta hace poco. La ventana del POS
+ * hace peticiones cada pocos segundos (status, draft, audit), así que un express sano
+ * siempre tiene algo reciente; uno atorado deja de terminar peticiones del todo.
+ */
+function localServerLooksAlive() {
+    const srv = localServer;
+    if (!srv || !srv.listening || typeof srv.nestorActivity !== 'function') return null;
+    try {
+        const act = srv.nestorActivity();
+        const hace = act.lastFinishedAt ? Date.now() - act.lastFinishedAt : Infinity;
+        return { alive: hace < LOCAL_SERVER_STALL_MS, sinceMs: hace, inflight: act.inflight };
+    } catch {
+        return null;
     }
 }
 
@@ -958,7 +992,7 @@ async function listenLocalServer() {
     // Si el socket se cae por su cuenta, la próxima ronda tiene que volver a levantarlo.
     server.on('close', () => {
         if (shuttingDown || localServer !== server) return;
-        console.warn('[local] el servidor local se cerró solo; se reintentará');
+        health.log('[local] el servidor local se cerró solo; se reintentará');
         setLocalServerState({ listening: false, error: 'el servidor local se cerró' });
         ensureLocalServer('close').catch(() => { });
     });
@@ -995,6 +1029,23 @@ function ensureLocalServer(reason = 'check') {
             return localServerPayload();
         }
 
+        // El sondeo se venció pero el express sigue en pie y terminando peticiones: está
+        // LENTO, no muerto. Reiniciarlo era lo que cortaba el register-ticket en vuelo
+        // (12/nov/2026, CAJA03: ERR_EMPTY_RESPONSE a media venta, tres veces) y no
+        // arreglaba nada — la lentitud venía de otro lado. Se anota y se deja en paz.
+        if (!first.ok && first.timeout) {
+            const vivo = localServerLooksAlive();
+            if (vivo && vivo.alive) {
+                health.log(`[local] el sondeo se venció (${first.error}) pero el servidor local sigue `
+                    + `contestando: última respuesta hace ${Math.round(vivo.sinceMs)} ms, `
+                    + `${vivo.inflight} en vuelo; NO se reinicia (motivo=${reason})`);
+                setLocalServerState({ listening: true, foreign: false, error: '' });
+                return localServerPayload();
+            }
+            health.log(`[local] el sondeo se venció y el servidor local no termina peticiones `
+                + `desde hace ${vivo ? Math.round(vivo.sinceMs / 1000) + ' s' : '?'}: se da por atorado (motivo=${reason})`);
+        }
+
         if (first.foreign) {
             // Contesta un express que no es el mío. No se toca el puerto: quien manda es
             // el otro proceso, y el nuestro no puede servir nada. Con el candado de
@@ -1011,7 +1062,8 @@ function ensureLocalServer(reason = 'check') {
 
         // Nadie contesta: hay que levantarlo. Varios intentos porque el puerto puede
         // estar liberándose todavía (una instancia que acaba de salir).
-        console.warn(`[local] nadie contesta en ${LOCAL_FRONT_URL} (motivo=${reason}): ${first.error}`);
+        health.log(`[local] nadie contesta en ${LOCAL_FRONT_URL} (motivo=${reason}): ${first.error}`
+            + `${first.code ? ` [${first.code}]` : ''}; se vuelve a levantar`);
 
         let lastError = first.error;
         for (let intento = 1; intento <= 3; intento++) {
@@ -1020,7 +1072,7 @@ function ensureLocalServer(reason = 'check') {
                 const after = await probeLocalServer();
                 if (after.mine) {
                     localServerState.repairs++;
-                    console.log(`[local] servidor local restablecido (intento ${intento}, motivo=${reason})`);
+                    health.log(`[local] servidor local restablecido (intento ${intento}, motivo=${reason})`);
                     setLocalServerState({ listening: true, foreign: false, error: '' });
                     return localServerPayload();
                 }
@@ -1035,7 +1087,7 @@ function ensureLocalServer(reason = 'check') {
                 lastError = after.error || 'el servidor no contesta después de levantarlo';
             } catch (e) {
                 lastError = e && e.message ? e.message : String(e);
-                console.warn(`[local] no se pudo levantar el servidor local (intento ${intento}): ${lastError}`);
+                health.log(`[local] no se pudo levantar el servidor local (intento ${intento}): ${lastError}`);
             }
             if (intento < 3) await sleep(400);
         }
@@ -1094,6 +1146,7 @@ function shutdownForExit(reason) {
     try { xhr.shutdown(); } catch { }
     try { ledger.shutdown(); } catch { }
     try { posError.shutdown(); } catch { }
+    try { health.shutdown(); } catch { }
 }
 
 // Reinicio de la aplicación. Suelta el candado de instancia única ANTES de relanzar: el
@@ -1516,9 +1569,12 @@ function clientBuiltAt() {
     return clientBuiltAtCache;
 }
 
+// Cada handler de IPC corre en el proceso principal, el mismo que sirve el proxy de la
+// ventana: uno síncrono que tarda (el ledger es SQLite síncrono) traba TODO. Se mide para
+// que `cliente.log` diga cuál fue (ver src/main.health.js).
 function removeAndHandle(channel, handler) {
     try { ipcMain.removeHandler(channel); } catch { }
-    ipcMain.handle(channel, handler);
+    ipcMain.handle(channel, (...args) => health.timed(`ipc ${channel}`, () => handler(...args)));
 }
 
 ipcMain.on('client:log', (event, ...args) => {
@@ -2229,6 +2285,21 @@ app.whenReady().then(async () => {
         // "Ventas en local" — se abre ANTES que la ventana y antes de cualquier borrado
         // de caché. Vive fuera de `userData`, así que nada de lo que hace runCacheClear
         // (ni el botón rojo) lo alcanza; ver src/ledger.js.
+        // Bitácora del proceso principal y detector de trabas. Va primero para que
+        // cualquier traba del arranque (abrir el ledger, descomprimir el bundle) quede
+        // anotada. Ver src/main.health.js.
+        health.init(app.getPath('userData'), {
+            appVersion: app.getVersion(),
+            context: () => {
+                const srv = localServer;
+                const act = srv && typeof srv.nestorActivity === 'function' ? srv.nestorActivity() : null;
+                return act ? {
+                    proxy_en_vuelo: act.inflight,
+                    proxy_ultima_respuesta_ms: act.lastFinishedAt ? Date.now() - act.lastFinishedAt : 'nunca'
+                } : { proxy: 'sin servidor' };
+            }
+        });
+
         ledger.init(app.getPath('userData'));
 
         // Captura de sesiones XHR. También vive fuera de `userData` y también se abre
