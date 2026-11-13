@@ -553,7 +553,12 @@ function startLocalFrontendServer(currentDir, getServerOriginFn, options = {}) {
             // mienta para poder decidir si retoma la sesión del POS sin conexión (ver
             // NestorPOS_Frontend/src/pos/offline.session.js). Es la más barata que hay
             // (140 bytes) y ya se pide en cada arranque.
-            '/system/connectivity'
+            '/system/connectivity',
+            // Estado del arranque y de la actualización (server.boot.js, «Acerca de»):
+            // una copia vieja diría «arrancando, 40 %» con el servidor apagado, o al
+            // revés, y es justo lo que estas dos rutas existen para no hacer.
+            '/boot/status',
+            '/system/update-status'
         ];
 
         const canCacheRequest = (req.method === 'GET') && !disallowCache.includes(req.url)

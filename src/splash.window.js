@@ -49,12 +49,18 @@ const PASOS = {
     equipo: { at: 12, estado: 'Preparando el equipo' },
     servidor: { at: 26, estado: 'Levantando el servidor local' },
     servicios: { at: 38, estado: 'Revisando los servicios de la caja' },
+    // Sólo aparece cuando el servidor dice que está arrancando o actualizándose
+    // (ver server.boot.js); avanza de 40 a 47 con el porcentaje del servidor.
+    esperando: { at: 40, estado: 'Esperando al servidor' },
     actualizacion: { at: 48, estado: 'Buscando actualizaciones' },
     descarga: { at: 55, estado: 'Descargando la aplicación' },
     instalando: { at: 92, estado: 'Instalando la actualización' },
     ventana: { at: 96, estado: 'Abriendo el punto de venta' },
     listo: { at: 100, estado: 'Listo' }
 };
+
+const ESPERA_DESDE = 40;
+const ESPERA_HASTA = 47;
 
 const DESCARGA_DESDE = 55;
 const DESCARGA_HASTA = 92;
@@ -191,6 +197,36 @@ function progress(bajado, total) {
 }
 
 /**
+ * Lo que el servidor dice de su arranque (GET /api/v1/boot/status). La frase grande
+ * es QUÉ hace el servidor; la chica, cuánto lleva y en qué sentencia va. El porcentaje
+ * del servidor se reparte en el tramo de espera para que la barra siga siendo una sola.
+ */
+function server(s) {
+    if (!s) return;
+    const { duracion } = require('./server.boot');
+    const actualizando = s.source === 'updater';
+    if (s.reconnecting) {
+        ultimo.estado = 'Reiniciando el servidor';
+        ultimo.detalle = 'Esperando a que vuelva a responder';
+        pintar();
+        return;
+    }
+    ultimo.estado = (actualizando ? 'Actualizando el servidor: ' : 'Servidor: ') + (s.message || 'iniciando');
+    if (typeof s.percent === 'number' && s.percent >= 0) {
+        const antes = typeof ultimo.progress === 'number' ? ultimo.progress : -1;
+        const p = ESPERA_DESDE + (ESPERA_HASTA - ESPERA_DESDE) * Math.min(1, s.percent / 100);
+        ultimo.progress = Math.max(antes, p);
+    }
+    const partes = [];
+    if (typeof s.percent === 'number' && s.percent >= 0) partes.push(`${s.percent}% del servidor`);
+    partes.push(`lleva ${duracion(s.phase_elapsed_ms)}`);
+    if (s.estimate_ms >= 2000) partes.push(`la vez anterior ${duracion(s.estimate_ms)}`);
+    if (s.detail) partes.push(String(s.detail).slice(0, 60));
+    ultimo.detalle = partes.join(' · ');
+    pintar();
+}
+
+/**
  * Deja el splash en rojo con un motivo. Se usa cuando el arranque va a seguir de todas
  * formas (una actualización que no se pudo bajar y se sigue con la copia local): si va a
  * terminar en un diálogo de error, lo que toca es `close()` y el diálogo.
@@ -216,4 +252,4 @@ function isOpen() {
     return !!(win && !win.isDestroyed());
 }
 
-module.exports = { show, step, note, progress, fail, close, isOpen, PASOS };
+module.exports = { show, step, note, progress, server, fail, close, isOpen, PASOS };

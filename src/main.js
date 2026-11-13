@@ -18,6 +18,7 @@ const topology = require('./topology.report');
 // bundle del frontend — antes de esto, esos segundos eran pantalla vacía. Ver
 // src/splash.window.js.
 const splash = require('./splash.window');
+const serverBoot = require('./server.boot');
 
 app.commandLine.appendSwitch('disable-http-cache');
 
@@ -2381,6 +2382,25 @@ app.whenReady().then(async () => {
             services
         });
 
+        // Si el servidor está arrancando o actualizándose, lo dice (ver server.boot.js) y
+        // se espera enseñando en qué va. Si no contesta o es un servidor viejo, se sigue
+        // de inmediato como siempre.
+        let notaServidor = '';
+        try {
+            const r = await serverBoot.waitForServerBoot(serverOrigin, (s) => {
+                splash.step('esperando');
+                splash.server(s);
+            });
+            if (r.waited) console.log(`[server-boot] esperado: ${r.reason}`, r.last ? `${r.last.phase} ${r.last.percent}%` : '');
+            if (r.reason === 'tope' || (r.waited && !r.ready)) {
+                notaServidor = 'El servidor sigue iniciando; se abre de todos modos';
+            } else if (r.reason === 'error' && r.last) {
+                notaServidor = `El servidor no pudo iniciar: ${r.last.message || ''}`.slice(0, 90);
+            }
+        } catch (e) {
+            console.warn('[server-boot]', e && e.message ? e.message : e);
+        }
+
         if (IS_DEV) {
             console.log(`[dev] frontend desde ${DEV_URL} (sin bundle, sin auto-update); API hacia ${serverOrigin}`);
             mainWindow = createMainWindow();
@@ -2392,7 +2412,7 @@ app.whenReady().then(async () => {
         // arrancamos con caché limpio. Aquí todavía no hay ventana, así que no
         // se toca localStorage: los borradores del POS de la sesión anterior
         // (ventas encoladas sin subir) tienen que sobrevivir.
-        splash.step('actualizacion');
+        splash.step('actualizacion', notaServidor);
         await clearCachesIfBuildChanged(serverOrigin);
 
         try {
